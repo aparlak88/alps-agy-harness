@@ -58,9 +58,14 @@ Evaluate the Plan's Complexity Budget and/or code diff in a single `jev_ask` pas
 - **`Domain` Purity:** Zero ORM annotations, HTTP clients, UI frameworks (`SwiftUI`, `UIKit`, `android.*`, `@angular/*`, XAML), or 3rd-party SDK types (`Firebase`, `RevenueCat`, etc.) inside `Domain`.
 - **Compile/Test-Time Fitness Functions:** Verify greenfield projects define (and brownfield projects preserve) executable architecture boundary tests (`NetArchTest` / `ArchUnitNET`, `@softarc/sheriff` / `eslint-plugin-boundaries`, Swift `Package.swift` target isolation, Gradle + `Konsist`) whose failure messages start with actionable English **`REMEDIATION:`** guidance.
 
-### Step 5: End-of-Document Technical Glossary Audit
+### Step 5: End-of-Document Glossary & Deep Walkthrough Coverage Audit
 - Inspect every added or modified Markdown document in `README.md` and `docs/**/*.md` (**exempt:** `docs/canon/glossary.md` and `docs/parking-lot.md`).
 - Confirm each document ends with a non-empty **`## Teknik Terimler Sözlüğü`** (or **`## Technical Glossary`** in English-standard repos) table whose definitions match `docs/canon/glossary.md`.
+- **Pre-PR Walkthrough Deep Coverage (`docs/walkthroughs/*.md`):** At the Pre-PR checkpoint, run `git diff --name-status <base>..HEAD` and verify the walkthrough:
+  1. Uses real project class/module/method names (never generic `[Feature]Controller` / `A --> B` placeholders) across `>= 2` `mermaid` diagrams.
+  2. Contains **`## Dosya Bazlı Değişiklik Analizi`** (or `## File-by-File Change Analysis`) covering **100% of added, modified, and deleted files** in the diff (`docs/walkthroughs/*` and `docs/parking-lot.md` exempt) with `[ÜRETİLDİ]`/`[GÜNCELLENDİ]`/`[SİLİNDİ]` tags and concrete multi-sentence **Ne** (*what classes/methods/logic changed*) and **Neden** (*why the business rule, layer boundary, or root cause required it*) explanations.
+  3. Provides concrete test/command/output verification proofs rather than vague *"all tests passed"* claims.
+  - Flag **any** omitted diff file, leftover template placeholder, or shallow 1-line bullet summary in `docs/walkthroughs/*.md` as a PR-blocking **`Important`** defect (`FAIL`).
 
 ---
 
@@ -108,6 +113,7 @@ Locate `stamp-gate.sh` (`./scripts/stamp-gate.sh`, `.agents/plugins/alps-agy-har
 - `docs/canon/lessons.md`: PASS | FAIL
 - Clean Architecture & `REMEDIATION:` Fitness: PASS | FAIL
 - Scope Lock (`allowedFiles` / `docs/parking-lot.md`): PASS | FAIL
+- Walkthrough Per-File Depth (`## Dosya Bazlı Değişiklik Analizi` — 100% diff files + Ne/Neden): PASS | FAIL | N/A
 - End-of-Doc Glossary (`## Teknik Terimler Sözlüğü` / `## Technical Glossary`): PASS | FAIL
 
 ### 3. Actionable Findings (`Critical` / `Important` / `Minor`)

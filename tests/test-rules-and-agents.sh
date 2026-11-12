@@ -74,6 +74,7 @@ test_agents_md_no_frontmatter_and_under_8kb() {
   assert_contains "$content" "Teknik Terimler Sözlüğü" "AGENTS.md must enforce Teknik Terimler Sözlüğü section"
   assert_contains "$content" "REMEDIATION:" "AGENTS.md must mandate English REMEDIATION: fitness messages"
   assert_contains "$content" "pre-pr-readiness" "AGENTS.md must reference pre-pr-readiness"
+  assert_contains "$content" "Dosya Bazlı Değişiklik Analizi" "AGENTS.md must enforce per-file walkthrough analysis"
   assert_contains "$content" "canon-auditor" "AGENTS.md must reference canon-auditor"
   assert_contains "$content" "security-reviewer" "AGENTS.md must reference security-reviewer"
   assert_contains "$content" "review-pr" "AGENTS.md must reference review-pr"
@@ -236,6 +237,7 @@ test_subagents_frontmatter_and_audit_contracts() {
   assert_contains "$canon_content" "REMEDIATION:" "canon-auditor must verify Clean Architecture REMEDIATION: fitness checks"
   assert_contains "$canon_content" "## Teknik Terimler Sözlüğü" "canon-auditor must verify Turkish glossary section"
   assert_contains "$canon_content" "## Technical Glossary" "canon-auditor must verify English glossary section"
+  assert_contains "$canon_content" "Dosya Bazlı Değişiklik Analizi" "canon-auditor must enforce per-file walkthrough coverage"
   assert_contains "$canon_content" "stamp-gate.sh canon" "canon-auditor must invoke stamp-gate.sh canon"
   assert_contains "$canon_content" "--verdict PASS" "canon-auditor must document exact --verdict PASS flag"
   assert_contains "$canon_content" "--allow-file" "canon-auditor must document exact --allow-file flag"
@@ -284,6 +286,7 @@ test_subagents_frontmatter_and_audit_contracts() {
   assert_contains "$pr_content" "7. Readability, Naming & Ubiquitous Language" "pr-auditor must define Dimension 7: Readability, Naming & Ubiquitous Language"
   assert_contains "$pr_content" "docs/canon/glossary.md" "pr-auditor Dimension 7 must check docs/canon/glossary.md"
   assert_contains "$pr_content" "## Teknik Terimler Sözlüğü" "pr-auditor Dimension 7 must check mandatory end-of-doc glossary"
+  assert_contains "$pr_content" "Dosya Bazlı Değişiklik Analizi" "pr-auditor Dimension 7 must check deep per-file walkthrough coverage"
 }
 
 run_tests "test_"

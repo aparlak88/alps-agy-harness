@@ -57,4 +57,4 @@ Temizlik işlerinin özellik dallarını kirletmesini veya büyük regresyonlara
 4. **Otoparkın Güncellenmesi:**
    Tamamlanan maddeler `docs/parking-lot.md` dosyasından silinir.
 5. **Standart PR Kapıları:**
-   Mikro-PR için öz bir Walkthrough hazırlanır (`walkthrough-template.md`), `canon` ve `security` damgaları alınarak PR açılır.
+   Mikro-PR için dokunulan her dosyayı `## Dosya Bazlı Değişiklik Analizi` altında `Ne` ve `Neden` boyutlarıyla açıklayan eksiksiz bir Walkthrough hazırlanır (`walkthrough-template.md`), `canon` ve `security` damgaları alınarak PR açılır.

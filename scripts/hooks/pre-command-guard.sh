@@ -141,13 +141,18 @@ for ((s_idx = 0; s_idx < num_segments; s_idx++)); do
             ' <<< "$seg_json" 2>/dev/null || true)"
 
             if [ -n "$target_branch" ]; then
-              diff_files="$(git -C "$WORKSPACE_ROOT" diff --name-only --diff-filter=ACMR "HEAD..$target_branch" 2>/dev/null || true)"
+              merge_base="$(git -C "$WORKSPACE_ROOT" merge-base HEAD "$target_branch" 2>/dev/null || printf 'HEAD')"
+              diff_files="$(git -C "$WORKSPACE_ROOT" diff --name-only --diff-filter=ACMR "$merge_base..$target_branch" 2>/dev/null || true)"
+              all_merge_diff="$(git -C "$WORKSPACE_ROOT" diff --name-only "$merge_base..$target_branch" 2>/dev/null || true)"
               walkthrough_found=false
+              has_any_wt=false
+              wt_err=""
               while IFS= read -r f; do
                 [ -n "$f" ] || continue
                 if [[ "$f" == docs/walkthroughs/*.md ]]; then
-                  m_count="$(git -C "$WORKSPACE_ROOT" show "$target_branch:$f" 2>/dev/null | grep -c '```mermaid' || true)"
-                  if [ "$m_count" -ge 2 ]; then
+                  has_any_wt=true
+                  wt_content="$(git -C "$WORKSPACE_ROOT" show "$target_branch:$f" 2>/dev/null || true)"
+                  if wt_err="$(harness_validate_walkthrough "$wt_content" "$all_merge_diff")"; then
                     walkthrough_found=true
                     break
                   fi
@@ -155,7 +160,11 @@ for ((s_idx = 0; s_idx < num_segments; s_idx++)); do
               done <<< "$diff_files"
 
               if ! $walkthrough_found; then
-                emit_deny "Local merge into main requires at least one walkthrough with >= 2 Mermaid diagrams in docs/walkthroughs/*.md"
+                if ! $has_any_wt; then
+                  emit_deny "Local merge into main requires a walkthrough in docs/walkthroughs/*.md covering every changed file."
+                else
+                  emit_deny "Local merge into main blocked: $wt_err"
+                fi
                 exit 0
               fi
 
@@ -381,18 +390,21 @@ sys.exit(0 if re.search(pat, section) else 1)
         exit 0
       fi
 
-      # (b) Walkthrough in docs/walkthroughs/*.md with >= 2 Mermaid code fences
-      diff_files="$(git -C "$WORKSPACE_ROOT" diff --name-only --diff-filter=ACMR "$base..HEAD" 2>/dev/null || true)"
+      # (b) Walkthrough in docs/walkthroughs/*.md with >= 2 Mermaid blocks + 100% per-file Ne/Neden coverage
+      merge_base="$(git -C "$WORKSPACE_ROOT" merge-base "$base" HEAD 2>/dev/null || printf '%s' "$base")"
+      diff_files="$(git -C "$WORKSPACE_ROOT" diff --name-only --diff-filter=ACMR "$merge_base..HEAD" 2>/dev/null || true)"
+      all_diff="$(git -C "$WORKSPACE_ROOT" diff --name-only "$merge_base..HEAD" 2>/dev/null || true)"
       walkthrough_found=false
       has_any_wt=false
+      wt_err=""
 
       while IFS= read -r f; do
         [ -n "$f" ] || continue
         if [[ "$f" == docs/walkthroughs/*.md ]]; then
           has_any_wt=true
           if [ -f "$WORKSPACE_ROOT/$f" ]; then
-            m_count="$(grep -c '```mermaid' "$WORKSPACE_ROOT/$f" 2>/dev/null || true)"
-            if [ "$m_count" -ge 2 ]; then
+            wt_content="$(cat "$WORKSPACE_ROOT/$f")"
+            if wt_err="$(harness_validate_walkthrough "$wt_content" "$all_diff")"; then
               walkthrough_found=true
               break
             fi
@@ -404,7 +416,7 @@ sys.exit(0 if re.search(pat, section) else 1)
         if ! $has_any_wt; then
           emit_deny "PR creation blocked: missing walkthrough. PR diff must include at least one docs/walkthroughs/*.md file."
         else
-          emit_deny "PR creation blocked: walkthrough in docs/walkthroughs/*.md must contain at least 2 Mermaid diagrams (\`\`\`mermaid)."
+          emit_deny "PR creation blocked: $wt_err"
         fi
         exit 0
       fi
