@@ -181,6 +181,244 @@ harness_has_glossary_section() {
   ' >/dev/null 2>&1
 }
 
+# Validate a PR/merge walkthrough markdown string against:
+#   1. >= 2 ```mermaid diagrams
+#   2. No unedited template placeholders
+#   3. Mandatory '## Dosya Bazlı Değişiklik Analizi' (or '## File-by-File Change Analysis') H2 section
+#   4. 100% coverage of all changed/created/deleted files in $2 (excluding docs/walkthroughs/* and docs/parking-lot.md)
+#   5. Non-shallow per-file 'Ne Değişti/Üretildi/Silindi' (What) and 'Neden Değişti/Üretildi/Silindi' (Why) explanations
+# Prints an actionable English error reason on stdout and returns 1 on failure; returns 0 on success.
+harness_validate_walkthrough() {
+  local wt_text="${1:-}"
+  local diff_files_raw="${2:-}"
+
+  if [ -z "$wt_text" ]; then
+    printf 'walkthrough file in docs/walkthroughs/*.md is empty.\n'
+    return 1
+  fi
+
+  WT_TEXT="$wt_text" DIFF_FILES_RAW="$diff_files_raw" python3 -c '
+import os, re, sys
+
+text = os.environ.get("WT_TEXT", "")
+diff_raw = os.environ.get("DIFF_FILES_RAW", "")
+
+lines = [l.rstrip("\r") for l in text.split("\n")]
+
+# 1. Parse code fences, count ```mermaid blocks, and locate per-file H2 section
+in_fence = False
+fence_len = 0
+mermaid_count = 0
+has_file_h2 = False
+in_file_h2 = False
+file_sec_lines = []
+non_fence_lines = []
+
+h2_file_re = re.compile(
+    r"^##\s+(?:\d+\.\s+)?(?:Dosya Bazlı(?: Tam)? Değişiklik Analizi|File-by-File Change Analysis)\s*$",
+    re.IGNORECASE,
+)
+
+for line in lines:
+    stripped = line.lstrip(" \t")
+    if in_fence:
+        m_close = re.match(r"^(`{3,})[ \t]*$", stripped)
+        if m_close and len(m_close.group(1)) >= fence_len:
+            in_fence = False
+            fence_len = 0
+        if in_file_h2:
+            file_sec_lines.append((True, line))
+        continue
+
+    m_open = re.match(r"^(`{3,})(.*)$", stripped)
+    if m_open:
+        in_fence = True
+        fence_len = len(m_open.group(1))
+        info = m_open.group(2).strip().lower()
+        if info == "mermaid" or info.startswith("mermaid "):
+            mermaid_count += 1
+        if in_file_h2:
+            file_sec_lines.append((True, line))
+        continue
+
+    non_fence_lines.append(line)
+
+    if line.startswith("## "):
+        if h2_file_re.match(line):
+            has_file_h2 = True
+            in_file_h2 = True
+            continue
+        elif in_file_h2:
+            in_file_h2 = False
+
+    if in_file_h2:
+        file_sec_lines.append((False, line))
+
+if mermaid_count < 2:
+    print(
+        f"walkthrough in docs/walkthroughs/*.md must contain at least 2 Mermaid diagrams (```mermaid); found {mermaid_count}."
+    )
+    sys.exit(1)
+
+# 2. Reject unedited template placeholders outside inline backticks / code fences
+def strip_inline_code(s: str) -> str:
+    return re.sub(r"`[^`]*`", "", s)
+
+for line in non_fence_lines:
+    if line.startswith("#") and "[Özellik / Düzeltme Başlığı]" in strip_inline_code(line):
+        print("walkthrough contains unedited template placeholder \"[Özellik / Düzeltme Başlığı]\".")
+        sys.exit(1)
+    if line.startswith("###") and (
+        "[ÜRETİLDİ | GÜNCELLENDİ | SİLİNDİ]" in strip_inline_code(line)
+        or "`<dosya/tam/yolu>`" in line
+        or "<dosya-yolu>" in strip_inline_code(line)
+    ):
+        print("walkthrough contains unedited per-file template placeholder (e.g. \"[ÜRETİLDİ | GÜNCELLENDİ | SİLİNDİ]\" or \"<dosya/tam/yolu>\").")
+        sys.exit(1)
+    plain = strip_inline_code(line)
+    for marker in (
+        "[Gerçek problemi ve kök bağlamı açıklayın",
+        "[Eklenen veya değiştirilen sınıfları, metod imzalarını",
+        "[Bu dosyadaki değişikliği zorunlu kılan iş kuralını",
+    ):
+        if marker in plain:
+            print(f"walkthrough contains unedited template placeholder: {marker}...")
+            sys.exit(1)
+
+# 3. Require mandatory per-file analysis H2 heading
+if not has_file_h2:
+    print(
+        "walkthrough in docs/walkthroughs/*.md is missing mandatory \"## Dosya Bazlı Değişiklik Analizi\" (or \"## File-by-File Change Analysis\") section."
+    )
+    sys.exit(1)
+
+# 4. Collect required diff files (excluding docs/walkthroughs/* and docs/parking-lot.md)
+required_files = []
+seen = set()
+for raw in diff_raw.splitlines():
+    f = raw.strip()
+    if not f or f.startswith("docs/walkthroughs/") or f == "docs/parking-lot.md":
+        continue
+    if f not in seen:
+        seen.add(f)
+        required_files.append(f)
+
+section_non_fence_text = "\n".join(l for is_f, l in file_sec_lines if not is_f)
+
+if not required_files:
+    if len(re.sub(r"\s+", "", section_non_fence_text)) < 15:
+        print("walkthrough \"## Dosya Bazlı Değişiklik Analizi\" section cannot be empty.")
+        sys.exit(1)
+    sys.exit(0)
+
+# 5. Split "## Dosya Bazlı Değişiklik Analizi" into H3 per-file blocks (outside code fences)
+h3_blocks = []
+cur_header = None
+cur_lines = []
+for is_f, l in file_sec_lines:
+    if not is_f and re.match(r"^###[ \t]+", l):
+        if cur_header is not None:
+            h3_blocks.append((cur_header, cur_lines))
+        cur_header = l
+        cur_lines = []
+    else:
+        if cur_header is not None:
+            cur_lines.append((is_f, l))
+if cur_header is not None:
+    h3_blocks.append((cur_header, cur_lines))
+
+# Check first if any required file is completely missing from the section or lacks its own H3 block
+section_full_text = "\n".join(l for _, l in file_sec_lines)
+missing_files = []
+missing_h3_files = []
+file_to_block = {}
+
+for rf in required_files:
+    pat = re.compile(r"(?<![A-Za-z0-9_./-])" + re.escape(rf) + r"(?![A-Za-z0-9_./-])")
+    matched_blocks = [(hdr, blines) for hdr, blines in h3_blocks if pat.search(hdr)]
+    if matched_blocks:
+        file_to_block[rf] = matched_blocks[0]
+    elif not pat.search(section_full_text):
+        missing_files.append(rf)
+    else:
+        missing_h3_files.append(rf)
+
+if missing_files:
+    print(
+        "walkthrough \"## Dosya Bazlı Değişiklik Analizi\" is missing per-file analysis for: "
+        + ", ".join(missing_files)
+        + ". Every created, modified, or deleted file in git diff must be documented."
+    )
+    sys.exit(1)
+
+if missing_h3_files:
+    print(
+        "walkthrough \"## Dosya Bazlı Değişiklik Analizi\" is too shallow for: "
+        + ", ".join(missing_h3_files)
+        + ". Each file must have its own dedicated \"### `<path>` — [ÜRETİLDİ|GÜNCELLENDİ|SİLİNDİ]\" subsection instead of one-line summary bullets."
+    )
+    sys.exit(1)
+
+# 6. Verify every file H3 block contains substantive What ("Ne ...") and Why ("Neden ...") prose (>= 25 chars each)
+what_label = (
+    r"(?:Ne\s+(?:Değişti|Üretildi|Silindi|Eklendi)"
+    r"(?:\s*/\s*(?:Ne\s+)?(?:Değişti|Üretildi|Silindi|Eklendi))*"
+    r"|What\s+(?:Changed|Was\s+(?:Added|Created|Updated|Removed|Deleted)))"
+)
+why_label = (
+    r"(?:Neden\s+(?:Değişti|Üretildi|Silindi|Eklendi)"
+    r"(?:\s*/\s*(?:Neden\s+)?(?:Değişti|Üretildi|Silindi|Eklendi))*"
+    r"|Why\s+(?:It\s+)?(?:Changed|Was\s+(?:Added|Created|Updated|Removed|Deleted)|Added|Created|Removed|Deleted)|Why)"
+)
+
+what_re = re.compile(
+    r"^[ \t]*(?:[-*+]|\d+\.|#{4,6})?[ \t]*\*{0,2}" + what_label + r"[ \t]*\??[ \t]*\*{0,2}[ \t]*:?[ \t]*\*{0,2}",
+    re.IGNORECASE | re.MULTILINE,
+)
+why_re = re.compile(
+    r"^[ \t]*(?:[-*+]|\d+\.|#{4,6})?[ \t]*\*{0,2}" + why_label + r"[ \t]*\??[ \t]*\*{0,2}[ \t]*:?[ \t]*\*{0,2}",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+shallow_files = []
+for rf in required_files:
+    _, blines = file_to_block[rf]
+    masked_block = "\n".join((" " * len(l) if is_f else l) for is_f, l in blines)
+    w_matches = list(what_re.finditer(masked_block))
+    y_matches = list(why_re.finditer(masked_block))
+    if not w_matches or not y_matches:
+        shallow_files.append(f"{rf} (missing Ne/What or Neden/Why label)")
+        continue
+
+    bounds = sorted(
+        set([len(masked_block)] + [m.start() for m in w_matches] + [m.start() for m in y_matches])
+    )
+
+    def next_bound(pos: int) -> int:
+        for b in bounds:
+            if b > pos:
+                return b
+        return len(masked_block)
+
+    w_body = masked_block[w_matches[0].end():next_bound(w_matches[0].start())]
+    y_body = masked_block[y_matches[0].end():next_bound(y_matches[0].start())]
+    w_clean = re.sub(r"[`*_>#\-\s]+", " ", w_body).strip()
+    y_clean = re.sub(r"[`*_>#\-\s]+", " ", y_body).strip()
+    if len(w_clean) < 25 or len(y_clean) < 25:
+        shallow_files.append(f"{rf} (stub/one-word prose < 25 chars)")
+
+if shallow_files:
+    print(
+        "walkthrough \"## Dosya Bazlı Değişiklik Analizi\" has shallow per-file documentation for: "
+        + ", ".join(shallow_files)
+        + ". Provide concrete multi-sentence \"Ne Değişti / Ne Üretildi\" and \"Neden Değişti / Neden Üretildi\" explanations."
+    )
+    sys.exit(1)
+
+sys.exit(0)
+'
+}
+
 # Antigravity PreToolUse JSON emitters
 emit_allow() {
   jq -nc '{decision: "allow"}'

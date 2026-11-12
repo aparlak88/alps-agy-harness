@@ -329,13 +329,43 @@ EOF
   assert_json_field "$out_1_mermaid" ".decision" "deny" "Walkthrough with < 2 Mermaid blocks must deny"
   assert_contains "$(printf '%s' "$out_1_mermaid" | jq -r '.reason')" "Mermaid"
 
-  # Fix walkthrough with 2 mermaid blocks and glossary
-  cat << 'EOF' >> "$repo/docs/walkthroughs/01-feature.md"
+  # Fix walkthrough with 2 mermaid blocks, deep per-file analysis, and glossary
+  cat << 'EOF' > "$repo/docs/walkthroughs/01-feature.md"
+# Pull Request Mühendislik Rehberi: Çekirdek Başlangıç ve Mimari Kanon
+
+## 1. Problem Bağlamı ve Mimari Kararlar
+Uygulama giriş noktasını ve kanon mimari dokümantasyonunu standartlaştırmak için temel modül ve mimari referans dosyası oluşturuldu.
+
+## 2. Mimari ve Veri Akışı Diyagramları
+```mermaid
+flowchart LR
+  Entry["src.js (Bootstrap)"] --> ArchDoc["docs/canon/arch.md"]
+```
 
 ```mermaid
 sequenceDiagram
-  Client->>Server: Request
+  Developer->>Entry: node src.js
+  Entry-->>Developer: stdout ("work")
 ```
+
+## 3. Dosya Bazlı Değişiklik Analizi
+
+### `src.js` — [ÜRETİLDİ] (`Presentation / Entry`)
+- **Ne Değişti / Ne Üretildi?:** Uygulamanın çalışma zamanı başlangıç çıktısını üreten `src.js` giriş betiği eklendi ve standart çıktı akışı yapılandırıldı.
+- **Neden Değişti / Neden Üretildi?:** PR kapısı doğrulama hattında çalıştırılabilir minimal bir kaynak dosya giriş noktası sağlamak için üretildi.
+
+### `docs/canon/arch.md` — [ÜRETİLDİ] (`Domain Canon`)
+- **Ne Değişti / Ne Üretildi?:** Sistemin katman sınırlarını ve temel mimari sözleşmelerini tanımlayan `docs/canon/arch.md` referans dokümanı eklendi.
+- **Neden Değişti / Neden Üretildi?:** Geliştiricilerin ve denetçi ajanların katman kurallarını tek bir kanonik kaynaktan doğrulayabilmesi için üretildi.
+
+## 4. Kritik İş Mantığı, Kenar Durumlar (Edge Cases) ve Hata Yönetimi
+Başlangıç betiği yan etkisiz çalışır; eksik argüman durumunda sıfır çıkış kodu korunur.
+
+## 5. Somut Doğrulama Kanıtları
+`test-command-hooks.sh` altındaki 5 aşamalı PR kapısı senaryosu ile tüm kontroller doğrulandı.
+
+## 6. Kapsam Dışı (`docs/parking-lot.md`) ve Operasyonel Notlar
+Ek CLI bayrakları kapsam dışı bırakıldı.
 
 ## Technical Glossary
 
@@ -344,7 +374,7 @@ sequenceDiagram
 | Flow | Sequential process |
 EOF
   git -C "$repo" add docs/walkthroughs/01-feature.md
-  git -C "$repo" commit -m "docs: 2 mermaids" --quiet
+  git -C "$repo" commit -m "docs: 2 mermaids and deep analysis" --quiet
 
   # Check 3: Modified technical doc missing Technical Glossary -> deny
   mkdir -p "$repo/docs/canon"
@@ -382,11 +412,20 @@ EOF
   "$STAMP_GATE" canon --verdict PASS --workspace "$repo"
   "$STAMP_GATE" security --verdict PASS --critical 0 --important 0 --workspace "$repo"
 
-  # Check 5: Drive-by modified file outside allowedFiles -> deny
-  # Add drive-by file
+  # Check 5: Drive-by modified file outside allowedFiles -> deny (even if documented in walkthrough)
   mkdir -p "$repo/src"
   echo "drive by" > "$repo/src/unrelated.ts"
-  git -C "$repo" add src/unrelated.ts
+  python3 -c '
+p = "'"$repo"'/docs/walkthroughs/01-feature.md"
+s = open(p, encoding="utf-8").read()
+entry = """
+### `src/unrelated.ts` — [ÜRETİLDİ] (`Infrastructure`)
+- **Ne Değişti / Ne Üretildi?:** Kapsam dışı eklenen `unrelated.ts` yardımcı dosyası oluşturuldu.
+- **Neden Değişti / Neden Üretildi?:** `allowedFiles` kapsam kilidi kontrolünü izole olarak test etmek için eklendi.
+"""
+open(p, "w", encoding="utf-8").write(s.replace("## 4. Kritik İş Mantığı", entry + "\n## 4. Kritik İş Mantığı"))
+'
+  git -C "$repo" add src/unrelated.ts docs/walkthroughs/01-feature.md
   git -C "$repo" commit -m "drive by edit" --quiet
   # Restamp canon with allowedFiles restricting to src.js (current sha, but unrelated.ts not in allowedFiles)
   "$STAMP_GATE" canon --verdict PASS --allow-file "src.js" --workspace "$repo"
@@ -398,9 +437,8 @@ EOF
   assert_json_field "$out_driveby" ".decision" "deny" "Drive-by file outside allowedFiles must deny"
   assert_contains "$(printf '%s' "$out_driveby" | jq -r '.reason')" "allowedFiles"
 
-  # Now fix: remove drive-by file, update stamps to match HEAD
-  git -C "$repo" rm -f src/unrelated.ts
-  git -C "$repo" commit -m "revert drive by edit" --quiet
+  # Now fix: revert drive-by commit, update stamps to match HEAD
+  git -C "$repo" reset --hard HEAD~1 --quiet
 
   "$STAMP_GATE" canon --verdict PASS --allow-file "src.js" --workspace "$repo"
   "$STAMP_GATE" security --verdict PASS --critical 0 --important 0 --workspace "$repo"
@@ -409,6 +447,308 @@ EOF
   local out_all_pass
   out_all_pass=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_all_pass" ".decision" "allow" "When all 5 checks pass, gh pr create must be allowed"
+}
+
+test_walkthrough_deep_file_coverage_and_local_merge_gate() {
+  [ -x "$PRE_COMMAND_GUARD" ] || { echo "pre-command-guard.sh missing or not executable: $PRE_COMMAND_GUARD" >&2; return 1; }
+
+  local repo
+  repo=$(make_temp_repo)
+  mkdir -p "$repo/src"
+  echo "export const legacy = true;" > "$repo/src/LegacyHelper.ts"
+  cat << 'EOF' > "$repo/README.md"
+# Repo
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Repo | Kod deposu |
+EOF
+  git -C "$repo" add README.md src/LegacyHelper.ts
+  git -C "$repo" commit -m "chore: init with legacy helper" --quiet
+
+  git -C "$repo" checkout -b "feat/order-processing" --quiet
+
+  # Touch 1 new file, 1 another new file, 1 deleted file, plus exempt docs/parking-lot.md
+  mkdir -p "$repo/docs/walkthroughs"
+  echo "export class OrderService { submit() { return true; } }" > "$repo/src/OrderService.ts"
+  echo "export class OrderRepository { save() { return true; } }" > "$repo/src/OrderRepository.ts"
+  git -C "$repo" rm -f src/LegacyHelper.ts --quiet
+  echo "- [ ] V2 batch order retry queue" > "$repo/docs/parking-lot.md"
+  git -C "$repo" add src/OrderService.ts src/OrderRepository.ts docs/parking-lot.md
+  git -C "$repo" commit -m "feat(orders): add order service/repo and remove legacy helper" --quiet
+
+  local p_pr_create
+  p_pr_create=$(jq -nc --arg ws "$repo" --arg cmd "gh pr create --fill" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+
+  # Stamp canon & security upfront so walkthrough gate is isolated
+  "$STAMP_GATE" canon --verdict PASS \
+    --allow-file "src/OrderService.ts" \
+    --allow-file "src/OrderRepository.ts" \
+    --allow-file "src/LegacyHelper.ts" \
+    --workspace "$repo"
+  "$STAMP_GATE" security --verdict PASS --critical 0 --important 0 --workspace "$repo"
+
+  # Case 1: Walkthrough has 2 Mermaids + Glossary, but NO '## Dosya Bazlı Değişiklik Analizi' heading -> deny
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-12-orders.md"
+# Sipariş İşleme Rehberi
+
+```mermaid
+flowchart LR
+  OrderService --> OrderRepository
+```
+
+```mermaid
+sequenceDiagram
+  Client->>OrderService: submit()
+  OrderService->>OrderRepository: save()
+```
+
+src/OrderService.ts, src/OrderRepository.ts ve src/LegacyHelper.ts güncellendi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| OrderService | Sipariş uygulama servisi |
+EOF
+  git -C "$repo" add docs/walkthroughs/2026-11-12-orders.md
+  git -C "$repo" commit -m "docs: walkthrough without file analysis heading" --quiet
+
+  local out_no_heading
+  out_no_heading=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_no_heading" ".decision" "deny" "Walkthrough missing Dosya Bazlı Değişiklik Analizi heading must be denied"
+  assert_contains "$(printf '%s' "$out_no_heading" | jq -r '.reason')" "Dosya Bazlı Değişiklik Analizi"
+
+  # Case 2: Walkthrough omits src/OrderRepository.ts and deleted src/LegacyHelper.ts -> deny naming missing files
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-12-orders.md"
+# Sipariş İşleme Rehberi
+
+```mermaid
+flowchart LR
+  OrderService --> OrderRepository
+```
+
+```mermaid
+sequenceDiagram
+  Client->>OrderService: submit()
+  OrderService->>OrderRepository: save()
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/OrderService.ts` — [ÜRETİLDİ] (`Application`)
+- **Ne Değişti / Ne Üretildi?:** Sipariş oluşturma iş akışını koordine eden `OrderService` sınıfı ve `submit()` metodu eklendi.
+- **Neden Değişti / Ne Üretildi?:** Sunum katmanı ile veri erişim katmanı arasındaki sipariş doğrulama mantığını tek merkezde toplamak için üretildi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| OrderService | Sipariş uygulama servisi |
+EOF
+  git -C "$repo" add docs/walkthroughs/2026-11-12-orders.md
+  git -C "$repo" commit -m "docs: walkthrough missing repository and deleted legacy file" --quiet
+
+  local out_missing_files
+  out_missing_files=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_missing_files" ".decision" "deny" "Walkthrough omitting changed/deleted files must be denied"
+  local reason_missing
+  reason_missing=$(printf '%s' "$out_missing_files" | jq -r '.reason')
+  assert_contains "$reason_missing" "src/OrderRepository.ts" "Deny reason must explicitly name missing src/OrderRepository.ts"
+  assert_contains "$reason_missing" "src/LegacyHelper.ts" "Deny reason must explicitly name missing deleted file src/LegacyHelper.ts"
+
+  # Case 3: Walkthrough mentions all files under heading, but only with shallow 1-line bullets (no Ne/Neden depth) -> deny
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-12-orders.md"
+# Sipariş İşleme Rehberi
+
+```mermaid
+flowchart LR
+  OrderService --> OrderRepository
+```
+
+```mermaid
+sequenceDiagram
+  Client->>OrderService: submit()
+  OrderService->>OrderRepository: save()
+```
+
+## Dosya Bazlı Değişiklik Analizi
+- `src/OrderService.ts`: Sipariş servisi eklendi.
+- `src/OrderRepository.ts`: Sipariş deposu eklendi.
+- `src/LegacyHelper.ts`: Eski yardımcı dosya silindi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| OrderService | Sipariş uygulama servisi |
+EOF
+  git -C "$repo" add docs/walkthroughs/2026-11-12-orders.md
+  git -C "$repo" commit -m "docs: shallow 1-liner walkthrough" --quiet
+
+  local out_shallow
+  out_shallow=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_shallow" ".decision" "deny" "Shallow 1-line summary walkthrough without Ne/Neden explanations must be denied"
+
+  # Case 3b: Partial laziness — 2 files have full H3 Ne/Neden, 3rd file has H3 heading with 1-word stub -> deny naming 3rd file
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-12-orders.md"
+# Sipariş İşleme Rehberi
+
+```mermaid
+flowchart LR
+  OrderService --> OrderRepository
+```
+
+```mermaid
+sequenceDiagram
+  Client->>OrderService: submit()
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/OrderService.ts` — [ÜRETİLDİ] (`Application`)
+- **Ne Değişti / Ne Üretildi?:** Sipariş oluşturma iş akışını koordine eden `OrderService` sınıfı ve `submit()` metodu eklendi.
+- **Neden Değişti / Ne Üretildi?:** Sunum katmanı ile veri erişim katmanı arasındaki sipariş doğrulama mantığını izole etmek için üretildi.
+
+### `src/OrderRepository.ts` — [ÜRETİLDİ] (`Infrastructure`)
+- **Ne Değişti / Ne Üretildi?:** Kalıcı sipariş kaydını yöneten `OrderRepository` sınıfı ve `save()` metodu eklendi.
+- **Neden Değişti / Ne Üretildi?:** Domain/Application katmanını veritabanı altyapısından soyutlamak için üretildi.
+
+### `src/LegacyHelper.ts` — [SİLİNDİ] (`Legacy`)
+- **Ne Silindi?:** Silindi.
+- **Neden Silindi?:** Eskiydi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| OrderService | Sipariş uygulama servisi |
+EOF
+  git -C "$repo" add docs/walkthroughs/2026-11-12-orders.md
+  git -C "$repo" commit -m "docs: partial stub on LegacyHelper" --quiet
+
+  local out_partial_stub
+  out_partial_stub=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_partial_stub" ".decision" "deny" "Per-file block with 1-word stub must be denied"
+  assert_contains "$(printf '%s' "$out_partial_stub" | jq -r '.reason')" "src/LegacyHelper.ts" "Deny reason must identify shallow file src/LegacyHelper.ts"
+
+  # Case 4: Walkthrough contains unedited template placeholder -> deny
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-12-orders.md"
+# Pull Request Mühendislik Rehberi: [Özellik / Düzeltme Başlığı]
+
+```mermaid
+flowchart LR
+  OrderService --> OrderRepository
+```
+
+```mermaid
+sequenceDiagram
+  Client->>OrderService: submit()
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/OrderService.ts` — [ÜRETİLDİ | GÜNCELLENDİ | SİLİNDİ] (`Application`)
+- **Ne Değişti / Ne Üretildi?:** Sipariş oluşturma iş akışını koordine eden `OrderService` sınıfı ve `submit()` metodu eklendi.
+- **Neden Değişti / Ne Üretildi?:** Sunum katmanı ile veri erişim katmanı arasındaki sipariş doğrulama mantığını izole etmek için üretildi.
+
+### `src/OrderRepository.ts` — [ÜRETİLDİ] (`Infrastructure`)
+- **Ne Değişti / Ne Üretildi?:** Kalıcı sipariş kaydını yöneten `OrderRepository` sınıfı ve `save()` metodu eklendi.
+- **Neden Değişti / Ne Üretildi?:** Domain/Application katmanını veritabanı altyapısından soyutlamak için üretildi.
+
+### `src/LegacyHelper.ts` — [SİLİNDİ] (`Legacy`)
+- **Ne Silindi?:** Artık kullanılmayan `legacy` bayrağını taşıyan `LegacyHelper.ts` modülü tamamen kaldırıldı.
+- **Neden Silindi?:** Yeni `OrderService` akışı devreye alındığından ölü kod (dead code) birikimini önlemek için silindi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| OrderService | Sipariş uygulama servisi |
+EOF
+  git -C "$repo" add docs/walkthroughs/2026-11-12-orders.md
+  git -C "$repo" commit -m "docs: walkthrough with leftover template placeholder" --quiet
+
+  local out_placeholder
+  out_placeholder=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_placeholder" ".decision" "deny" "Walkthrough with leftover template placeholders must be denied"
+
+  # Also verify local git merge into main (no remote) denies before fixing walkthrough
+  git -C "$repo" checkout main --quiet
+  local p_local_merge
+  p_local_merge=$(jq -nc --arg ws "$repo" --arg cmd "git merge feat/order-processing" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+  local out_merge_deny
+  out_merge_deny=$(printf '%s' "$p_local_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_deny" ".decision" "deny" "Local merge into main must also deny invalid/placeholder walkthrough"
+  git -C "$repo" checkout feat/order-processing --quiet
+
+  # Case 5: Complete, deep engineering walkthrough covering 100% of non-exempt files -> allow!
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-12-orders.md"
+# Pull Request Mühendislik Rehberi: Sipariş İşleme Akışı ve Legacy Temizliği
+
+## 1. Problem Bağlamı ve Mimari Kararlar
+Dağınık yardımcı fonksiyonlarla yürütülen sipariş kaydı, katman sınırlarını koruyan `OrderService` ve `OrderRepository` bileşenlerine taşındı; eski `LegacyHelper` kaldırıldı.
+
+## 2. Mimari ve Veri Akışı Diyagramları
+```mermaid
+flowchart LR
+  OrderService["Application: OrderService"] --> OrderRepository["Infrastructure: OrderRepository"]
+```
+
+```mermaid
+sequenceDiagram
+  Client->>OrderService: submit()
+  OrderService->>OrderRepository: save()
+  OrderRepository-->>OrderService: true
+```
+
+## 3. Dosya Bazlı Değişiklik Analizi
+
+### `src/OrderService.ts` — [ÜRETİLDİ] (`Application`)
+- **Ne Değişti / Ne Üretildi?:** Sipariş gönderim adımlarını yöneten `OrderService` sınıfı ve `submit(): boolean` metodu oluşturuldu.
+- **Neden Değişti / Ne Üretildi?:** İstemci çağrılarının doğrudan veri katmanına erişmesini engelleyip uygulama kurallarını merkezi katmanda yürütmek için üretildi.
+
+### `src/OrderRepository.ts` — [ÜRETİLDİ] (`Infrastructure`)
+- **Ne Değişti / Ne Üretildi?:** Sipariş varlıklarının kalıcı depoya yazılmasını sağlayan `OrderRepository` sınıfı ve `save(): boolean` metodu eklendi.
+- **Neden Değişti / Ne Üretildi?:** Kalıcılık detaylarını uygulama mantığından ayırarak Clean Architecture bağımlılık yönünü korumak için üretildi.
+
+### `src/LegacyHelper.ts` — [SİLİNDİ] (`Legacy`)
+- **Ne Silindi?:** Eski statik `legacy = true` sabiti ve kullanılmayan yardımcı modül kod tabanından tamamen kaldırıldı.
+- **Neden Silindi?:** Sipariş akışı `OrderService` üzerine taşındıktan sonra hiçbir çağrıcısı kalmayan ölü kodu temizlemek için silindi.
+
+## 4. Kritik İş Mantığı, Kenar Durumlar (Edge Cases) ve Hata Yönetimi
+Kayıt başarısız olduğunda `save()` hatası yutulmadan üst katmana iletilir.
+
+## 5. Somut Doğrulama Kanıtları
+Birim testleri `./scripts/run-quiet.sh unit -- npm test` komutuyla sıfır hata ile doğrulandı; `canon-pass.json` ve `security-pass.json` damgalandı.
+
+## 6. Kapsam Dışı (`docs/parking-lot.md`) ve Operasyonel Notlar
+Toplu sipariş tekrar deneme kuyruğu `docs/parking-lot.md` dosyasına aktarıldı.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| **OrderService** | Sipariş oluşturma iş akışını koordine eden uygulama katmanı servisi. |
+| **OrderRepository** | Sipariş verisinin kalıcı depoya yazılmasından sorumlu altyapı bileşeni. |
+EOF
+  git -C "$repo" add docs/walkthroughs/2026-11-12-orders.md
+  git -C "$repo" commit -m "docs: complete deep walkthrough" --quiet
+
+  # Check gh pr create -> allow!
+  local out_pr_allow
+  out_pr_allow=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_allow" ".decision" "allow" "Comprehensive walkthrough covering all diff files must allow gh pr create"
+
+  # Check local merge into main (no remote) -> allow!
+  git -C "$repo" checkout main --quiet
+  local out_merge_allow
+  out_merge_allow=$(printf '%s' "$p_local_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_allow" ".decision" "allow" "Comprehensive walkthrough covering all diff files must allow local merge when no remote exists"
 }
 
 test_post_command_sets_pr_audit_flag_and_triggers_graphify_on_merge() {

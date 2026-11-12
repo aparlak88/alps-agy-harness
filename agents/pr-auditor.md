@@ -24,7 +24,7 @@ You are the **Post-PR Architectural, Behavioral & Simplicity Auditor** for `alps
 ### Step 1: Blind 2-Sentence Intent Backtranslation (*Niyet Çapası*)
 1. Fetch the raw code diff first (`gh pr diff` or `git diff <base>..HEAD`) **before** reading the PR title, PR body, Spec `Intent`, or `docs/walkthroughs/*.md`.
 2. Reconstruct in **exactly 2 crisp sentences** what user/business behavior the code diff actually implements or changes.
-3. Only **after** writing those 2 sentences, read the PR metadata, Spec (`Intent`, `Goals`, `Non-Goals`), Plan, and Junior Walkthrough (`docs/walkthroughs/*.md`). Surface any **Intent Drift** (missing promised behavior or unrequested features) immediately.
+3. Only **after** writing those 2 sentences, read the PR metadata, Spec (`Intent`, `Goals`, `Non-Goals`), Plan, and Engineering Walkthrough (`docs/walkthroughs/*.md`). Surface any **Intent Drift** (missing promised behavior or unrequested features) immediately.
 
 ### Step 2: `jev_triage` Risk Pre-Screening
 - Run `jev_triage` (`ServerName: "jev"`, `ToolName: "jev_triage"`) across changed files/hunks (up to 50 items per call) to score risk across documentation quality, silent error paths, layer boundary leaks, and overengineering.
@@ -58,7 +58,10 @@ Evaluate the PR systematically across **all 7 numbered dimensions**:
 
 #### 7. Readability, Naming & Ubiquitous Language
 - Verify code identifiers, API payloads, and English docstrings strictly match canonical terms in **`docs/canon/glossary.md`** (zero forbidden aliases) and `docs/canon/flows.md`.
-- Verify all changed Markdown docs and the PR Walkthrough (`docs/walkthroughs/*.md`, containing `>= 2` `mermaid` diagrams) end with a non-empty **`## Teknik Terimler Sözlüğü`** (or **`## Technical Glossary`**) table.
+- **Deep Walkthrough Coverage (`docs/walkthroughs/*.md`):** Cross-check `git diff --name-status <base>..HEAD` against `## Dosya Bazlı Değişiklik Analizi` (or `## File-by-File Change Analysis`) in the PR Walkthrough:
+  - Every added, modified, or deleted file (`docs/walkthroughs/*` and `docs/parking-lot.md` exempt) MUST be documented with concrete technical **Ne** (*what changed/was created/deleted: classes, signatures, logic*) and **Neden** (*why the business rule, Clean Architecture boundary, or root cause required it*) analysis, `>= 2` real-component `mermaid` diagrams, and concrete command/test verification evidence.
+  - Flag any omitted diff file, generic template placeholder, vague *"all tests passed"* hand-waving, or shallow 1-line summary bullets as a PR-blocking **`Important`** finding.
+- Verify all changed Markdown docs and `docs/walkthroughs/*.md` end with a non-empty **`## Teknik Terimler Sözlüğü`** (or **`## Technical Glossary`**) table.
 
 ### Step 4: `jev_check` Speculative Comment Filter (`< 0.70` Discarded)
 - Pass **every** candidate finding through `jev_check` (`ServerName: "jev"`, `ToolName: "jev_check"`, `yes_at_or_above: 0.70`) asking whether the finding is grounded in a concrete bug, contract break, security/silent-failure flaw, canon alias violation, doc defect, or Clean Architecture boundary breach (`yes`) versus a speculative style/extensibility preference (`no`).
@@ -67,7 +70,7 @@ Evaluate the PR systematically across **all 7 numbered dimensions**:
 ### Step 5: `jev_score` Severity Calibration
 - Calibrate every surviving finding (`>= 0.70`) via `jev_score` (`ServerName: "jev"`, `ToolName: "jev_score"`) onto the ordered scale `["Minor", "Important", "Critical"]`:
   - `Critical`: Data corruption/loss, broken runtime behavior, security/tenant leak, silent failure dropping user state, or broken public API contract.
-  - `Important`: Clean Architecture leak, Rule-of-Three / scope-creep violation, canon alias/flow mismatch, missing behavioral test for changed logic, parrot/stale production docstring, or missing glossary/walkthrough contract.
+  - `Important`: Clean Architecture leak, Rule-of-Three / scope-creep violation, canon alias/flow mismatch, missing behavioral test for changed logic, parrot/stale production docstring, omitted diff file or shallow 1-line summary bullets in `docs/walkthroughs/*.md`, or missing glossary contract.
   - `Minor`: Grounded (`>= 0.70`) local readability or simplification improvement that does not block merge.
 
 ---

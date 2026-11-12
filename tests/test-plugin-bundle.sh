@@ -82,10 +82,10 @@ test_all_eleven_skills_frontmatter_and_folder_match() {
     return 1
   fi
 
-  # 4. Verify total tracked/staged/working plugin bundle file count (excluding docs/superpowers/)
+  # 4. Verify total tracked/staged/working plugin bundle file count (excluding project lifecycle docs)
   local bundle_count
-  bundle_count=$(git -C "$REPO_ROOT" ls-files -c -o --exclude-standard | grep -v "^docs/superpowers/" | wc -l | tr -d '[:space:]')
-  assert_eq "49" "$bundle_count" "Plugin bundle must have exactly 49 files (excluding docs/superpowers/)"
+  bundle_count=$(git -C "$REPO_ROOT" ls-files -c -o --exclude-standard | grep -Ev "^docs/(superpowers|walkthroughs|canon)/|^docs/parking-lot\.md$" | wc -l | tr -d '[:space:]')
+  assert_eq "49" "$bundle_count" "Plugin bundle must have exactly 49 core files (excluding docs/superpowers/, docs/walkthroughs/, docs/canon/, docs/parking-lot.md)"
 }
 
 test_templates_and_readme_glossary_and_mermaid_contracts() {
@@ -131,18 +131,21 @@ test_templates_and_readme_glossary_and_mermaid_contracts() {
   assert_contains "$glossary_content" "Invariants" "Glossary template must have Invariants column"
   assert_contains "$glossary_content" "Forbidden Aliases" "Glossary template must have Forbidden Aliases column"
 
-  # 4. Walkthrough template checks: >= 2 mermaid diagrams and all 5 mandatory sections
+  # 4. Walkthrough template checks: >= 2 mermaid diagrams and all 6 mandatory deep engineering sections
   local wt_content
   wt_content=$(cat "$wt_tpl")
   local mermaid_count
   mermaid_count=$(grep -c '```mermaid' "$wt_tpl" || true)
   [ "$mermaid_count" -ge 2 ] || { echo "Walkthrough template must contain >= 2 mermaid blocks, found $mermaid_count" >&2; return 1; }
 
-  assert_contains "$wt_content" "İş Amacı ve Mimari Özet" "Walkthrough template Section 1 required"
-  assert_contains "$wt_content" "Katman ve Modül Değişiklik Haritası" "Walkthrough template Section 2 required"
-  assert_contains "$wt_content" "Veri ve Durum Akışı Diyagramları" "Walkthrough template Section 3 required"
-  assert_contains "$wt_content" "Doğrulama Kanıtları" "Walkthrough template Section 4 required"
-  assert_contains "$wt_content" "Kapsam Dışı Bırakılanlar" "Walkthrough template Section 5 required"
+  assert_contains "$wt_content" "Problem Bağlamı ve Mimari Kararlar" "Walkthrough template Section 1 required"
+  assert_contains "$wt_content" "Mimari ve Veri Akışı Diyagramları" "Walkthrough template Section 2 required"
+  assert_contains "$wt_content" "Dosya Bazlı Değişiklik Analizi" "Walkthrough template Section 3 (per-file analysis) required"
+  assert_contains "$wt_content" "Ne Değişti / Ne Üretildi" "Walkthrough template per-file 'What' prompt required"
+  assert_contains "$wt_content" "Neden Değişti / Neden Üretildi" "Walkthrough template per-file 'Why' prompt required"
+  assert_contains "$wt_content" "Kritik İş Mantığı, Kenar Durumlar (Edge Cases) ve Hata Yönetimi" "Walkthrough template Section 4 required"
+  assert_contains "$wt_content" "Somut Doğrulama Kanıtları" "Walkthrough template Section 5 required"
+  assert_contains "$wt_content" "Kapsam Dışı" "Walkthrough template Section 6 required"
 
   # 5. README.md contracts: all 8 mandatory MCPs + optional XcodeBuildMCP + .harness-ignore + zero secrets
   local readme_content
@@ -318,28 +321,40 @@ EOF
   mkdir -p "$repo/docs/walkthroughs"
   local wt_doc_content
   wt_doc_content=$(cat << 'EOF'
-# Pull Request Görsel Rehberi: Faturalandırma Modülü
+# Pull Request Mühendislik Rehberi: Faturalandırma Modülü
 
-## 1. İş Amacı ve Mimari Özet
-Abonelik faturalandırma mantığını işlemek için Billing sınıfı eklendi.
+## 1. Problem Bağlamı ve Mimari Kararlar
+Abonelik ödemelerinde tutar hesaplamasını sunum katmanından ayırmak için saf `Billing` domain sınıfı ve ilgili abonelik tasarım spesifikasyonu oluşturuldu.
 
-## 2. Katman ve Modül Değişiklik Haritası
+## 2. Mimari ve Veri Akışı Diyagramları
 ```mermaid
 flowchart LR
-    Domain["Domain: Billing"] --> Infra["Infrastructure: PaymentGateway"]
+    Spec["docs/superpowers/specs/billing-spec.md"] --> Billing["Domain: Billing (src/Billing.ts)"]
 ```
 
-## 3. Veri ve Durum Akışı Diyagramları
 ```mermaid
 sequenceDiagram
-    Client->>Billing: Checkout
-    Billing-->>Client: Success
+    Client->>Billing: new Billing()
+    Billing-->>Client: amount = 100
 ```
 
-## 4. Doğrulama Kanıtları
-Birim testleri ve statik analiz tamamlandı.
+## 3. Dosya Bazlı Değişiklik Analizi
 
-## 5. Kapsam Dışı Bırakılanlar
+### `src/Billing.ts` — [ÜRETİLDİ] (`Domain`)
+- **Ne Değişti / Ne Üretildi?:** Varsayılan faturalandırma tutarını (`amount = 100`) barındıran `Billing` domain sınıfı dışa aktarıldı.
+- **Neden Değişti / Neden Üretildi?:** Abonelik ücretlendirme kurallarını altyapı ve arayüz bağımlılıklarından arındırılmış çekirdek modülde temsil etmek için üretildi.
+
+### `docs/superpowers/specs/billing-spec.md` — [ÜRETİLDİ] (`Architecture Spec`)
+- **Ne Değişti / Ne Üretildi?:** Faturalandırma modülünün iş amacını (`Intent`) ve temel terim sözlüğünü tanımlayan spesifikasyon dokümanı eklendi.
+- **Neden Değişti / Neden Üretildi?:** Kodlama öncesinde abonelik faturalandırma kapsamını ve kanonik terimleri kayıt altına almak için üretildi.
+
+## 4. Kritik İş Mantığı, Kenar Durumlar (Edge Cases) ve Hata Yönetimi
+Varsayılan tutar sabit olarak başlatılır; negatif tutar girişleri sonraki iterasyonda Value Object doğrulaması ile engellenecektir.
+
+## 5. Somut Doğrulama Kanıtları
+`pre-edit-guard.sh`, `pre-command-guard.sh` ve `stamp-gate.sh` kontrolleri uçtan uca senaryo testinde sıfır hata ile doğrulandı.
+
+## 6. Kapsam Dışı (`docs/parking-lot.md`) ve Operasyonel Notlar
 Taksitli ödemeler V2 otoparkına bırakıldı.
 
 ## Teknik Terimler Sözlüğü
