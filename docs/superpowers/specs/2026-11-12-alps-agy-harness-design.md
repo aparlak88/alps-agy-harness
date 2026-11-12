@@ -26,14 +26,14 @@ Antigravity (`agy`) kullanan ekip üyelerinin her projede aynı mühendislik kal
 ## 2. Hedefler, Kapsam Dışı Olanlar ve Anti-Hedefler
 
 ### 2.1. Hedefler (Goals)
-1. **Tek Komutla Takım Dağıtımı ve Ortam Teşhisi (`harness-doctor`):** Takım arkadaşlarının `README.md` içindeki ön gereksinimleri (`superpowers`, zorunlu MCP'ler, Marketplace eklentileri) kurduktan sonra `agy plugin install <repo-url>` ile yükleyebileceği ve `harness-doctor` ile tüm ortam/proje hazırlığını 3 saniyede doğrulayabileceği bağımsız bir eklenti paketi sunmak.
-2. **Deterministik Yaşam Döngüsü Kapıları (`hooks.json`):** `main` dalında doğrudan üretim kodu yazılmasını, sürümü doğrulanmamış paket kurulmasını, plan kapsamı dışı dosyalara izinsiz dokunulmasını, `jev` yönlendirmesi yapılmadan rastgele modelle alt ajan (`invoke_subagent`) çağrılmasını (`overwrite` ile Gemini modeli ve efor profilini kilitleyerek), güvenlik/kanon/walkthrough adımları tamamlanmadan PR açılmasını (`gh pr create`) ve PR sonrası denetim (`pr-auditor`) bitmeden oturumun kapanmasını fiziksel olarak engellemek; `main`'e merge/pull sonrası `graphify` bilgi grafiğini otomatik güncellemek.
+1. **Esnek Kurulum (Global veya Proje Bazlı) ve Ortam Teşhisi (`harness-doctor`):** Takım arkadaşlarının ön gereksinimleri kurduktan sonra aynı eklenti paketini ister **Global** (`~/.gemini/config/plugins/alps-agy-harness/`, kişisel deneme projeleri için `.harness-ignore` kaçış dosyası destekli) ister **Proje Bazlı** (`.agents/plugins/alps-agy-harness/` veya `.agents/plugins.json`) olarak yükleyebileceği ve `harness-doctor` ile tüm hazırlığı 3 saniyede doğrulayabileceği bağımsız bir eklenti sunmak.
+2. **Deterministik Yaşam Döngüsü Kapıları (`hooks.json`):** `main` dalında doğrudan üretim kodu yazılmasını, sürümü doğrulanmamış paket kurulmasını, plan kapsamı dışı dosyalara izinsiz dokunulmasını, `jev` yönlendirmesi yapılmadan rastgele modelle alt ajan (`invoke_subagent`) çağrılmasını (`overwrite` ile Gemini modeli ve efor profilini kilitleyerek), sonsuz mobil log akışlarının oturumu kilitlemesini, güvenlik/kanon/walkthrough adımları tamamlanmadan PR açılmasını (`gh pr create`) ve PR sonrası denetim (`pr-auditor`) bitmeden oturumun kapanmasını fiziksel olarak engellemek; `main`'e merge/pull sonrası `graphify` bilgi grafiğini otomatik güncellemek.
 3. **Zorunlu `jev` Karar & Ön-Eleme Katmanı:** Context penceresini şişirmeden dosya ve öğrenilmiş ders ön-elemesi (`jev_triage`), tek geçişte çoklu kanon/mimari/yalınlık kontrolü (`jev_ask`, `jev_check`), görev boyutu ve **alt ajan Gemini model + efor seviyesi yönlendirmesi** (`jev_classify`, `jev_score`), spekülatif inceleme yorumu elemesi (`jev_check`) ve bulgu/teknik borç öncelik kalibrasyonu (`jev_score`) yapmak.
 4. **Sürüm ve Dokümantasyon Yönetişimi (`context7`):** Brownfield projelerde sabitlenmiş sürümleri korumak; greenfield veya yeni paket seçimlerinde güncel kararlı sürümü doğrulayıp `context7` dokümantasyonunu okumadan Spec/Plan yazılmasını önlemek.
 5. **Üç Parçalı Proje Kanonu (`glossary` + `flows` + `lessons`) ve Doküman Sonu Sözlük Zorunluluğu:** Alan terimlerinin (`customer_subscription_tier`, `ClientWorkAddress` vb.) ve iş akışı adımlarının (`Request -> Log -> Validate -> DB Write` vb.) Spec, Plan ve Kod genelinde birebir tutarlı kalmasını sağlamak; çözülen sinsi bug ve platform tuzaklarını `lessons.md` içinde biriktirip sonraki işlerde sıfır context maliyetiyle (`jev_triage`) hatırlatmak; üretilen her Spec, Plan, PR Walkthrough ve teknik dokümanın sonuna **Teknik Terimler Sözlüğü** bölümü eklenmesini deterministik olarak zorlamak.
 6. **Mimari Karar & Trade-off Sunumu:** Önemli tasarım kararlarında uygulanabilir 2–3 yaklaşımı kazanç/kayıp matrisiyle kullanıcıya sunup seçilen kararı ADR olarak Spec'e kaydetmek.
 7. **Çok Platformlu DDD, Clean Architecture, Mimari Fitness Testleri, LSP ve Kod Dokümantasyonu:** `.NET (C#/XAML)`, `Angular (TypeScript)`, `iOS (Swift/SwiftUI)` ve `Android (Kotlin/Jetpack Compose)` için katman sınırlarını hem inceleme aşamasında hem de derleme/test zamanı **Mimari Fitness Testleri + Düzeltme Enjeksiyonu (*Remediation Injection*)** ile korumak; ilgili LSP araçlarını ve üretim kodunda anlamlı dokümantasyonu (`XMLDoc`, `TSDoc`, `Swift DocC`, `KDoc`) zorlamak.
-8. **PR Öncesi Güvenlik, Görsel Walkthrough ve PR Sonrası 7 Boyutlu Denetim:** PR açılmadan önce `security-reviewer` taraması ve repo içine (`docs/walkthroughs/`) Junior geliştirici seviyesinde bol Mermaid şemalı rehber üretimi; PR açıldıktan sonra `pr-auditor` ile derin inceleme; Web UI tarafında `@playwright/mcp` destekli E2E test akışı; RevenueCat, Firebase ve Postman iş akışı entegrasyonu.
+8. **PR Öncesi Güvenlik, Görsel Walkthrough, PR Sonrası 7 Boyutlu Denetim ve Çalışma Zamanı Teşhisi (Web & Mobil):** PR açılmadan önce `security-reviewer` taraması ve repo içine (`docs/walkthroughs/`) Junior geliştirici seviyesinde bol Mermaid şemalı rehber üretimi; PR açıldıktan sonra `pr-auditor` ile derin inceleme; **Web** tarafında `@playwright/mcp` + resmi `Chrome DevTools` eklentisi + sıfır-konsol-hatası E2E kalkanı ile tarayıcı konsol/ağ/performans teşhisi; **Mobil** tarafında `mobile-logs.sh` ile iOS Simulator (`.ips` crash + uygulama logu) ve Android Emulator (`--pid` logcat + crash/ANR) teşhisi; RevenueCat, Firebase ve Postman iş akışı entegrasyonu.
 9. **Anti-Overengineering, Context Kalkanı ve Entropi Temizliği:** İş boyutuna göre mimari orantılılık uygulamak, plan dışı dosya değişikliklerini engellemek (yan fikirleri `docs/parking-lot.md` dosyasına yönlendirmek), uzun derleme/test loglarını `run-quiet.sh` ile süzerek context çürümesini önlemek, inceleyicilerde önce kullanıcı niyetini doğrulamak (*Intent Backtranslation*) ve isteğe bağlı `entropy-sweep` moduyla otoparktaki teknik borcu özellik PR'larından ayrı mikro-PR'larla eritmek.
 
 ### 2.2. Kapsam Dışı Olanlar (Non-Goals)
@@ -53,12 +53,15 @@ Antigravity (`agy`) kullanan ekip üyelerinin her projede aynı mühendislik kal
 
 ## 3. Kısıtlar, Ortam Varsayımları ve Ön Gereksinimler (`README.md` Sözleşmesi)
 
-### 3.1. Çalışma Ortamı, Git Akışı ve Dil Standardı
+### 3.1. Çalışma Ortamı, Kurulum Kapsamı, Git Akışı ve Dil Standardı
 - **Kaynak Kontrol & PR Platformu:** GitHub (`gh` CLI üzerinden kimlik doğrulaması yapılmış).
+- **Esnek Kurulum Kapsamı (Global veya Proje Bazlı):** Eklenti sabit makine yolu varsayımı yapmaz (`$PLUGIN_ROOT` ve `workspacePaths[0]` üzerinden dinamik çalışır) ve her iki kullanım modunu destekler:
+  1. **Global Kurulum (`~/.gemini/config/plugins/alps-agy-harness/`):** `agy plugin install <git-url>` ile kurulur ve tüm çalışma alanlarında etkinleşir. Global kurulumda kişisel deneme/hobi klasörlerini harness kapılarından muaf tutmak için çalışma alanı köküne **`.harness-ignore`** dosyası konması yeterlidir; bu dosya varsa tüm hook'lar sessizce pasif geçer.
+  2. **Proje Bazlı Kurulum (`.agents/plugins/alps-agy-harness/` veya `.agents/plugins.json`):** Eklenti yalnızca seçili projenin `.agents/plugins/` dizinine konur veya `.agents/plugins.json` üzerinden bağlanır; bilgisayardaki diğer projeleri etkilemez.
 - **Dal Stratejisi:** `main` ana dalından özellik dalı (feature branch) veya git worktree açılarak çalışılır; `main` üzerinde doğrudan geliştirme yapılmaz ve PR açılmadan doğrudan yerel birleştirme/push yapılmaz.
 - **İşletim Sistemi / Kabuk:** macOS ve Linux üzerinde POSIX `bash` + `jq` + `git` + `python3` *(Windows Git Bash uyumluluğu için betiklerde standart POSIX araçları kullanılır — [Builder Call])*.
 - **Dil Standardı:**
-  - **Kaynak Kod ve Kod İçi Dokümantasyon (`XMLDoc`, `TSDoc`, `Swift DocC`, `KDoc`) + Mimari Fitness Testi `REMEDIATION:` Mesajları:** **İngilizce** (`docs/canon/glossary.md` içindeki kanonik İngilizce tip/alan tanımlayıcılarıyla birebir uyumlu).
+  - **Kaynak Kod ve Kod İçi Dokümantasyon (`XMLDoc`, `TSDoc`, `Swift DocC`, `KDoc`) + Mimari Fitness / E2E Testi `REMEDIATION:` Mesajları:** **İngilizce** (`docs/canon/glossary.md` içindeki kanonik İngilizce tip/alan tanımlayıcılarıyla birebir uyumlu).
   - **Repo İçi Markdown Dokümanları (`docs/walkthroughs/`, `docs/canon/{glossary,flows,lessons}.md` açıklamaları, `docs/superpowers/specs & plans`, `docs/parking-lot.md`) ve Sohbet İletişimi:** Varsayılan olarak **Türkçe** *(Brownfield bir projede mevcut repo dokümanlarında yerleşik başka bir dil standardı varsa o projenin diline uyulur)*.
 
 ### 3.2. `README.md` İçinde Belgelenecek Zorunlu Ön Gereksinimler
@@ -69,6 +72,8 @@ Takım üyeleri `alps-agy-harness` eklentisini kurmadan önce aşağıdaki bile�
 2. **Antigravity Marketplace Eklentileri:**
    - **Firebase:** `antigravity-plugins-official/plugin/firebase`
    - **Postman:** `antigravity-plugins-partners/plugin/postman`
+   - **Chrome DevTools (Web Konsol/Ağ/Performans Teşhisi için Zorunlu):** `antigravity-plugins-official/plugin/chrome-devtools-plugin`
+   - **Android CLI *(Android/Mobil çalışan ekip üyeleri için önerilen)*:** `antigravity-plugins-official/plugin/android-cli-plugin`
 3. **Zorunlu Global MCP Sunucuları (`~/.gemini/config/mcp_config.json`):**
    - **`jev` (Zorunlu):** `npx -y jev-mcp` — her ekip üyesi `TYPESAFE_API_KEY` alır (`~/.config/typesafe/key` veya güvenli ortam değişkeni sarmalayıcısı ile; düz metin anahtar repoya girmez).
    - **`context7`:** `npx -y @upstash/context7-mcp`
@@ -78,33 +83,35 @@ Takım üyeleri `alps-agy-harness` eklentisini kurmadan önce aşağıdaki bile�
    - **`graphify`:** `uv tool install graphifyy` + `/graphify` skill kurulumu ve proje bazlı/global `graphify.serve` MCP yapılandırması
    - **`revenuecat`:** Streamable HTTP uzak MCP (`"url": "https://mcp.revenuecat.ai/mcp"`, OAuth / API v2 anahtarı ile)
    - **`filesystem`:** `npx -y @modelcontextprotocol/server-filesystem <projeler-kök-dizini>`
-4. **CLI Araçları:** `gh` (GitHub CLI), `jq`, `node` (`>=20`), `uv` / `python3`.
+   - *(Opsiyonel — yalnız macOS/iOS çalışanlar için `README.md` şablonu)*: **`XcodeBuildMCP`** (`npx -y xcodebuildmcp@latest mcp`)
+4. **CLI Araçları:** `gh` (GitHub CLI), `jq`, `node` (`>=20`), `uv` / `python3` *(mobil projelerde ek olarak macOS `xcrun simctl` ve Android SDK `adb`)*.
 
 ---
 
 ## 4. Eklenti Paket Yapısı (`alps-agy-harness`)
 
-Antigravity native plugin kuralları gereği `plugin.json` ve `hooks.json` doğrudan depo kökünde yer alır *(böylece `agy plugin install <git-url>` doğrudan `~/.gemini/config/plugins/alps-agy-harness/` olarak yükler — [Builder Call])*:
+Antigravity native plugin kuralları gereği `plugin.json` ve `hooks.json` doğrudan depo kökünde yer alır *(böylece hem `~/.gemini/config/plugins/alps-agy-harness/` altında global hem de `.agents/plugins/alps-agy-harness/` altında proje bazlı yüklenir — [Builder Call])*:
 
 ```text
 alps-agy-harness/
 ├── plugin.json                        # Eklenti manifestosu
 ├── hooks.json                         # Antigravity yaşam döngüsü kancaları (kökte zorunlu)
-├── README.md                          # Ön gereksinimler, MCP şablonları ve takım kurulum rehberi
+├── README.md                          # Global/Proje kurulumu, ön gereksinimler ve MCP şablonları
 ├── assets/
 │   └── logo.svg                       # Eklenti logosu [Builder Call]
 ├── scripts/
 │   ├── hooks/
-│   │   ├── common.sh                  # JSON stdin ayrıştırma, git/tree-SHA ve durum yardımcıları
+│   │   ├── common.sh                  # JSON stdin, .harness-ignore kaçışı, git/tree-SHA yardımcıları
 │   │   ├── session-start.sh           # SessionStart: router + proje durumu + ön gereksinim kontrolü
-│   │   ├── pre-edit-guard.sh          # PreToolUse (write_file|edit_file): main kilidi + tehlikeli desen kapısı
-│   │   ├── pre-command-guard.sh       # PreToolUse (run_command): paket kurulum kilidi + sert PR kapısı
+│   │   ├── pre-edit-guard.sh          # PreToolUse (write_file|edit_file): main kilidi + sözlük + güvenlik kapısı
+│   │   ├── pre-command-guard.sh       # PreToolUse (run_command): paket + logcat/stream + sert PR kapısı
 │   │   ├── pre-subagent-guard.sh      # PreToolUse (invoke_subagent): hibrit jev model/efor kilidi + overwrite
 │   │   ├── post-command-hooks.sh      # PostToolUse (run_command): PR açıldı bayrağı + graphify --update
 │   │   └── stop-gate.sh               # Stop: PR sonrası pr-auditor çalışmadan durmayı engelleme
 │   ├── stamp-gate.sh                  # Alt ajanların .harness/state/<branch>/ damgası ve dispatch yazma/doğrulama aracı
-│   ├── harness-doctor.sh              # 8 MCP, TYPESAFE_API_KEY, LSP, superpowers ve repo kanon teşhis aracı
-│   └── run-quiet.sh                   # Context çürümesi kalkanı: uzun build/test loglarını süzüp tek satır özet döndürür
+│   ├── harness-doctor.sh              # 8 MCP, TYPESAFE_API_KEY, Chrome DevTools, LSP/mobil ve kanon teşhis aracı
+│   ├── run-quiet.sh                   # Context çürümesi kalkanı: uzun build/test loglarını süzüp tek satır özet döndürür
+│   └── mobile-logs.sh                 # Mobil teşhis: iOS Simulator (.ips crash + log) ve Android (--pid logcat/ANR) süzgeci
 ├── rules/
 │   ├── AGENTS.md                      # Always-on ana orkestrasyon sözleşmesi (<8 KB bütçe dostu)
 │   ├── dotnet-clean-arch.md           # trigger: glob (**/*.cs, **/*.xaml, **/*.csproj, **/*.sln, **/*.slnx)
@@ -138,7 +145,9 @@ alps-agy-harness/
     │   └── SKILL.md
     ├── entropy-sweep/                 # İsteğe bağlı otopark (parking-lot.md) ve teknik borç mikro-PR temizliği
     │   └── SKILL.md
-    ├── playwright-e2e/                # @playwright/mcp ile keşif + kalıcı @playwright/test E2E yazımı
+    ├── playwright-e2e/                # @playwright/mcp + Chrome DevTools + sıfır-konsol-hatası E2E akışı
+    │   └── SKILL.md
+    ├── mobile-diagnostics/            # iOS Simulator ve Android Emulator log, crash (.ips/ANR) ve ekran teşhisi
     │   └── SKILL.md
     └── revenuecat-integration/        # RevenueCat MCP + iOS/Android/Backend Clean Architecture entegrasyonu
         └── SKILL.md
@@ -217,11 +226,11 @@ Hook betiklerinin alt ajan denetimlerini deterministik doğrulayabilmesi ve `run
   - `pr-audit-pending.json`: `{"prUrl":"...","stopRetries":0}`
 
 ### 6.2. Yaşam Döngüsü Hook'ları (`hooks.json`)
-Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlanır (`camelCase` JSON girdi/çıktı kontratı):
+Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlanır (`camelCase` JSON girdi/çıktı kontratı). **Global Kurulum Kaçışı (`.harness-ignore`):** `common.sh`, her hook başında `workspacePaths[0]/.harness-ignore` dosyasını kontrol eder; dosya mevcutsa tüm hook'lar hiçbir kısıtlama uygulamadan anında pasif (`{}` veya `{"decision":"allow"}`) döner:
 
 1. **`SessionStart` (`scripts/hooks/session-start.sh`):**
    - `workspacePaths[0]` içinde aktif git dalını, `docs/canon/{glossary,flows,lessons}.md` ve `graphify-out/graph.json` varlığını, ayrıca temel CLI ön gereksinimlerini (`gh`, `jq`) kontrol eder; eksik ön gereksinim görürse `harness-doctor.sh` çalıştırılmasını hatırlatır.
-   - `injectSteps` → `systemMessage` ile `using-superpowers` + `alps-agy-harness` yönlendirme kurallarını (`run-quiet.sh` ve `jev` alt ajan yönlendirme kuralı dahil) ve çalışma alanı durum özetini ilk turdan bağlama enjekte eder.
+   - `injectSteps` → `systemMessage` ile `using-superpowers` + `alps-agy-harness` yönlendirme kurallarını (`run-quiet.sh`, `mobile-logs.sh` ve `jev` alt ajan yönlendirme kuralı dahil) ve çalışma alanı durum özetini ilk turdan bağlama enjekte eder.
 
 2. **`PreToolUse` — `write_file|edit_file` (`scripts/hooks/pre-edit-guard.sh`):**
    - **`main` / `master` Üretim Kodu Kilidi:** Hedef dosya çalışma alanı içindeyse, depoda en az bir commit varsa (`git rev-parse --verify HEAD`) ve aktif dal `main` veya `master` ise üretim kodu ve uygulama yapılandırma dosyalarının yazılmasını `"decision": "deny"` ile reddeder (*İstisna [Builder Call]:* `docs/superpowers/specs/` ve `docs/canon/` altındaki tasarım dokümanları brainstorming sırasında `main` üzerinde taslaklanabilir; kodlamaya geçmeden feature branch/worktree zorunludur).
@@ -229,6 +238,7 @@ Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlan
    - **Anlık Tehlikeli Desen Kapısı (`security-guidance` Per-Edit):** Yazılan içerikte deterministik yüksek risk kalıpları (`eval(`, `dangerouslySetInnerHTML`, Angular `bypassSecurityTrust*`, SQL string birleştirme, `-----BEGIN .* PRIVATE KEY-----` gibi açık anahtar blokları) yakalanırsa `"decision": "deny"` (meşru kullanım şüphesinde gerekçeli `"decision": "force_ask"`) döner.
 
 3. **`PreToolUse` — `run_command` (`scripts/hooks/pre-command-guard.sh`):**
+   - **Sonsuz Mobil Log Akışı Kilidi:** Komut `-d` bayrağı olmadan çıplak `adb logcat` veya süresiz `xcrun simctl ... log stream` çalıştırıyorsa oturum kilitlenmesini ve sistem log taşmasını önlemek için `"decision": "deny"` döner ve yerine `scripts/mobile-logs.sh` süzgecinin kullanılmasını ister.
    - **PR-Only `main` / `master` Koruma Kapısı *[Builder Call]*:** Depoda uzak sunucu (`git remote`) tanımlıysa, PR kapılarının etrafından dolaşılmasını (`superpowers:finishing-a-development-branch` Seçenek 1 yerel birleştirme bypass'ını) önlemek için `git push` ile doğrudan `main`/`master` dalına itme veya aktif dal `main`/`master` iken yerel bir özellik dalını `git merge` ile birleştirme girişimlerini `"decision": "deny"` ile reddeder (`git pull --ff-only` ve `gh pr merge` serbesttir; henüz `git remote` tanımlanmamış tamamen yerel prototip depolarda ise yerel `git merge` ancak aşağıdaki PR damgaları ve Walkthrough tamamsa izin alır).
    - **Paket Kurulum Kapısı:** Komut yeni bir 3. parti paket ekliyorsa (`npm i <pkg>`, `npm install <pkg>`, `pnpm add`, `yarn add`, `dotnet add package`, `uv add`, `pod install` vb.; çıplak kilit kurulumu `npm ci` / `npm install` / `dotnet restore` hariç), paketin mevcut Spec `Global Constraints` içinde veya `.harness/state/<branch>/context7-verified.json` dosyasında kaydı yoksa `"decision": "deny"` döner ve önce `dependency-versions` skill'iyle sürüm + `context7` doğrulaması yapılmasını ister.
    - **Sert PR Açma Kapısı (`gh pr create`):** Komut `gh pr create` içeriyorsa sırasıyla şunları doğrular:
@@ -350,9 +360,9 @@ Ajanın DDD/Clean Architecture ve derin inceleme kurallarını bahane ederek ger
 | Kural Dosyası | Glob Deseni | Clean Architecture & DDD Kuralları *[Builder Call — Web Best-Practice Sentezi]* | Mimari Fitness Testi & Zorunlu LSP / Kod Dokümantasyonu |
 | :--- | :--- | :--- | :--- |
 | `dotnet-clean-arch.md` | `**/*.cs, **/*.xaml, **/*.csproj, **/*.sln, **/*.slnx, **/Directory.Packages.props` | **Domain:** Saf C#; sıfır EF Core / JSON / ASP.NET bağımlılığı ve data annotation; zengin Aggregate Root + `record` Value Object + `IDomainEvent`. **Application:** CQRS (Command/Query ayrımı), use-case handler, FluentValidation, repository/servis arayüzleri. **Infrastructure:** `IEntityTypeConfiguration<T>`, dış servis adaptörleri, dayanıklılık (Polly). **Presentation:** İnce Minimal API / Controller, merkezi `IExceptionHandler` (`RFC 7807`). | **Fitness Testi:** `NetArchTest.Rules` veya `ArchUnitNET` (`ArchitectureTests.cs`). **LSP:** `csharp-lsp` (`csharp_diagnostics`, `csharp_references`, `csharp_rename`, XAML `xaml_validate` / `xaml_find_binding_errors`). Üretim kodunda anlamlı **XMLDoc** (`/// <summary>`, `<param>`, `<returns>`, `<exception>`). |
-| `angular-typescript.md` | `**/*.ts, **/*.tsx, **/*.html, **/angular.json, **/tsconfig*.json` | Bounded Context (özellik) bazlı dilimleme: **`model/` (Domain):** Saf TypeScript tipleri ve doğrulama kuralları; sıfır `@angular/*` veya `HttpClient`. **`application/`:** Signal tabanlı feature store / use-case facade (`signal`, `computed`). **`infrastructure/`:** API adaptörleri + DTO→Domain mapper. **`presentation/`:** Standalone bileşenler (`NgModule` yasak), `@if/@for/@defer`, yalın şablonlar. | **Fitness Testi:** `@softarc/sheriff` veya `eslint-plugin-boundaries` katman kuralı. **LSP:** `typescript-lsp` tanılaması ve sembol analizi; UI akışlarında `playwright-e2e`. Üretim kodunda (`*.spec.ts`, `*.test.ts` hariç) anlamlı **TSDoc** (`/** ... @param @returns */`). |
-| `ios-swift.md` | `**/*.swift, **/Package.swift, **/*.xcodeproj/**` | Yerel **Swift Package Manager (SPM)** modül sınırları: **`Domain` paketi:** Saf Swift (`struct` Entity/ValueObject, UseCase, Repository `protocol`); sıfır `SwiftUI`/`UIKit`/ağ kütüphanesi. **`Data` paketi:** Somut repository + DTO mapper. **`Features` paketleri:** `@Observable` ViewModel + yalın SwiftUI View (`Data` modülünü doğrudan import edemez). **`App`:** Composition Root (DI bağlantısı). | **Fitness Testi:** `Package.swift` target bağımlılık grafiği + `Domain`/`Features` yasaklı `import` XCTest/Swift Testing kontrolü. Üretim kodunda (`*Tests.swift` hariç) anlamlı **Swift DocC** (`///`, `- Parameters:`, `- Returns:`, `- Throws:`). |
-| `android-kotlin.md` | `**/*.kt, **/*.kts, **/libs.versions.toml` | Çok modüllü Gradle + Google App Architecture + DDD: **`:domain` modülü:** Saf Kotlin (`kotlin("jvm")`, sıfır `android.*` bağımlılığı; Entity, ValueObject, `operator fun invoke` UseCase, Repository `interface`). **`:data` modülü:** Room/Retrofit/Firebase + DTO→Domain mapper + Hilt `@Binds`. **`:features:*` modülleri:** Tek yönlü veri akışı (UDF `StateFlow`), `collectAsStateWithLifecycle()`, stateless Jetpack Compose (`:data` modülüne doğrudan bağımlı olamaz). | **Fitness Testi:** Gradle modül izolasyonu + Konsist / JUnit paket sınır testi. Üretim kodunda (`*Test.kt` hariç) anlamlı **KDoc** (`/** ... @param @return @throws */`). |
+| `angular-typescript.md` | `**/*.ts, **/*.tsx, **/*.html, **/angular.json, **/tsconfig*.json` | Bounded Context (özellik) bazlı dilimleme: **`model/` (Domain):** Saf TypeScript tipleri ve doğrulama kuralları; sıfır `@angular/*` veya `HttpClient`. **`application/`:** Signal tabanlı feature store / use-case facade (`signal`, `computed`). **`infrastructure/`:** API adaptörleri + DTO→Domain mapper. **`presentation/`:** Standalone bileşenler (`NgModule` yasak), `@if/@for/@defer`, yalın şablonlar. | **Fitness Testi:** `@softarc/sheriff` veya `eslint-plugin-boundaries` katman kuralı. **LSP & Teşhis:** `typescript-lsp`, `@playwright/mcp` konsol/ağ kapısı + `Chrome DevTools` + `playwright-e2e`. Üretim kodunda (`*.spec.ts`, `*.test.ts` hariç) anlamlı **TSDoc**. |
+| `ios-swift.md` | `**/*.swift, **/Package.swift, **/*.xcodeproj/**` | Yerel **Swift Package Manager (SPM)** modül sınırları: **`Domain` paketi:** Saf Swift (`struct` Entity/ValueObject, UseCase, Repository `protocol`); sıfır `SwiftUI`/`UIKit`/ağ kütüphanesi. **`Data` paketi:** Somut repository + DTO mapper. **`Features` paketleri:** `@Observable` ViewModel + yalın SwiftUI View (`Data` modülünü doğrudan import edemez). **`App`:** Composition Root (DI bağlantısı). | **Fitness Testi:** `Package.swift` target bağımlılık grafiği + `Domain`/`Features` yasaklı `import` kontrolü. **Simülatör Teşhisi:** `mobile-logs.sh --platform ios` (`.ips` crash + uygulama logu). Üretim kodunda (`*Tests.swift` hariç) anlamlı **Swift DocC**. |
+| `android-kotlin.md` | `**/*.kt, **/*.kts, **/libs.versions.toml` | Çok modüllü Gradle + Google App Architecture + DDD: **`:domain` modülü:** Saf Kotlin (`kotlin("jvm")`, sıfır `android.*` bağımlılığı; Entity, ValueObject, `operator fun invoke` UseCase, Repository `interface`). **`:data` modülü:** Room/Retrofit/Firebase + DTO→Domain mapper + Hilt `@Binds`. **`:features:*` modülleri:** Tek yönlü veri akışı (UDF `StateFlow`), `collectAsStateWithLifecycle()`, stateless Jetpack Compose (`:data` modülüne doğrudan bağımlı olamaz). | **Fitness Testi:** Gradle modül izolasyonu + Konsist / JUnit paket sınır testi. **Emülatör Teşhisi:** `mobile-logs.sh --platform android` (`--pid` logcat + crash/ANR). Üretim kodunda (`*Test.kt` hariç) anlamlı **KDoc**. |
 
 > **Derleme/Test Zamanı Mimari Fitness Testleri ve Düzeltme Enjeksiyonu (*Remediation Injection*):**
 > - **Greenfield projelerde** ilk iskelet kurulurken (`writing-plans` ilk görevi) ilgili platformun mimari fitness testini eklemek **zorunludur**; **brownfield projelerde** test zaten mevcutsa korunup çalıştırılır, mevcut değilse `architecture-tradeoffs` adımında eklenmesi kullanıcıya önerilir.
@@ -387,7 +397,14 @@ Bir planın tüm görevleri tamamlanıp PR açma aşamasına gelindiğinde (`fin
   6. **Fazlalık, Kapsam Kayması & Overengineering Cezası (Bloklayıcı):** Tek kullanımlık gereksiz soyutlamalar, istenmeyen ek özellikler ve kapsam dışı dosya değişiklikleri `Important` olarak işaretlenir.
   7. **Okunabilirlik, Basitleştirme & Glossary Uyumu**
   *(İnceleme raporu oturumda sunulur ve `pr-audit-pending.json` bayrağı temizlenir; kullanıcı isterse `gh pr comment` ile PR'a da eklenir — [Builder Call]).*
-- **`playwright-e2e`:** Web / Angular arayüz akışlarında `@playwright/mcp` ile canlı sayfanın erişilebilirlik ağacını (*accessibility snapshot*) inceleyerek kırılgan CSS seçiciler yerine rol/etiket tabanlı (`getByRole`, `getByLabel`), Page Object Model yapısında kalıcı `@playwright/test` E2E testleri üretir ve gerçek tarayıcıda doğrulamadan görevi kapatmaz.
+- **`playwright-e2e` (Web Arayüz, Konsol, Ağ ve Performans Teşhisi — `Seçenek 1`):** Web / Angular arayüz akışlarında 3 katmanlı çalışma zamanı doğrulaması uygular:
+  1. **Anlık Konsol & Ağ Okuma (`@playwright/mcp`):** Canlı sayfanın erişilebilirlik ağacını (*accessibility snapshot*) incelemenin yanı sıra `browser_console_messages` (`error`/`warning`) ve `browser_network_requests` (`4xx`/`5xx`/CORS) araçlarıyla görünmez çalışma zamanı hatalarını kontrol eder; kırılgan CSS seçiciler yerine rol/etiket tabanlı (`getByRole`, `getByLabel`) Page Object Model testleri üretir.
+  2. **Derin Teşhis (`Chrome DevTools` Eklentisi + Dev-Server Eşleştirmesi):** Başarısız API çağrılarının *request/response* gövdesini, *network waterfall* zincirini, bellek/layout sorunlarını ve *performance trace* çıktısını `Chrome DevTools` (`antigravity-plugins-official/plugin/chrome-devtools-plugin`) ile inceler; `5xx` sunucu hatalarında arka planda çalışan `ng serve` / `dotnet run` görev logundaki (`manage_task` / `.harness/logs/`) stack trace ile eşleştirir.
+  3. **Kalıcı "Sıfır Konsol Hatası" E2E Kalkanı:** Üretilen `@playwright/test` temel fixture'ına otomatik `page.on('pageerror')` (yakalanmamış JS/Angular istisnaları) ve beklenmeyen `console.error` / `status >= 500` dinleyicisi gömer; ekran görsel olarak çizilse bile konsola/ağa beklenmeyen hata düşerse testi İngilizce `REMEDIATION:` mesajıyla kırar (zararsız 3. parti analitik mesajları için açık allowlist desteklenir).
+- **`mobile-diagnostics` (`scripts/mobile-logs.sh` — iOS Simulator & Android Emulator Teşhisi — `Seçenek 1`):** Mobil simülatör ve emülatörlerde sistem log gürültüsünü ve sonsuz akış kilitlenmesini önleyerek uygulama hatalarını yakalar:
+  - **iOS Simulator (`mobile-logs.sh --platform ios --bundle-id <id> [--last 2m] [--screenshot]`):** `xcrun simctl spawn booted log show --last <süre>` üzerinde `subsystem`/`process` filtresi uygulayarak yalnızca hedef uygulamanın loglarını çeker; `~/Library/Logs/DiagnosticReports/` altındaki en güncel `.ips`/`.crash` çökme raporundan ilgili thread stack trace'ini ayıklar ve istenirse `simctl io booted screenshot` ile ekran görüntüsü alır.
+  - **Android Emulator (`mobile-logs.sh --platform android --package <pkg> [--screenshot]`):** `adb shell pidof <pkg>` ile uygulamanın PID değerini bulup `adb logcat -d --pid=<PID>` ve `adb logcat -b crash -d` çalıştırarak binlerce satırlık sistem gürültüsünü dışarıda bırakır; yalnızca hedef uygulamanın loglarını ve `AndroidRuntime` (`FATAL EXCEPTION` / `ANR`) yığın izlerini yakalar (`adb exec-out screencap -p` ekran görüntüsü destekli).
+  - Tüm ham çıktıyı `.harness/logs/mobile-<platform>-last.log` dosyasına yazar, context penceresine en fazla 100 satırlık süzülmüş hata/crash özeti döndürür (çoklu log dosyalarında `jev_triage` ile sıfır-context tarama yapılır).
 - **`revenuecat-integration`:** `RevenueCat/ai-toolkit` yaklaşımını Clean Architecture ile birleştirir; ürün/offering/entitlement yapılandırmasını RevenueCat MCP (`https://mcp.revenuecat.ai/mcp`) üzerinden doğrular, iOS/Android/Web SDK çağrılarını daima `Data/Infrastructure` katmanındaki bir `SubscriptionRepository` / `BillingGateway` adaptörü arkasına hapseder (`Domain` ve `Presentation` katmanlarına doğrudan RevenueCat SDK tipi sızmasını yasaklar). Firebase ve Postman kullanımlarında da aynı dış-katman izolasyonu korunur.
 
 ---
@@ -397,11 +414,11 @@ Bir planın tüm görevleri tamamlanıp PR açma aşamasına gelindiğinde (`fin
 1. **`harness-doctor` Kurulum ve Ortam Teşhis Aracı (`scripts/harness-doctor.sh` + `skills/harness-doctor/SKILL.md`):**
    - Takım üyeleri eklentiyi kurduğunda veya yeni bir çalışma alanına geçtiğinde tüm hazırlığı tek komutla (`harness-doctor.sh [--workspace <path>] [--json]`) 3 saniye içinde doğrular:
      1. **CLI Araçları & Kimlik:** `git`, `jq`, `node >= 20`, `python3`, `uv` ve `gh auth status`.
-     2. **Eklenti Bağımlılıkları:** `~/.gemini/config/plugins/superpowers` kurulum durumu ve Marketplace ön gereksinim kontrolü.
+     2. **Eklenti Bağımlılıkları:** `superpowers` ve zorunlu Marketplace eklentileri (`firebase`, `postman`, `chrome-devtools-plugin`) kurulum durumu.
      3. **8 Zorunlu Global MCP:** `~/.gemini/config/mcp_config.json` içinde `jev`, `context7`, `csharp-lsp`, `typescript-lsp`, `playwright`, `graphify`, `revenuecat`, `filesystem` anahtarlarının varlığı.
      4. **`jev` Anahtar Hazırlığı (Gizlilik Korumalı):** `TYPESAFE_API_KEY` ortam değişkeninin, `~/.config/typesafe/key` dosyasının veya yapılandırılmış `jev` başlatıcı betiğinin varlığını doğrular (**gizli anahtar değerini asla ekrana veya loglara basmaz**, yalnızca `[OK] present` / `[FAIL] missing` yazar).
-     5. **LSP & Graphify İkilileri:** `csharp-ls`, `csharp-lsp-mcp`, `graphify` erişilebilirliği.
-     6. **Aktif Proje Sağlığı:** `.gitignore`/`.git/info/exclude` içinde `.harness/` kaydı, `docs/canon/{glossary,flows,lessons}.md` ve `graphify-out/graph.json` durumu.
+     5. **LSP, Graphify & Mobil Araçlar:** `csharp-ls`, `csharp-lsp-mcp`, `graphify` erişilebilirliği; çalışma alanında iOS/Android dosyaları varsa platforma duyarlı `xcrun simctl` / `adb` hazırlığı (mobil olmayan projelerde eksikse `[FAIL]` değil bilgilendirici `[WARN]` döner).
+     6. **Aktif Proje Sağlığı:** Kurulum modu (Global / Proje bazlı / `.harness-ignore`), `.gitignore`/`.git/info/exclude` içinde `.harness/` kaydı, `docs/canon/{glossary,flows,lessons}.md` ve `graphify-out/graph.json` durumu.
    - Çıkış kodu tüm zorunlu kontroller geçtiğinde `0`, zorunlu ön gereksinim eksikliğinde `1` döner; her `[FAIL]` / `[WARN]` satırı altında kopyala-yapıştır hazır düzeltme komutu (`Fix: ...`) yer alır.
 
 2. **Context Çürümesi Kalkanı — "Sessiz Başarı, Detaylı Hata" (`scripts/run-quiet.sh` + `rules/AGENTS.md`):**
@@ -425,9 +442,9 @@ Bir planın tüm görevleri tamamlanıp PR açma aşamasına gelindiğinde (`fin
 
 Aşağıdaki iç uygulama detayları bu dokümandaki kontratları değiştirmemek kaydıyla planlayıcı ve uygulayıcıya bırakılmıştır:
 - `assets/logo.svg` görsel tasarımı.
-- `scripts/hooks/*.sh`, `scripts/harness-doctor.sh` ve `scripts/run-quiet.sh` içindeki yardımcı fonksiyonların iç modülerliği, hata mesajı metin şablonları ve `.harness/` (durum + eski log rotasyonu) temizlik yardımcıları.
+- `scripts/hooks/*.sh`, `scripts/harness-doctor.sh`, `scripts/run-quiet.sh` ve `scripts/mobile-logs.sh` içindeki yardımcı fonksiyonların iç modülerliği, hata mesajı metin şablonları ve `.harness/` (durum + eski log rotasyonu) temizlik yardımcıları.
 - Her `SKILL.md` dosyasının `references/` alt dosyalarına bölünme granülerliği (Antigravity `24 KB` kural sınırı ve progressive disclosure ilkelerine uyulduğu sürece).
-- Hook, damga, `harness-doctor` ve `run-quiet` betiklerini doğrulayan otomatik kabuk/entegrasyon test senaryolarının (`tests/`) iç dizin organizasyonu (doküman sonu sözlük başlık kontrolünde numaralı/numarasız `^## ([0-9]+\. )?(Teknik Terimler Sözlüğü|Technical Glossary)` eşleşmesi desteklenir).
+- Hook, damga, `harness-doctor`, `run-quiet` ve `mobile-logs` betiklerini doğrulayan otomatik kabuk/entegrasyon test senaryolarının (`tests/`) iç dizin organizasyonu (doküman sonu sözlük başlık kontrolünde numaralı/numarasız `^## ([0-9]+\. )?(Teknik Terimler Sözlüğü|Technical Glossary)` eşleşmesi desteklenir).
 
 ---
 
@@ -451,6 +468,7 @@ Aşağıdaki iç uygulama detayları bu dokümandaki kontratları değiştirmeme
 | **Harness** | Yapay zeka ajanlarının rastgele davranmasını önlemek için etraflarına kurulan deterministik kancalar (*hooks*), kurallar, alt ajanlar ve doğrulama kapılarından oluşan mühendislik çerçevesi. |
 | **Hook (`hooks.json`) & `overwrite`** | Antigravity'de ajan yaşam döngüsü adımlarında (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`) çalışan kabuk betikleri; `overwrite` ise bir araç çağrısının argümanlarını (ör. alt ajan `Model` ve `Prompt` alanlarını) çalışmadan hemen önce fiziksel olarak yeniden yazar. |
 | **Intent Backtranslation (*Niyet Çapası*)** | İnceleyici alt ajanın kod bulgularına geçmeden önce yalnızca kod farkına (*diff*) bakarak değişikliğin hangi kullanıcı amacını çözdüğünü özetlemesi ve Spec ile karşılaştırması tekniği. |
+| **`.ips` Crash Report & `adb logcat`** | macOS/iOS Simulator çökme yığınlarının kaydedildiği JSON tabanlı tanılama raporu (`.ips`) ile Android cihaz/emülatör çalışma zamanı ve çökme (`-b crash` / `ANR`) günlüklerini sağlayan köprü aracı. |
 | **`jev` (TypeSafe System One)** | Kod ve metinler üzerinde kalibre edilmiş olasılık dağılımı üreten değerlendirme motoru; `jev_triage` ile ana modelin context'ini kirletmeden sunucu tarafında ön-eleme, `jev_ask`/`jev_check`/`jev_score`/`jev_classify` ile hızlı karar kalibrasyonu yapar. |
 | **LSP (*Language Server Protocol*)** | Derleyici düzeyinde tip kontrolü, referans bulma ve sembol yeniden adlandırma yeteneklerini IDE ve MCP üzerinden ajana sunan protokol (`csharp-lsp`, `typescript-lsp`). |
 | **MCP (*Model Context Protocol*)** | Yapay zeka ajanlarının dış araçlara, dil sunucularına ve servislere standart bir şema üzerinden bağlanmasını sağlayan protokol. |
@@ -458,4 +476,5 @@ Aşağıdaki iç uygulama detayları bu dokümandaki kontratları değiştirmeme
 | **Overengineering (*Aşırı Mühendislik*)** | Mevcut problemi çözmek için gerekenden fazla soyutlama, tek kullanımlık arayüz veya *"ileride lazım olur"* karmaşıklığı üretilmesi kusuru. |
 | **Progressive Disclosure (*Aşamalı Yükleme*)** | Tüm kuralları ve yönergeleri aynı anda context penceresine yüklemek yerine yalnızca ilgili dosya deseni (`glob`) veya görev tetiklendiğinde belleğe alma prensibi. |
 | **SDD (*Subagent-Driven Development*)** | Uygulama planındaki her görevin taze bir alt ajana (*implementer*) yaptırılıp ardından bağımsız bir inceleyici alt ajanla (*reviewer*) denetlendiği geliştirme akışı. |
+| **Sıfır-Konsol-Hatası E2E Fixture'ı** | Web arayüz testlerinde sayfa görsel olarak açılsa bile arka planda yakalanmamış JS istisnası (`pageerror`), `console.error` veya `5xx` sunucu hatası oluştuğunda testi otomatik kıran koruyucu katman. |
 | **Ubiquitous Language (`glossary.md`)** | İş birimi, dokümanlar (Spec/Plan/Walkthrough) ve kaynak kod arasında aynı kavram için eş anlamlı karışıklığına izin vermeden kullanılan tekil kanonik terimler sözlüğü. |
