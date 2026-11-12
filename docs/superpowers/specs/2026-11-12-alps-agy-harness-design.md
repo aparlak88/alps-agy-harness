@@ -17,8 +17,9 @@ Antigravity (`agy`) kullanan ekip üyelerinin her projede aynı mühendislik kal
 3. Dokümanlar (Spec, Plan) ve kod arasında alan terimleri (*glossary*) ve iş akışı adımları (*canonical flows*) zamanla sessizce farklılaşır.
 4. Mimari karar noktalarında alternatifler artı/eksileriyle sunulmadan tek bir yaklaşım varsayılır.
 5. DDD & Clean Architecture sınırları, üretim kodu dokümantasyonu (XMLDoc/TSDoc/DocC/KDoc), PR öncesi güvenlik taraması, PR sonrası çok boyutlu denetim ve Junior geliştirici odaklı görsel PR rehberi (Mermaid) zorunlu ve fiziksel olarak denetlenen adımlar değildir.
+6. Ajanlar sıkı mimari ve inceleme kuralları altında karşıt bir **orantılılık ve kapsam freni** olmadığında basit işler için aşırı soyutlama üretir (*overengineering*), görev dışı komşu dosyaları kurcalar (*drive-by refactoring / scope creep*) ve inceleme turlarında asıl kullanıcı amacını unutup kodu şişirir (*goal drift*).
 
-`alps-agy-harness`, bu boşlukları **Antigravity yaşam döngüsü hook'ları (`hooks.json`)**, **zorunlu `jev` olasılıksal değerlendirme araçları**, **özelleştirilmiş alt ajanlar (`agents/*.md`)**, **süreç skill'leri (`skills/*/SKILL.md`)** ve **dosya desenine duyarlı kurallar (`rules/*.md`)** ile kapatır.
+`alps-agy-harness`, bu boşlukları **Antigravity yaşam döngüsü hook'ları (`hooks.json`)**, **zorunlu `jev` olasılıksal değerlendirme araçları**, **orantılılık ve karmaşıklık bütçesi kuralları**, **özelleştirilmiş alt ajanlar (`agents/*.md`)**, **süreç skill'leri (`skills/*/SKILL.md`)** ve **dosya desenine duyarlı kurallar (`rules/*.md`)** ile kapatır.
 
 ---
 
@@ -26,13 +27,14 @@ Antigravity (`agy`) kullanan ekip üyelerinin her projede aynı mühendislik kal
 
 ### 2.1. Hedefler (Goals)
 1. **Tek Komutla Takım Dağıtımı:** Takım arkadaşlarının `README.md` içindeki ön gereksinimleri (`superpowers`, zorunlu MCP'ler, Marketplace eklentileri) kurduktan sonra `agy plugin install <repo-url>` ile doğrudan yükleyebileceği bağımsız bir eklenti paketi sunmak.
-2. **Deterministik Yaşam Döngüsü Kapıları (`hooks.json`):** `main` dalında doğrudan üretim kodu yazılmasını, sürümü doğrulanmamış paket kurulmasını, güvenlik/kanon/walkthrough adımları tamamlanmadan PR açılmasını (`gh pr create`) ve PR sonrası denetim (`pr-auditor`) bitmeden oturumun kapanmasını fiziksel olarak engellemek; `main`'e merge/pull sonrası `graphify` bilgi grafiğini otomatik güncellemek.
-3. **Zorunlu `jev` Karar & Ön-Eleme Katmanı:** Context penceresini şişirmeden dosya ön-elemesi (`jev_triage`), tek geçişte çoklu kanon/mimari kontrol (`jev_ask`, `jev_check`), görev/boyut sınıflandırması (`jev_classify`) ve bulgu ciddiyeti kalibrasyonu (`jev_score`) yapmak.
+2. **Deterministik Yaşam Döngüsü Kapıları (`hooks.json`):** `main` dalında doğrudan üretim kodu yazılmasını, sürümü doğrulanmamış paket kurulmasını, plan kapsamı dışı dosyalara izinsiz dokunulmasını, güvenlik/kanon/walkthrough adımları tamamlanmadan PR açılmasını (`gh pr create`) ve PR sonrası denetim (`pr-auditor`) bitmeden oturumun kapanmasını fiziksel olarak engellemek; `main`'e merge/pull sonrası `graphify` bilgi grafiğini otomatik güncellemek.
+3. **Zorunlu `jev` Karar & Ön-Eleme Katmanı:** Context penceresini şişirmeden dosya ön-elemesi (`jev_triage`), tek geçişte çoklu kanon/mimari/yalınlık kontrolü (`jev_ask`, `jev_check`), görev/boyut sınıflandırması (`jev_classify`), spekülatif inceleme yorumu elemesi (`jev_check`) ve bulgu ciddiyeti kalibrasyonu (`jev_score`) yapmak.
 4. **Sürüm ve Dokümantasyon Yönetişimi (`context7`):** Brownfield projelerde sabitlenmiş sürümleri korumak; greenfield veya yeni paket seçimlerinde güncel kararlı sürümü doğrulayıp `context7` dokümantasyonunu okumadan Spec/Plan yazılmasını önlemek.
 5. **Proje Kanonu (`glossary` + `flows`):** Alan terimlerinin (`customer_subscription_tier`, `ClientWorkAddress` vb.) ve iş akışı adımlarının (`Request -> Log -> Validate -> DB Write` vb.) Spec, Plan ve Kod genelinde birebir tutarlı kalmasını sağlamak.
 6. **Mimari Karar & Trade-off Sunumu:** Önemli tasarım kararlarında uygulanabilir 2–3 yaklaşımı kazanç/kayıp matrisiyle kullanıcıya sunup seçilen kararı ADR olarak Spec'e kaydetmek.
 7. **Çok Platformlu DDD, Clean Architecture, LSP ve Kod Dokümantasyonu:** `.NET (C#/XAML)`, `Angular (TypeScript)`, `iOS (Swift/SwiftUI)` ve `Android (Kotlin/Jetpack Compose)` için katman sınırlarını, ilgili LSP araçlarını ve üretim kodunda anlamlı dokümantasyonu (`XMLDoc`, `TSDoc`, `Swift DocC`, `KDoc`) zorlamak.
-8. **PR Öncesi Güvenlik, Görsel Walkthrough ve PR Sonrası 6 Boyutlu Denetim:** PR açılmadan önce `security-reviewer` taraması ve repo içine (`docs/walkthroughs/`) Junior geliştirici seviyesinde bol Mermaid şemalı rehber üretimi; PR açıldıktan sonra `pr-auditor` ile derin inceleme; Web UI tarafında `@playwright/mcp` destekli E2E test akışı; RevenueCat, Firebase ve Postman iş akışı entegrasyonu.
+8. **PR Öncesi Güvenlik, Görsel Walkthrough ve PR Sonrası 7 Boyutlu Denetim:** PR açılmadan önce `security-reviewer` taraması ve repo içine (`docs/walkthroughs/`) Junior geliştirici seviyesinde bol Mermaid şemalı rehber üretimi; PR açıldıktan sonra `pr-auditor` ile derin inceleme; Web UI tarafında `@playwright/mcp` destekli E2E test akışı; RevenueCat, Firebase ve Postman iş akışı entegrasyonu.
+9. **Anti-Overengineering, Kapsam Kilidi ve Niyet Çapası:** İş boyutuna göre mimari orantılılık uygulamak, plan dışı dosya değişikliklerini engellemek (yan fikirleri `docs/parking-lot.md` dosyasına yönlendirmek), inceleyicilerde önce kullanıcı niyetini doğrulamak (*Intent Backtranslation*) ve gereksiz soyutlama/kod şişkinliğini bloklayıcı kusur saymak.
 
 ### 2.2. Kapsam Dışı Olanlar (Non-Goals)
 - `superpowers` eklentisini git subtree/submodule olarak paketin içine gömmek (`README.md` ön gereksinimi olarak kurulacak).
@@ -45,6 +47,7 @@ Antigravity (`agy`) kullanan ekip üyelerinin her projede aynı mühendislik kal
 - Sadece kuralı geçmek için metot ismini tekrarlayan "papağan dokümantasyon" (`GetUser` → `Gets the user`) üretmek veya bayatlamış yorumları yakalamamak.
 - `Domain` katmanına ORM attribute'ları, HTTP istemcileri, UI çerçeveleri veya 3. parti SDK tipleri (Firebase, RevenueCat vb.) sızdırmak.
 - Kritik kapıları yalnızca `SKILL.md` metnine bırakıp ajanın yoğun bağlamda adımları atlayarak doğrudan PR açmasına izin vermek.
+- Basit veya küçük kapsamlı işler için tek kullanımlık arayüzler (`IFooHelper`), gereksiz `Factory`/`AbstractBase` sınıfları veya *"ileride lazım olur"* bayrakları üretmek; görev kapsamı dışındaki dosyalara *drive-by refactoring* yapmak veya inceleme turlarında asıl kullanıcı amacından kopup spekülatif soyutlamalar dayatmak.
 
 ---
 
@@ -105,7 +108,7 @@ alps-agy-harness/
 ├── agents/
 │   ├── canon-auditor.md               # Glossary + Flow + DDD/Clean Architecture denetçi subagent
 │   ├── security-reviewer.md           # PR öncesi diff güvenlik tarama subagent'ı
-│   └── pr-auditor.md                  # PR sonrası 6 boyutlu derin inceleme subagent'ı
+│   └── pr-auditor.md                  # PR sonrası 7 boyutlu derin inceleme + niyet çapası subagent'ı
 └── skills/
     ├── harness-orchestrator/          # jev tabanlı iş boyutlandırma ve SDD model seçimi protokolü
     │   └── SKILL.md
@@ -166,7 +169,7 @@ flowchart TD
     OpenPR --> H3{"Hook: PreToolUse Sert PR Kapısı"}
     H3 -->|"Damgalar ve Walkthrough Tamam"| PRCreated["GitHub PR Açıldı (PostToolUse Bayrak Yazar)"]
     PRCreated --> StopGuard["Hook: Stop (pr-auditor Çalışmadan Durmayı Engeller)"]
-    StopGuard --> PostPR["review-pr Skill -> pr-auditor Subagent (6 Boyut + jev Kalibrasyonu)"]
+    StopGuard --> PostPR["review-pr Skill -> pr-auditor Subagent (Niyet Çapası + 7 Boyut + jev Kalibrasyonu)"]
 
     PostPR --> Merge["PR main Dalına Merge Edildi / Pull Çekildi"]
     Merge --> H4["Hook: PostToolUse -> graphify Artımlı Güncelleme"]
@@ -178,9 +181,9 @@ flowchart TD
 
 ### 6.1. Durum ve Damga Yönetimi (`.harness/state/`) — *[Builder Call]*
 Hook betiklerinin alt ajan denetimlerinin gerçekten yapıldığını deterministik doğrulayabilmesi için hedef çalışma alanında git-ignored `.harness/state/<branch-slug>/` dizini kullanılır (`.git/info/exclude` veya `.gitignore` üzerinden izlenmez):
-- **`code-tree-sha` hesabı:** Walkthrough dokümanı (`docs/walkthroughs/`) commit edildiğinde `HEAD` değişeceği için tavuk-yumurta döngüsü oluşmaması adına damgalar `git rev-parse HEAD` yerine **`docs/walkthroughs/` hariç çalışma ağacı özetini** (`git ls-tree -r HEAD | grep -v $'\tdocs/walkthroughs/' | git hash-object --stdin`) `codeTreeSha` olarak kaydeder. Üretim veya test kodunda tek bir satır bile değişse `codeTreeSha` değişir ve eski damgalar otomatik geçersiz olur.
+- **`code-tree-sha` hesabı:** Walkthrough dokümanı (`docs/walkthroughs/`) veya V2 otopark notları (`docs/parking-lot.md`) commit edildiğinde `HEAD` değişeceği için tavuk-yumurta döngüsü oluşmaması adına damgalar `git rev-parse HEAD` yerine **`docs/walkthroughs/` ve `docs/parking-lot.md` hariç çalışma ağacı özetini** (`git ls-tree -r HEAD | grep -Ev $'\tdocs/(walkthroughs/|parking-lot\\.md$)' | git hash-object --stdin`) `codeTreeSha` olarak kaydeder. Üretim veya test kodunda tek bir satır bile değişse `codeTreeSha` değişir ve eski damgalar otomatik geçersiz olur.
 - Damga dosyaları (`scripts/stamp-gate.sh` ile yazılır ve doğrulanır):
-  - `canon-pass.json`: `{"verdict":"PASS","codeTreeSha":"...","timestamp":"..."}`
+  - `canon-pass.json`: `{"verdict":"PASS","codeTreeSha":"...","planPath":"...","allowedFiles":["..."],"timestamp":"..."}`
   - `security-pass.json`: `{"verdict":"PASS","codeTreeSha":"...","criticalCount":0,"importantCount":0,"timestamp":"..."}`
   - `context7-verified.json`: `{"packages":{"<pkg>":{"version":"...","source":"locked|greenfield-latest","timestamp":"..."}}}`
   - `pr-audit-pending.json`: `{"prUrl":"...","stopRetries":0}`
@@ -202,6 +205,7 @@ Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlan
      1. Aktif dal `main`/`master` değil ve `git status --porcelain` tamamen temiz.
      2. `origin/main..HEAD` (veya `main..HEAD`) commit farkında `docs/walkthroughs/` altında en az bir `.md` dosyası eklenmiş/güncellenmiş ve bu dosyada en az **2 adet ```` ```mermaid ````** diyagram bloğu mevcut.
      3. `canon-pass.json` ve `security-pass.json` mevcut, her ikisinin `verdict` değeri `"PASS"` ve `codeTreeSha` değeri güncel ağaçla birebir eşleşiyor.
+     4. **Dosya Kapsam Kilidi (Scope Allowlist Kontrolü):** Aktif bir uygulama planı mevcutsa (`canon-pass.json` içindeki `allowedFiles` listesi), `origin/main..HEAD` aralığında değişen her dosya (`git diff --name-only`) ya planın `Files` izin listesinde ya da izinli meta-doküman yollarında (`docs/superpowers/`, `docs/canon/`, `docs/walkthroughs/`, `docs/parking-lot.md`) yer almalıdır; plan dışı *drive-by* değiştirilmiş dosya varsa `"decision": "deny"` döner.
      Eksik varsa `"decision": "deny"` ve hangi adımın eksik olduğunu söyleyen net bir `reason` döner.
 
 4. **`PostToolUse` — `run_command` (`scripts/hooks/post-command-hooks.sh`):**
@@ -219,10 +223,12 @@ Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlan
 | :--- | :--- | :--- | :--- |
 | **İstek Sınıflandırma** | `jev_classify` | İlk kullanıcı mesajını `quick_fix`, `small_change`, `full_project`, `bug_investigation`, `pr_review` olarak sınıflandırır. | `act_above: 0.80`; altında kalırsa güvenli yol olan `brainstorming` seçilir. |
 | **Mimari Trade-off Kontrolü** | `jev_check` | Spec yazılırken birden fazla geçerli mimari desen barındıran ve kullanıcıya artı/eksi tablosuyla sorulmamış karar noktası olup olmadığını denetler. | `yes_at_or_above: 0.65`; `yes` veya `uncertain` ise trade-off sunulmadan Spec kapatılamaz. |
+| **Plan Yalınlık & Soyutlama Testi** | `jev_ask` | Plan onayı öncesinde planlanan arayüz/katman sayısının hedefi çözmek için en yalın yol olup olmadığını veya tek-kullanımlık soyutlama şişkinliği barındırıp barındırmadığını puanlar. | Şişkinlik olasılığı `>= 0.60` ise `canon-auditor` gereksiz soyutlamaların budanmasını zorunlu tutar. |
 | **SDD Görev Model Seçimi** | `jev_classify` | Her SDD görev brief'ini `mechanical_single_file` (`flash`), `multi_file_integration` (`inherit`) veya `complex_architecture` (`pro`) olarak sınıflandırır. | `act_above: 0.75`; belirsizse `inherit` kullanılır. |
 | **Kanon & Akış Denetimi** | `jev_ask` + `jev_triage` | `jev_ask` Spec/Plan metnini tek prefill ile tüm kanonik akış ve sözlük kurallarına göre puanlar; `jev_triage` 50'ye kadar kod dosyasını context kirletmeden tarar. | İhlal olasılığı `>= 0.50` (`yes` veya `uncertain`) olan her madde `canon-auditor` tarafından satır kanıtıyla incelenir. |
-| **Güvenlik & PR Ön-Elemesi** | `jev_triage` | PR farkındaki tüm üretim dosyalarını güvenlik riski, katman sızıntısı ve "papağan/bayat dokümantasyon" açısından context dışında tarar. | Yalnızca şüpheli çıkan dosyalar ve kritik sınır dosyaları derin incelemeye alınır; küçük PR'larda (`<= 8` dosya) tüm diff ayrıca okunur. |
-| **Bulgu Ciddiyeti Kalibrasyonu** | `jev_score` | Tespit edilen inceleme bulgularını `[Minor, Important, Critical]` ölçeğinde olasılık ağırlıklı puanlar. | `Important` ve `Critical` bulgular geçişi bloklar; `Minor` bulgular raporlanır. |
+| **Güvenlik & PR Ön-Elemesi** | `jev_triage` | PR farkındaki tüm üretim dosyalarını güvenlik riski, katman sızıntısı, aşırı mühendislik ve "papağan/bayat dokümantasyon" açısından context dışında tarar. | Yalnızca şüpheli çıkan dosyalar ve kritik sınır dosyaları derin incelemeye alınır; küçük PR'larda (`<= 8` dosya) tüm diff ayrıca okunur. |
+| **Spekülatif İnceleme Yorumu Filtresi** | `jev_check` | İnceleyicinin ürettiği her aday bulgunun somut bir bug, güvenlik açığı, kanon sapması veya katman yönü ihlali mi yoksa spekülatif genişletilebilirlik/stil önerisi mi olduğunu sınar. | Somut kanıt olasılığı `< 0.70` olan spekülatif soyutlama önerileri bloklayıcı listeden otomatik düşürülür. |
+| **Bulgu Ciddiyeti Kalibrasyonu** | `jev_score` | Somut süzgeci geçen inceleme bulgularını `[Minor, Important, Critical]` ölçeğinde olasılık ağırlıklı puanlar. | `Important` ve `Critical` bulgular geçişi bloklar; `Minor` bulgular raporlanır. |
 
 ---
 
@@ -258,7 +264,27 @@ Her hedef projede `docs/canon/` altında yaşayan iki kanonik kaynak tanımlanı
 
 ---
 
-### 6.7. Çok Platformlu DDD, Clean Architecture, LSP ve Üretim Kodu Dokümantasyon Kuralları (`rules/*.md`)
+### 6.7. Orantılılık, Kapsam Kilidi ve Anti-Overengineering Protokolü
+Ajanın DDD/Clean Architecture ve derin inceleme kurallarını bahane ederek gereksiz kod şişirmesini (*Enterprise Mimicry*), komşu dosyaları kurcalamasını (*Scope Creep*) ve incelemede asıl amacı unutmasını (*Goal Drift*) aşağıdaki 5 kural engeller:
+
+1. **Orantılılık Matrisi ("Tören Değil Sınır"):**
+   - Clean Architecture'ın bağlayıcı kuralı **dosya/klasör çoğaltmak değil, bağımlılık yönünü korumaktır** (`Domain` dışarıyı bilmez).
+   - `jev_classify` çıktısı `quick_fix` veya `small_change` olduğunda mevcut dosya yapısına cerrahi müdahale yapılır; yeni katman, yeni paket veya yeni soyutlama açılması **yasaktır**.
+   - `full_project` ölçeğinde dahi **Rule of Three** geçerlidir: dış sınırlar (Repository, harici API/SDK adaptörü) haricinde tek bir somut uygulaması olan sınıflar için `IFooHelper` arayüzü, `AbstractBase`, `Factory` veya *"ileride lazım olur"* yapılandırma bayrakları üretmek **bloklayıcı (`Important`) kusurdur**.
+2. **Planlarda Açık Karmaşıklık Bütçesi (`writing-plans` + `canon-auditor`):**
+   - Her uygulama planının başına (a) oluşturulacak/değiştirilecek toplam dosya sayısı bütçesi, (b) eklenecek her yeni arayüz/soyutlama için **tek cümlelik zorunluluk gerekçesi** ve (c) **"Açıkça Kapsam Dışı (Out-of-Scope)"** maddeleri yazılır. `canon-auditor` bu bütçeyi `jev_ask` yalınlık testiyle doğrular ve onaylanan `Files` listesini `canon-pass.json` içine yazar.
+3. **Dosya İzin Listesi Kilidi ve "V2 Otoparkı" (`docs/parking-lot.md`):**
+   - Yürütme sırasında planlanan `Files` listesi dışındaki dosyalarda temizlik, yeniden adlandırma veya biçimlendirme (*drive-by refactoring*) yapılması yasaktır (`pre-command-guard.sh` PR kapısında `git diff --name-only` ile fiziksel olarak denetlenir; zorunlu sapma varsa ledger'da açık `Ruling:` kaydı gerekir).
+   - Ajan çalışırken görev dışı bir iyileştirme veya teknik borç fark ederse koda dokunmaz; bulguyu tek satır halinde `docs/parking-lot.md` dosyasına kaydedip mevcut göreve devam eder.
+4. **İnceleyicilerde "Niyet Çapası" (Intent Backtranslation) ve Fazlalık Cezası:**
+   - Hem `canon-auditor` hem `pr-auditor`, tek bir bulgu listelemeden önce raporunun en başında diff'e bakarak **"Bu değişiklik gerçekte hangi kullanıcı amacını çözüyor?"** sorusunu 2 cümleyle yanıtlar ve Spec'in `Intent` / `Non-Goals` bölümleriyle karşılaştırır.
+   - İstenmeyen özellik, ölü kod veya gereksiz soyutlama eklemek, eksik kod bırakmakla eşdeğer ağırlıkta (`Important`) bloklayıcı kusur olarak puanlanır.
+5. **`jev_check` ile Spekülatif İnceleme Yorumu Süzgeci:**
+   - İnceleme döngülerinin kodu karmaşıklaştırmasını önlemek için `pr-auditor` aday bulgularını raporlamadan önce `jev_check` süzgecinden geçirir; somut bir hata, güvenlik açığı, kanon sapması veya katman yönü ihlali kanıtlamayan *"gelecekte genişletilebilirlik için soyutla"* tarzı önerilerin PR bloklaması otomatik engellenir.
+
+---
+
+### 6.8. Çok Platformlu DDD, Clean Architecture, LSP ve Üretim Kodu Dokümantasyon Kuralları (`rules/*.md`)
 
 `rules/AGENTS.md` yalnızca evrensel orkestrasyon kurallarını taşır; teknolojiye özgü kurallar context bütçesini (`20,000` token) korumak için `trigger: glob` ile yalnızca ilgili dosyalara dokunulduğunda yüklenir:
 
@@ -273,9 +299,9 @@ Her hedef projede `docs/canon/` altında yaşayan iki kanonik kaynak tanımlanı
 
 ---
 
-### 6.8. PR Öncesi Hazırlık (`pre-pr-readiness`) ve Görsel PR Rehberi
+### 6.9. PR Öncesi Hazırlık (`pre-pr-readiness`) ve Görsel PR Rehberi
 Bir planın tüm görevleri tamamlanıp PR açma aşamasına gelindiğinde (`finishing-a-development-branch` içinde PR seçeneği çalıştırılmadan hemen önce) şu 3 adım sırayla zorunludur:
-1. **`canon-auditor` Son Kontrolü:** Üretilen kodun `glossary.md`, `flows.md` ve Clean Architecture katman kurallarına tam uyumu doğrulanır → `canon-pass.json` yazılır.
+1. **`canon-auditor` Son Kontrolü:** Üretilen kodun `glossary.md`, `flows.md`, Clean Architecture katman kuralları ve planın dosya izin listesine (`allowedFiles`) tam uyumu doğrulanır → `canon-pass.json` yazılır.
 2. **`security-reviewer` Taraması:** `main..HEAD` farkındaki tüm dosyalar önce `jev_triage` ile taranır, ardından kimlik doğrulama/yetkilendirme, girdi doğrulama, secret sızıntısı, güvensiz serileştirme, Firebase güvenlik kuralları ve mobil güvenli depolama (Keychain / EncryptedSharedPreferences-Keystore) açısından incelenir; `Critical` veya `Important` bulgu sıfırlanmadan `security-pass.json` üretilmez.
 3. **Junior Geliştirici Odaklı Görsel PR Rehberi (`docs/walkthroughs/YYYY-MM-DD-<konu>.md`):**
    - Dala yeni eklenen bir geliştiriciye anlatır gibi sade, öğretici bir dille yazılır ve repo içine commit edilir.
@@ -287,14 +313,15 @@ Bir planın tüm görevleri tamamlanıp PR açma aşamasına gelindiğinde (`fin
 
 ---
 
-### 6.9. PR Sonrası Derin İnceleme (`review-pr` + `pr-auditor`) ve Diğer Uzman Skill'ler
-- **`review-pr` & `pr-auditor`:** PR açıldıktan hemen sonra (`Stop` hook zorlamasıyla otomatik) veya mevcut bir GitHub PR'ı için çağrıldığında `gh pr diff` ve değişen dosyaları `jev_triage` + `jev_score` desteğiyle 6 boyutta denetler:
+### 6.10. PR Sonrası Derin İnceleme (`review-pr` + `pr-auditor`) ve Diğer Uzman Skill'ler
+- **`review-pr` & `pr-auditor`:** PR açıldıktan hemen sonra (`Stop` hook zorlamasıyla otomatik) veya mevcut bir GitHub PR'ı için çağrıldığında önce **Niyet Çapası (Intent Backtranslation)** özetini çıkarır, ardından `gh pr diff` ve değişen dosyaları `jev_triage` + `jev_check` (spekülatif yorum süzgeci) + `jev_score` desteğiyle **7 boyutta** denetler:
   1. **Kod Dokümantasyonu & Papağan/Bayat Yorum Analizi**
   2. **Test Kapsamı & Eksik Kenar Durumlar**
   3. **Tip Tasarımı & Arayüz Kontratları**
   4. **Hata Yönetimi & Sessiz Hata (Silent Failure) Analizi**
   5. **DDD & Clean Architecture Sınır Denetimi (Bloklayıcı):** Katman sızıntısı, Anemic model ve iş kuralı kaçakları `Important`/`Critical` olarak işaretlenir.
-  6. **Okunabilirlik, Basitleştirme & Glossary Uyumu**
+  6. **Fazlalık, Kapsam Kayması & Overengineering Cezası (Bloklayıcı):** Tek kullanımlık gereksiz soyutlamalar, istenmeyen ek özellikler ve kapsam dışı dosya değişiklikleri `Important` olarak işaretlenir.
+  7. **Okunabilirlik, Basitleştirme & Glossary Uyumu**
   *(İnceleme raporu oturumda sunulur ve `pr-audit-pending.json` bayrağı temizlenir; kullanıcı isterse `gh pr comment` ile PR'a da eklenir — [Builder Call]).*
 - **`playwright-e2e`:** Web / Angular arayüz akışlarında `@playwright/mcp` ile canlı sayfanın erişilebilirlik ağacını (*accessibility snapshot*) inceleyerek kırılgan CSS seçiciler yerine rol/etiket tabanlı (`getByRole`, `getByLabel`), Page Object Model yapısında kalıcı `@playwright/test` E2E testleri üretir ve gerçek tarayıcıda doğrulamadan görevi kapatmaz.
 - **`revenuecat-integration`:** `RevenueCat/ai-toolkit` yaklaşımını Clean Architecture ile birleştirir; ürün/offering/entitlement yapılandırmasını RevenueCat MCP (`https://mcp.revenuecat.ai/mcp`) üzerinden doğrular, iOS/Android/Web SDK çağrılarını daima `Data/Infrastructure` katmanındaki bir `SubscriptionRepository` / `BillingGateway` adaptörü arkasına hapseder (`Domain` ve `Presentation` katmanlarına doğrudan RevenueCat SDK tipi sızmasını yasaklar). Firebase ve Postman kullanımlarında da aynı dış-katman izolasyonu korunur.
