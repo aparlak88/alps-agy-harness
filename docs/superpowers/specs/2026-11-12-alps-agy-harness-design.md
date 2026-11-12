@@ -30,7 +30,7 @@ Antigravity (`agy`) kullanan ekip üyelerinin her projede aynı mühendislik kal
 2. **Deterministik Yaşam Döngüsü Kapıları (`hooks.json`):** `main` dalında doğrudan üretim kodu yazılmasını, sürümü doğrulanmamış paket kurulmasını, plan kapsamı dışı dosyalara izinsiz dokunulmasını, `jev` yönlendirmesi yapılmadan rastgele modelle alt ajan (`invoke_subagent`) çağrılmasını (`overwrite` ile Gemini modeli ve efor profilini kilitleyerek), güvenlik/kanon/walkthrough adımları tamamlanmadan PR açılmasını (`gh pr create`) ve PR sonrası denetim (`pr-auditor`) bitmeden oturumun kapanmasını fiziksel olarak engellemek; `main`'e merge/pull sonrası `graphify` bilgi grafiğini otomatik güncellemek.
 3. **Zorunlu `jev` Karar & Ön-Eleme Katmanı:** Context penceresini şişirmeden dosya ve öğrenilmiş ders ön-elemesi (`jev_triage`), tek geçişte çoklu kanon/mimari/yalınlık kontrolü (`jev_ask`, `jev_check`), görev boyutu ve **alt ajan Gemini model + efor seviyesi yönlendirmesi** (`jev_classify`, `jev_score`), spekülatif inceleme yorumu elemesi (`jev_check`) ve bulgu/teknik borç öncelik kalibrasyonu (`jev_score`) yapmak.
 4. **Sürüm ve Dokümantasyon Yönetişimi (`context7`):** Brownfield projelerde sabitlenmiş sürümleri korumak; greenfield veya yeni paket seçimlerinde güncel kararlı sürümü doğrulayıp `context7` dokümantasyonunu okumadan Spec/Plan yazılmasını önlemek.
-5. **Üç Parçalı Proje Kanonu (`glossary` + `flows` + `lessons`):** Alan terimlerinin (`customer_subscription_tier`, `ClientWorkAddress` vb.) ve iş akışı adımlarının (`Request -> Log -> Validate -> DB Write` vb.) Spec, Plan ve Kod genelinde birebir tutarlı kalmasını sağlamak; çözülen sinsi bug ve platform tuzaklarını `lessons.md` içinde biriktirip sonraki işlerde sıfır context maliyetiyle (`jev_triage`) hatırlatmak.
+5. **Üç Parçalı Proje Kanonu (`glossary` + `flows` + `lessons`) ve Doküman Sonu Sözlük Zorunluluğu:** Alan terimlerinin (`customer_subscription_tier`, `ClientWorkAddress` vb.) ve iş akışı adımlarının (`Request -> Log -> Validate -> DB Write` vb.) Spec, Plan ve Kod genelinde birebir tutarlı kalmasını sağlamak; çözülen sinsi bug ve platform tuzaklarını `lessons.md` içinde biriktirip sonraki işlerde sıfır context maliyetiyle (`jev_triage`) hatırlatmak; üretilen her Spec, Plan, PR Walkthrough ve teknik dokümanın sonuna **Teknik Terimler Sözlüğü** bölümü eklenmesini deterministik olarak zorlamak.
 6. **Mimari Karar & Trade-off Sunumu:** Önemli tasarım kararlarında uygulanabilir 2–3 yaklaşımı kazanç/kayıp matrisiyle kullanıcıya sunup seçilen kararı ADR olarak Spec'e kaydetmek.
 7. **Çok Platformlu DDD, Clean Architecture, Mimari Fitness Testleri, LSP ve Kod Dokümantasyonu:** `.NET (C#/XAML)`, `Angular (TypeScript)`, `iOS (Swift/SwiftUI)` ve `Android (Kotlin/Jetpack Compose)` için katman sınırlarını hem inceleme aşamasında hem de derleme/test zamanı **Mimari Fitness Testleri + Düzeltme Enjeksiyonu (*Remediation Injection*)** ile korumak; ilgili LSP araçlarını ve üretim kodunda anlamlı dokümantasyonu (`XMLDoc`, `TSDoc`, `Swift DocC`, `KDoc`) zorlamak.
 8. **PR Öncesi Güvenlik, Görsel Walkthrough ve PR Sonrası 7 Boyutlu Denetim:** PR açılmadan önce `security-reviewer` taraması ve repo içine (`docs/walkthroughs/`) Junior geliştirici seviyesinde bol Mermaid şemalı rehber üretimi; PR açıldıktan sonra `pr-auditor` ile derin inceleme; Web UI tarafında `@playwright/mcp` destekli E2E test akışı; RevenueCat, Firebase ve Postman iş akışı entegrasyonu.
@@ -225,6 +225,7 @@ Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlan
 
 2. **`PreToolUse` — `write_file|edit_file` (`scripts/hooks/pre-edit-guard.sh`):**
    - **`main` / `master` Üretim Kodu Kilidi:** Hedef dosya çalışma alanı içindeyse, depoda en az bir commit varsa (`git rev-parse --verify HEAD`) ve aktif dal `main` veya `master` ise üretim kodu ve uygulama yapılandırma dosyalarının yazılmasını `"decision": "deny"` ile reddeder (*İstisna [Builder Call]:* `docs/superpowers/specs/` ve `docs/canon/` altındaki tasarım dokümanları brainstorming sırasında `main` üzerinde taslaklanabilir; kodlamaya geçmeden feature branch/worktree zorunludur).
+   - **Doküman Sonu Teknik Terimler Sözlüğü Kapısı (`write_file`):** Üretilen yeni bir teknik Markdown dokümanı (`docs/superpowers/specs/*.md`, `docs/superpowers/plans/*.md`, `docs/walkthroughs/*.md`, `docs/canon/{flows,lessons}.md`, `README.md` ve `docs/**/*.md` — zaten kendisi sözlük olan `docs/canon/glossary.md` ve ham not listesi `docs/parking-lot.md` hariç) `Append != true` ile oluşturulurken içeriğin sonunda `## Teknik Terimler Sözlüğü` (veya İngilizce standartlı depoda `## Technical Glossary`) başlığı yer almıyorsa `"decision": "deny"` döner.
    - **Anlık Tehlikeli Desen Kapısı (`security-guidance` Per-Edit):** Yazılan içerikte deterministik yüksek risk kalıpları (`eval(`, `dangerouslySetInnerHTML`, Angular `bypassSecurityTrust*`, SQL string birleştirme, `-----BEGIN .* PRIVATE KEY-----` gibi açık anahtar blokları) yakalanırsa `"decision": "deny"` (meşru kullanım şüphesinde gerekçeli `"decision": "force_ask"`) döner.
 
 3. **`PreToolUse` — `run_command` (`scripts/hooks/pre-command-guard.sh`):**
@@ -233,8 +234,9 @@ Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlan
    - **Sert PR Açma Kapısı (`gh pr create`):** Komut `gh pr create` içeriyorsa sırasıyla şunları doğrular:
      1. Aktif dal `main`/`master` değil ve `git status --porcelain` tamamen temiz.
      2. `origin/main..HEAD` (veya `main..HEAD`) commit farkında `docs/walkthroughs/` altında en az bir `.md` dosyası eklenmiş/güncellenmiş ve bu dosyada en az **2 adet ```` ```mermaid ````** diyagram bloğu mevcut.
-     3. `canon-pass.json` ve `security-pass.json` mevcut, her ikisinin `verdict` değeri `"PASS"` ve `codeTreeSha` değeri güncel ağaçla birebir eşleşiyor.
-     4. **Dosya Kapsam Kilidi (Scope Allowlist Kontrolü):** Aktif bir uygulama planı mevcutsa (`canon-pass.json` içindeki `allowedFiles` listesi), `origin/main..HEAD` aralığında değişen her dosya (`git diff --name-only`) ya planın `Files` izin listesinde ya da izinli meta-doküman yollarında (`docs/superpowers/`, `docs/canon/`, `docs/walkthroughs/`, `docs/parking-lot.md`) yer almalıdır; plan dışı *drive-by* değiştirilmiş dosya varsa `"decision": "deny"` döner.
+     3. **Doküman Sonu Sözlük Doğrulaması:** `origin/main..HEAD` farkında eklenen/değişen tüm Spec, Plan, Walkthrough ve teknik Markdown dokümanlarında (`docs/canon/glossary.md` ve `docs/parking-lot.md` hariç) `## Teknik Terimler Sözlüğü` (veya `## Technical Glossary`) bölümünün korunduğu doğrulanır (`edit_file` ile sonradan silinmişse reddedilir).
+     4. `canon-pass.json` ve `security-pass.json` mevcut, her ikisinin `verdict` değeri `"PASS"` ve `codeTreeSha` değeri güncel ağaçla birebir eşleşiyor.
+     5. **Dosya Kapsam Kilidi (Scope Allowlist Kontrolü):** Aktif bir uygulama planı mevcutsa (`canon-pass.json` içindeki `allowedFiles` listesi), `origin/main..HEAD` aralığında değişen her dosya (`git diff --name-only`) ya planın `Files` izin listesinde ya da izinli meta-doküman yollarında (`docs/superpowers/`, `docs/canon/`, `docs/walkthroughs/`, `docs/parking-lot.md`) yer almalıdır; plan dışı *drive-by* değiştirilmiş dosya varsa `"decision": "deny"` döner.
      Eksik varsa `"decision": "deny"` ve hangi adımın eksik olduğunu söyleyen net bir `reason` döner.
 
 4. **`PreToolUse` — `invoke_subagent` (`scripts/hooks/pre-subagent-guard.sh` — Hibrit `jev` Model & Efor Kilidi):**
@@ -314,7 +316,10 @@ Her hedef projede `docs/canon/` altında yaşayan üç kanonik kaynak tanımlan�
    - Tablo/kayıt yapısı (`lessons-template.md`): `Ders Kimliği (ör. LSN-004) | Tarih | Platform / Modül | Sinsi Tuzak ve Kök Neden | Zorunlu Önleyici Kural | Kanıt Dosyası`.
    - **Gürültü Önleyici Yazım Kuralı:** Basit sözdizimi hataları, tek seferlik yazım yanlışları veya sıradan tip uyuşmazlıkları `lessons.md` içine **yazılamaz**; yalnızca `superpowers:systematic-debugging` ile çözülen sinsi kök nedenler veya PR incelemesinde yakalanan tekrarlanabilir mimari/SDK/platform tuzakları (ör. EF Core tracking tuzağı, Angular signal yarış durumu, RevenueCat webhook sıra bağımlılığı) 3–5 satırlık somut kural olarak kaydedilir.
    - **Sıfır-Context Okuma Protokolü:** `lessons.md` zamanla büyüdükçe ana modelin context penceresine ham olarak yüklenmez; planlama (`writing-plans`) ve hata ayıklama öncesinde `jev_triage` (veya tek dosya üzerinde `jev_ask`) ile taranır, yalnızca o anki görevle ilgililik olasılığı `>= 0.50` çıkan dersler planın `Global Constraints` / görev brief'ine enjekte edilir.
-4. **3 Denetim Noktası:** (1) Spec onayı öncesi, (2) Plan onayı öncesi, (3) PR açılışı öncesi (`canon-pass.json` üretimi).
+4. **Üretilen Tüm Dokümanların Sonunda Teknik Terimler Sözlüğü Zorunluluğu (`## Teknik Terimler Sözlüğü`):**
+   - Harness kapsamında üretilen her **Spec** (`docs/superpowers/specs/*.md`), **Plan** (`docs/superpowers/plans/*.md`), **PR Görsel Rehberi** (`docs/walkthroughs/*.md`) ve **diğer teknik repo dokümanlarının** (`docs/canon/flows.md`, `docs/canon/lessons.md`, `README.md` vb.; zaten kendisi sözlük olan `docs/canon/glossary.md` ve ham not listesi `docs/parking-lot.md` hariç) en son bölümü **`## Teknik Terimler Sözlüğü`** *(İngilizce standartlı depoda `## Technical Glossary`)* olmak zorundadır.
+   - Bu bölüm, ilgili dokümanda geçen teknik kavramları, mimari desenleri, kısaltmaları ve alan terimlerini tablo (`| Terim | Açıklama |`) yapısında sade, öğretici bir dille açıklar; hem `pre-edit-guard.sh` / `pre-command-guard.sh` hook'larıyla hem de `canon-auditor` tarafından (`docs/canon/glossary.md` ile tutarlılığı dahil) zorunlu tutulur.
+5. **3 Denetim Noktası:** (1) Spec onayı öncesi, (2) Plan onayı öncesi, (3) PR açılışı öncesi (`canon-pass.json` üretimi).
 
 ---
 
@@ -368,6 +373,7 @@ Bir planın tüm görevleri tamamlanıp PR açma aşamasına gelindiğinde (`fin
      2. **Mimari ve Katman Haritası (`mermaid` `flowchart`):** Değişen bileşenlerin `Domain`, `Application`, `Infrastructure/Data`, `Presentation/UI` katmanlarındaki yerleşimi ve bağımlılık yönü.
      3. **Uçtan Uca Çalışma Senaryosu (`mermaid` `sequenceDiagram` veya `stateDiagram-v2`):** Bir isteğin veya kullanıcı etkileşiminin adım adım akışı.
      4. **Kod Okuma Rehberi:** *"İncelemeye hangi dosyadan ve neden başlamalısın?"* sıralı okuma listesi + alınan önemli tasarım kararları ve dikkat edilecek köşe durumlar.
+     5. **Teknik Terimler Sözlüğü (`## Teknik Terimler Sözlüğü`):** Dokümanda ve PR'da geçen teknik/mimari kavramların sade açıklamaları.
 
 ---
 
@@ -421,4 +427,35 @@ Aşağıdaki iç uygulama detayları bu dokümandaki kontratları değiştirmeme
 - `assets/logo.svg` görsel tasarımı.
 - `scripts/hooks/*.sh`, `scripts/harness-doctor.sh` ve `scripts/run-quiet.sh` içindeki yardımcı fonksiyonların iç modülerliği, hata mesajı metin şablonları ve `.harness/` (durum + eski log rotasyonu) temizlik yardımcıları.
 - Her `SKILL.md` dosyasının `references/` alt dosyalarına bölünme granülerliği (Antigravity `24 KB` kural sınırı ve progressive disclosure ilkelerine uyulduğu sürece).
-- Hook, damga, `harness-doctor` ve `run-quiet` betiklerini doğrulayan otomatik kabuk/entegrasyon test senaryolarının (`tests/`) iç dizin organizasyonu.
+- Hook, damga, `harness-doctor` ve `run-quiet` betiklerini doğrulayan otomatik kabuk/entegrasyon test senaryolarının (`tests/`) iç dizin organizasyonu (doküman sonu sözlük başlık kontrolünde numaralı/numarasız `^## ([0-9]+\. )?(Teknik Terimler Sözlüğü|Technical Glossary)` eşleşmesi desteklenir).
+
+---
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| **ADR (*Architecture Decision Record*)** | Önemli bir mimari kararın; değerlendirilen alternatifler, artı/eksileri (*trade-off*) ve seçilme gerekçesiyle birlikte kayıt altına alındığı kısa karar notu. |
+| **Aggregate Root & Value Object** | DDD'de iş kurallarının ve veri tutarlılığının tek giriş noktası olan kök varlık (*Aggregate Root*) ile kimliği olmayıp yalnızca taşıdığı değerlerle tanımlanan değişmez (*immutable*) nesne (*Value Object*). |
+| **Anemic Domain Model** | Alan sınıflarının hiçbir iş kuralı barındırmayıp yalnızca veri taşıyan (`get/set`) yapılara dönüşmesi ve iş mantığının servis katmanlarına dağılması anti-deseni. |
+| **Brownfield / Greenfield** | *Brownfield*, üzerinde kurulu mimari ve sabitlenmiş paket sürümleri bulunan mevcut projeyi; *Greenfield* ise sıfırdan başlatılan yeni projeyi ifade eder. |
+| **Clean Architecture** | İş mantığını (`Domain` ve `Application`) veritabanı, UI ve 3. parti SDK'lardan (`Infrastructure` / `Presentation`) izole eden, bağımlılık oklarının daima dıştan içe doğru baktığı yazılım mimarisi. |
+| **`codeTreeSha`** | PR rehberi veya otopark dokümanları commit edildiğinde denetim damgalarının bozulmaması için meta-dokümanlar hariç tutularak hesaplanan deterministik Git ağaç özeti (*hash*). |
+| **Compound Lessons (`lessons.md`)** | Çözülen sinsi hataların ve platform tuzaklarının kalıcı kurallara dönüştürülerek biriktirildiği, sonraki görevlerde tekrar hata yapılmasını önleyen proje hafızası. |
+| **Context7** | Yapay zeka ajanlarına kütüphane ve çerçevelerin sürüme özel güncel resmi dokümantasyonunu sağlayan MCP sunucusu. |
+| **Context Rot (*Bağlam Çürümesi*)** | Uzun derleme/test çıktıları veya gereksiz dosya okumalarıyla modelin çalışma belleğinin (*context window*) dolması ve modelin kuralları/asıl amacı unutmaya başlaması durumu. |
+| **CQRS (*Command Query Responsibility Segregation*)** | Sistemde durum değiştiren yazma işlemleri (*Command*) ile veri okuyan sorguların (*Query*) ayrı modeller ve işleyiciler (*handler*) olarak tasarlanması deseni. |
+| **DDD (*Domain-Driven Design*)** | Yazılım modelini iş alanının (*domain*) kuralları, sınırlandırılmış bağlamları (*Bounded Context*) ve ortak dili (*Ubiquitous Language*) etrafında şekillendiren tasarım yaklaşımı. |
+| **Goal Drift & Scope Creep** | *Goal Drift*, ajanın inceleme veya geliştirme sırasında kullanıcının asıl amacından uzaklaşması; *Scope Creep* (*kapsam kayması*) ise görevle ilgisiz komşu dosyalarda istenmeyen değişiklikler (*drive-by refactoring*) yapmasıdır. |
+| **Graphify** | Kod tabanını ve dokümanları kalıcı bir bilgi grafiğine (*knowledge graph*) dönüştürerek bileşen ilişkilerini ve etki alanlarını sorgulamayı sağlayan araç. |
+| **Harness** | Yapay zeka ajanlarının rastgele davranmasını önlemek için etraflarına kurulan deterministik kancalar (*hooks*), kurallar, alt ajanlar ve doğrulama kapılarından oluşan mühendislik çerçevesi. |
+| **Hook (`hooks.json`) & `overwrite`** | Antigravity'de ajan yaşam döngüsü adımlarında (`SessionStart`, `PreToolUse`, `PostToolUse`, `Stop`) çalışan kabuk betikleri; `overwrite` ise bir araç çağrısının argümanlarını (ör. alt ajan `Model` ve `Prompt` alanlarını) çalışmadan hemen önce fiziksel olarak yeniden yazar. |
+| **Intent Backtranslation (*Niyet Çapası*)** | İnceleyici alt ajanın kod bulgularına geçmeden önce yalnızca kod farkına (*diff*) bakarak değişikliğin hangi kullanıcı amacını çözdüğünü özetlemesi ve Spec ile karşılaştırması tekniği. |
+| **`jev` (TypeSafe System One)** | Kod ve metinler üzerinde kalibre edilmiş olasılık dağılımı üreten değerlendirme motoru; `jev_triage` ile ana modelin context'ini kirletmeden sunucu tarafında ön-eleme, `jev_ask`/`jev_check`/`jev_score`/`jev_classify` ile hızlı karar kalibrasyonu yapar. |
+| **LSP (*Language Server Protocol*)** | Derleyici düzeyinde tip kontrolü, referans bulma ve sembol yeniden adlandırma yeteneklerini IDE ve MCP üzerinden ajana sunan protokol (`csharp-lsp`, `typescript-lsp`). |
+| **MCP (*Model Context Protocol*)** | Yapay zeka ajanlarının dış araçlara, dil sunucularına ve servislere standart bir şema üzerinden bağlanmasını sağlayan protokol. |
+| **Mimari Fitness Testi & `REMEDIATION:`** | Katman sınırlarının ihlal edilmediğini derleme/birim testi aşamasında denetleyen (`NetArchTest`, `Sheriff`, `Konsist` vb.) otomatik test ve kırıldığında ajana nasıl düzelteceğini söyleyen hata mesajı deseni. |
+| **Overengineering (*Aşırı Mühendislik*)** | Mevcut problemi çözmek için gerekenden fazla soyutlama, tek kullanımlık arayüz veya *"ileride lazım olur"* karmaşıklığı üretilmesi kusuru. |
+| **Progressive Disclosure (*Aşamalı Yükleme*)** | Tüm kuralları ve yönergeleri aynı anda context penceresine yüklemek yerine yalnızca ilgili dosya deseni (`glob`) veya görev tetiklendiğinde belleğe alma prensibi. |
+| **SDD (*Subagent-Driven Development*)** | Uygulama planındaki her görevin taze bir alt ajana (*implementer*) yaptırılıp ardından bağımsız bir inceleyici alt ajanla (*reviewer*) denetlendiği geliştirme akışı. |
+| **Ubiquitous Language (`glossary.md`)** | İş birimi, dokümanlar (Spec/Plan/Walkthrough) ve kaynak kod arasında aynı kavram için eş anlamlı karışıklığına izin vermeden kullanılan tekil kanonik terimler sözlüğü. |
