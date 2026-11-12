@@ -1,0 +1,19 @@
+{
+  "name": "alps-agy-harness",
+  "displayName": "Alps AGY Engineering Harness",
+  "version": "1.0.0",
+  "description": "Engineering harness plugin for Google Antigravity: lifecycle hooks, jev calibration, context7 version lock, triple-part canon, clean architecture rules, and mobile diagnostics.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Yeni bir özellik için harness-orchestrator ile brainstorming, sürüm kilidi ve planlama sürecini başlat.",
+    "Geliştirme ortamı, MCP sunucuları ve bağımlılıkların durumunu kontrol etmek için harness-doctor çalıştır.",
+    "Mevcut kod tabanı ve kanon dokümanları üzerinde kapsamlı bir entropy-sweep denetimi başlat."
+  ],
+  "author": {
+    "name": "Alparslan Parlak"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aparlak88/alps-agy-harness"
+  }
+}

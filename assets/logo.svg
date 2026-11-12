@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" fill="none">
+  <!-- Alps AGY Engineering Harness Logo -->
+  <defs>
+    <!-- Alpine peak & shield gradient -->
+    <linearGradient id="shieldGrad" x1="128" y1="32" x2="128" y2="224" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0EA5E9" />
+      <stop offset="50%" stop-color="#2563EB" />
+      <stop offset="100%" stop-color="#1E1B4B" />
+    </linearGradient>
+
+    <!-- Harness strap & carabiner gold gradient -->
+    <linearGradient id="accentGrad" x1="64" y1="96" x2="192" y2="192" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FCD34D" />
+      <stop offset="50%" stop-color="#F59E0B" />
+      <stop offset="100%" stop-color="#D97706" />
+    </linearGradient>
+
+    <!-- Alpine snow / peak highlight gradient -->
+    <linearGradient id="peakGrad" x1="128" y1="64" x2="128" y2="152" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="100%" stop-color="#0284C7" />
+    </linearGradient>
+
+    <!-- Contrast outline glow for dark/light adaptability -->
+    <filter id="subtleGlow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#0F172A" flood-opacity="0.25" />
+    </filter>
+  </defs>
+
+  <g filter="url(#subtleGlow)">
+    <!-- Outer Shield / Harness Gate (12% padding: 31px from 256 = 194x194 bounding box) -->
+    <path
+      d="M128 32 C172 32 216 44 224 58 C224 130 186 196 128 224 C70 196 32 130 32 58 C40 44 84 32 128 32 Z"
+      fill="url(#shieldGrad)"
+      stroke="#38BDF8"
+      stroke-width="4"
+      stroke-linejoin="round"
+    />
+
+    <!-- Inner Shield Inset Line -->
+    <path
+      d="M128 44 C164 44 202 54 208 66 C208 126 176 182 128 206 C80 182 48 126 48 66 C54 54 92 44 128 44 Z"
+      fill="none"
+      stroke="#60A5FA"
+      stroke-width="1.5"
+      stroke-opacity="0.6"
+    />
+
+    <!-- Alps Mountain Peak (Summit "A") -->
+    <path
+      d="M128 66 L178 148 L146 148 L128 116 L110 148 L78 148 Z"
+      fill="url(#peakGrad)"
+      stroke="#BAE6FD"
+      stroke-width="2"
+      stroke-linejoin="round"
+    />
+
+    <!-- Summit Snowcap -->
+    <polygon
+      points="128,66 142,90 134,88 128,94 122,88 114,90"
+      fill="#F8FAFC"
+      stroke="#FFFFFF"
+      stroke-width="1"
+      stroke-linejoin="round"
+    />
+
+    <!-- Harness Strap / Cross-reinforcement Loop -->
+    <path
+      d="M66 128 C88 152 108 168 128 178 C148 168 168 152 190 128 C192 136 193 144 191 152 C172 174 150 190 128 200 C106 190 84 174 65 152 C63 144 64 136 66 128 Z"
+      fill="url(#accentGrad)"
+      stroke="#FDE68A"
+      stroke-width="1.5"
+      stroke-linejoin="round"
+    />
+
+    <!-- Center Carabiner / Lock Node -->
+    <circle
+      cx="128"
+      cy="154"
+      r="16"
+      fill="#0F172A"
+      stroke="url(#accentGrad)"
+      stroke-width="4"
+    />
+    <circle
+      cx="128"
+      cy="154"
+      r="7"
+      fill="#FCD34D"
+    />
+  </g>
+</svg>
