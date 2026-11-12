@@ -27,8 +27,8 @@ Antigravity (`agy`) kullanan ekip üyelerinin her projede aynı mühendislik kal
 
 ### 2.1. Hedefler (Goals)
 1. **Tek Komutla Takım Dağıtımı ve Ortam Teşhisi (`harness-doctor`):** Takım arkadaşlarının `README.md` içindeki ön gereksinimleri (`superpowers`, zorunlu MCP'ler, Marketplace eklentileri) kurduktan sonra `agy plugin install <repo-url>` ile yükleyebileceği ve `harness-doctor` ile tüm ortam/proje hazırlığını 3 saniyede doğrulayabileceği bağımsız bir eklenti paketi sunmak.
-2. **Deterministik Yaşam Döngüsü Kapıları (`hooks.json`):** `main` dalında doğrudan üretim kodu yazılmasını, sürümü doğrulanmamış paket kurulmasını, plan kapsamı dışı dosyalara izinsiz dokunulmasını, güvenlik/kanon/walkthrough adımları tamamlanmadan PR açılmasını (`gh pr create`) ve PR sonrası denetim (`pr-auditor`) bitmeden oturumun kapanmasını fiziksel olarak engellemek; `main`'e merge/pull sonrası `graphify` bilgi grafiğini otomatik güncellemek.
-3. **Zorunlu `jev` Karar & Ön-Eleme Katmanı:** Context penceresini şişirmeden dosya ve öğrenilmiş ders ön-elemesi (`jev_triage`), tek geçişte çoklu kanon/mimari/yalınlık kontrolü (`jev_ask`, `jev_check`), görev/boyut sınıflandırması (`jev_classify`), spekülatif inceleme yorumu elemesi (`jev_check`) ve bulgu/teknik borç öncelik kalibrasyonu (`jev_score`) yapmak.
+2. **Deterministik Yaşam Döngüsü Kapıları (`hooks.json`):** `main` dalında doğrudan üretim kodu yazılmasını, sürümü doğrulanmamış paket kurulmasını, plan kapsamı dışı dosyalara izinsiz dokunulmasını, `jev` yönlendirmesi yapılmadan rastgele modelle alt ajan (`invoke_subagent`) çağrılmasını (`overwrite` ile Gemini modeli ve efor profilini kilitleyerek), güvenlik/kanon/walkthrough adımları tamamlanmadan PR açılmasını (`gh pr create`) ve PR sonrası denetim (`pr-auditor`) bitmeden oturumun kapanmasını fiziksel olarak engellemek; `main`'e merge/pull sonrası `graphify` bilgi grafiğini otomatik güncellemek.
+3. **Zorunlu `jev` Karar & Ön-Eleme Katmanı:** Context penceresini şişirmeden dosya ve öğrenilmiş ders ön-elemesi (`jev_triage`), tek geçişte çoklu kanon/mimari/yalınlık kontrolü (`jev_ask`, `jev_check`), görev boyutu ve **alt ajan Gemini model + efor seviyesi yönlendirmesi** (`jev_classify`, `jev_score`), spekülatif inceleme yorumu elemesi (`jev_check`) ve bulgu/teknik borç öncelik kalibrasyonu (`jev_score`) yapmak.
 4. **Sürüm ve Dokümantasyon Yönetişimi (`context7`):** Brownfield projelerde sabitlenmiş sürümleri korumak; greenfield veya yeni paket seçimlerinde güncel kararlı sürümü doğrulayıp `context7` dokümantasyonunu okumadan Spec/Plan yazılmasını önlemek.
 5. **Üç Parçalı Proje Kanonu (`glossary` + `flows` + `lessons`):** Alan terimlerinin (`customer_subscription_tier`, `ClientWorkAddress` vb.) ve iş akışı adımlarının (`Request -> Log -> Validate -> DB Write` vb.) Spec, Plan ve Kod genelinde birebir tutarlı kalmasını sağlamak; çözülen sinsi bug ve platform tuzaklarını `lessons.md` içinde biriktirip sonraki işlerde sıfır context maliyetiyle (`jev_triage`) hatırlatmak.
 6. **Mimari Karar & Trade-off Sunumu:** Önemli tasarım kararlarında uygulanabilir 2–3 yaklaşımı kazanç/kayıp matrisiyle kullanıcıya sunup seçilen kararı ADR olarak Spec'e kaydetmek.
@@ -99,9 +99,10 @@ alps-agy-harness/
 │   │   ├── session-start.sh           # SessionStart: router + proje durumu + ön gereksinim kontrolü
 │   │   ├── pre-edit-guard.sh          # PreToolUse (write_file|edit_file): main kilidi + tehlikeli desen kapısı
 │   │   ├── pre-command-guard.sh       # PreToolUse (run_command): paket kurulum kilidi + sert PR kapısı
+│   │   ├── pre-subagent-guard.sh      # PreToolUse (invoke_subagent): hibrit jev model/efor kilidi + overwrite
 │   │   ├── post-command-hooks.sh      # PostToolUse (run_command): PR açıldı bayrağı + graphify --update
 │   │   └── stop-gate.sh               # Stop: PR sonrası pr-auditor çalışmadan durmayı engelleme
-│   ├── stamp-gate.sh                  # Alt ajanların .harness/state/<branch>/ damgası yazma/doğrulama aracı
+│   ├── stamp-gate.sh                  # Alt ajanların .harness/state/<branch>/ damgası ve dispatch yazma/doğrulama aracı
 │   ├── harness-doctor.sh              # 8 MCP, TYPESAFE_API_KEY, LSP, superpowers ve repo kanon teşhis aracı
 │   └── run-quiet.sh                   # Context çürümesi kalkanı: uzun build/test loglarını süzüp tek satır özet döndürür
 ├── rules/
@@ -115,7 +116,7 @@ alps-agy-harness/
 │   ├── security-reviewer.md           # PR öncesi diff güvenlik tarama subagent'ı
 │   └── pr-auditor.md                  # PR sonrası 7 boyutlu derin inceleme + niyet çapası subagent'ı
 └── skills/
-    ├── harness-orchestrator/          # jev tabanlı iş boyutlandırma ve SDD model seçimi protokolü
+    ├── harness-orchestrator/          # jev tabanlı iş boyutlandırma ve hibrit alt ajan model/efor yönlendiricisi
     │   └── SKILL.md
     ├── harness-doctor/                # Kurulum ve ortam hazırlığını tek komutla doğrulama + onarım rehberi
     │   └── SKILL.md
@@ -208,10 +209,11 @@ Yukarıdaki hazırlık adımları işin boyutuna göre orantılı ölçeklenir; 
 ### 6.1. Durum, Log ve Damga Yönetimi (`.harness/`) — *[Builder Call]*
 Hook betiklerinin alt ajan denetimlerini deterministik doğrulayabilmesi ve `run-quiet.sh` sarmalayıcısının ham derleme/test çıktılarını saklayabilmesi için hedef çalışma alanında git-ignored `.harness/` dizini kullanılır (`.harness/state/<branch-slug>/` damgalar için, `.harness/logs/` sessiz test/build günlükleri için; `.git/info/exclude` veya `.gitignore` üzerinden izlenmez):
 - **`code-tree-sha` hesabı:** Walkthrough dokümanı (`docs/walkthroughs/`) veya V2 otopark notları (`docs/parking-lot.md`) commit edildiğinde `HEAD` değişeceği için tavuk-yumurta döngüsü oluşmaması adına damgalar `git rev-parse HEAD` yerine **`docs/walkthroughs/` ve `docs/parking-lot.md` hariç çalışma ağacı özetini** (`git ls-tree -r HEAD | grep -Ev $'\tdocs/(walkthroughs/|parking-lot\\.md$)' | git hash-object --stdin`) `codeTreeSha` olarak kaydeder (`docs/canon/lessons.md` ise kanonik kural parçası olduğu için `canon-pass.json` öncesinde güncellenir ve ağaca dahildir). Üretim veya test kodunda tek bir satır bile değişse `codeTreeSha` değişir ve eski damgalar otomatik geçersiz olur.
-- Damga dosyaları (`scripts/stamp-gate.sh` ile yazılır ve doğrulanır):
+- Damga ve yönlendirme dosyaları (`scripts/stamp-gate.sh` ile yazılır ve doğrulanır):
   - `canon-pass.json`: `{"verdict":"PASS","codeTreeSha":"...","planPath":"...","allowedFiles":["..."],"timestamp":"..."}`
   - `security-pass.json`: `{"verdict":"PASS","codeTreeSha":"...","criticalCount":0,"importantCount":0,"timestamp":"..."}`
   - `context7-verified.json`: `{"packages":{"<pkg>":{"version":"...","source":"locked|greenfield-latest","timestamp":"..."}}}`
+  - `subagent-dispatch.json`: `{"entries":{"<Role>":{"typeName":"...","tier":"trivial_lookup|bounded_execution|multi_module_integration|critical_architecture_or_audit","model":"flash_lite|flash|inherit|pro","effortProfile":"LOW|MEDIUM|HIGH|MAX","consumed":false,"timestamp":"..."}}}`
   - `pr-audit-pending.json`: `{"prUrl":"...","stopRetries":0}`
 
 ### 6.2. Yaşam Döngüsü Hook'ları (`hooks.json`)
@@ -219,7 +221,7 @@ Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlan
 
 1. **`SessionStart` (`scripts/hooks/session-start.sh`):**
    - `workspacePaths[0]` içinde aktif git dalını, `docs/canon/{glossary,flows,lessons}.md` ve `graphify-out/graph.json` varlığını, ayrıca temel CLI ön gereksinimlerini (`gh`, `jq`) kontrol eder; eksik ön gereksinim görürse `harness-doctor.sh` çalıştırılmasını hatırlatır.
-   - `injectSteps` → `systemMessage` ile `using-superpowers` + `alps-agy-harness` yönlendirme kurallarını (`run-quiet.sh` kullanımı dahil) ve çalışma alanı durum özetini ilk turdan bağlama enjekte eder.
+   - `injectSteps` → `systemMessage` ile `using-superpowers` + `alps-agy-harness` yönlendirme kurallarını (`run-quiet.sh` ve `jev` alt ajan yönlendirme kuralı dahil) ve çalışma alanı durum özetini ilk turdan bağlama enjekte eder.
 
 2. **`PreToolUse` — `write_file|edit_file` (`scripts/hooks/pre-edit-guard.sh`):**
    - **`main` / `master` Üretim Kodu Kilidi:** Hedef dosya çalışma alanı içindeyse, depoda en az bir commit varsa (`git rev-parse --verify HEAD`) ve aktif dal `main` veya `master` ise üretim kodu ve uygulama yapılandırma dosyalarının yazılmasını `"decision": "deny"` ile reddeder (*İstisna [Builder Call]:* `docs/superpowers/specs/` ve `docs/canon/` altındaki tasarım dokümanları brainstorming sırasında `main` üzerinde taslaklanabilir; kodlamaya geçmeden feature branch/worktree zorunludur).
@@ -235,11 +237,21 @@ Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlan
      4. **Dosya Kapsam Kilidi (Scope Allowlist Kontrolü):** Aktif bir uygulama planı mevcutsa (`canon-pass.json` içindeki `allowedFiles` listesi), `origin/main..HEAD` aralığında değişen her dosya (`git diff --name-only`) ya planın `Files` izin listesinde ya da izinli meta-doküman yollarında (`docs/superpowers/`, `docs/canon/`, `docs/walkthroughs/`, `docs/parking-lot.md`) yer almalıdır; plan dışı *drive-by* değiştirilmiş dosya varsa `"decision": "deny"` döner.
      Eksik varsa `"decision": "deny"` ve hangi adımın eksik olduğunu söyleyen net bir `reason` döner.
 
-4. **`PostToolUse` — `run_command` (`scripts/hooks/post-command-hooks.sh`):**
+4. **`PreToolUse` — `invoke_subagent` (`scripts/hooks/pre-subagent-guard.sh` — Hibrit `jev` Model & Efor Kilidi):**
+   - Her `invoke_subagent` çağrısını (`TypeName`, `Role`, `Prompt`, `Model`) çalıştırılmadan önce yakalar ve Antigravity'nin native **`"overwrite"`** yeteneğini kullanarak Gemini modelini ve davranışsal efor profilini fiziksel olarak kilitler:
+     - **Sabit Güvenlik Tabanlı Alt Ajanlar (Otomatik `overwrite`, ön kayıt gerekmez):**
+       - `security-reviewer` → daima `Model: "pro"` ve `EFFORT_PROFILE: MAX`.
+       - `pr-auditor` → daima `Model: "pro"` ve minimum `EFFORT_PROFILE: HIGH` (`subagent-dispatch.json` içinde `MAX` kayıtlıysa `MAX`).
+       - `browser` → Antigravity host kuralı gereği kullanıcı açıkça başka model istemedikçe `Model: "flash"` korunur; `image-generator` doğrudan geçirilir.
+     - **Dinamik `jev` Yönlendirmeli Alt Ajanlar (`self`, `research`, `canon-auditor` ve diğer alt ajanlar):**
+       - `.harness/state/<branch>/subagent-dispatch.json` içinde `Role` ile eşleşen tüketilmemiş (`consumed == false`) bir `jev` kararı arar; kayıt yoksa `"decision": "deny"` dönerek önce `jev_classify` / `jev_score` + `stamp-gate.sh dispatch` adımının çalıştırılmasını zorunlu kılar (`canon-auditor` için minimum taban `multi_module_integration` / `HIGH` olarak uygulanır, `flash_lite`/`flash` seviyesine düşmesine izin verilmez).
+       - Geçerli kaydı `consumed: true` olarak işaretler ve `"decision": "allow"` + `"overwrite": {"Model": "<seçilen-model>", "Prompt": "[EFFORT_PROFILE: <LOW|MEDIUM|HIGH|MAX> — <bütçe direktifi>]\n\n<orijinal Prompt>"}` döndürür (`Prompt` başında etiket zaten varsa idempotent kalır; mevcut alt ajana `send_message` ile devam edildiğinde ilk atanan model korunur).
+
+5. **`PostToolUse` — `run_command` (`scripts/hooks/post-command-hooks.sh`):**
    - **`gh pr create` Başarılı Olduğunda:** `error` alanı boşsa `.harness/state/<branch>/pr-audit-pending.json` dosyasını oluşturur.
    - **`main` Merge / Güncelleme Sonrası Graphify Otomasyonu:** Komut `gh pr merge` içeriyorsa **veya** aktif dal `main`/`master` iken `git merge` / `git pull` başarıyla çalıştıysa ve projede `graphify-out/` dizini varsa artımlı güncellemeyi (`--update --no-viz`) çalıştırır (`graphify-out/.graphify_python` varsa kayıtlı yorumlayıcıyla, yoksa `graphify` CLI ile; hata oluşursa ana akışı kırmadan günlük dosyasına yazar).
 
-5. **`Stop` (`scripts/hooks/stop-gate.sh`):**
+6. **`Stop` (`scripts/hooks/stop-gate.sh`):**
    - `terminationReason == "NO_TOOL_CALL"` iken `pr-audit-pending.json` mevcutsa ve `stopRetries < 2` ise sayacı artırıp `"decision": "continue"` ve `"reason": "PR açıldı; oturumu kapatmadan önce review-pr skill'ini kullanarak pr-auditor değerlendirmesini çalıştır."` döner.
 
 ---
@@ -252,11 +264,21 @@ Antigravity'nin `hooks.json` şemasına uygun olarak eklenti kökünde tanımlan
 | **Mimari Trade-off Kontrolü** | `jev_check` | Spec yazılırken birden fazla geçerli mimari desen barındıran ve kullanıcıya artı/eksi tablosuyla sorulmamış karar noktası olup olmadığını denetler. | `yes_at_or_above: 0.65`; `yes` veya `uncertain` ise trade-off sunulmadan Spec kapatılamaz. |
 | **Öğrenilmiş Dersler Ön-Elemesi** | `jev_triage` + `jev_ask` | Planlama ve hata ayıklama öncesinde `docs/canon/lessons.md` dosyasını context penceresini kirletmeden tarar ve yalnızca mevcut görevle ilgili geçmiş tuzakları seçer. | İlgililik olasılığı `>= 0.50` (`yes` veya `uncertain`) olan dersler doğrudan Plan veya görev brief'ine enjekte edilir. |
 | **Plan Yalınlık & Soyutlama Testi** | `jev_ask` | Plan onayı öncesinde planlanan arayüz/katman sayısının hedefi çözmek için en yalın yol olup olmadığını veya tek-kullanımlık soyutlama şişkinliği barındırıp barındırmadığını puanlar. | Şişkinlik olasılığı `>= 0.60` ise `canon-auditor` gereksiz soyutlamaların budanmasını zorunlu tutar. |
-| **SDD Görev Model Seçimi** | `jev_classify` | Her SDD görev brief'ini `mechanical_single_file` (`flash`), `multi_file_integration` (`inherit`) veya `complex_architecture` (`pro`) olarak sınıflandırır. | `act_above: 0.75`; belirsizse `inherit` kullanılır. |
+| **Alt Ajan Model & Efor Yönlendirme** | `jev_classify` / `jev_score` | Gönderilecek alt ajanın (`self`, `research`, `canon-auditor`) görev brief'ini 4 karmaşıklık katmanından birine (`trivial_lookup`, `bounded_execution`, `multi_module_integration`, `critical_architecture_or_audit`) atar (çoklu SDD görevlerinde tek geçişte toplu puanlanır). | `act_above: 0.75` (belirsizse bir üst güvenli katmana yuvarlanır); karar `subagent-dispatch.json`'a yazılıp `pre-subagent-guard.sh` `overwrite` ile kilitlenir. |
 | **Kanon & Akış Denetimi** | `jev_ask` + `jev_triage` | `jev_ask` Spec/Plan metnini tek prefill ile tüm kanonik akış ve sözlük kurallarına göre puanlar; `jev_triage` 50'ye kadar kod dosyasını context kirletmeden tarar. | İhlal olasılığı `>= 0.50` (`yes` veya `uncertain`) olan her madde `canon-auditor` tarafından satır kanıtıyla incelenir. |
 | **Güvenlik & PR Ön-Elemesi** | `jev_triage` | PR farkındaki tüm üretim dosyalarını güvenlik riski, katman sızıntısı, aşırı mühendislik ve "papağan/bayat dokümantasyon" açısından context dışında tarar. | Yalnızca şüpheli çıkan dosyalar ve kritik sınır dosyaları derin incelemeye alınır; küçük PR'larda (`<= 8` dosya) tüm diff ayrıca okunur. |
 | **Spekülatif İnceleme Yorumu Filtresi** | `jev_check` | İnceleyicinin ürettiği her aday bulgunun somut bir bug, güvenlik açığı, kanon sapması veya katman yönü ihlali mi yoksa spekülatif genişletilebilirlik/stil önerisi mi olduğunu sınar. | Somut kanıt olasılığı `< 0.70` olan spekülatif soyutlama önerileri bloklayıcı listeden otomatik düşürülür. |
 | **Bulgu & Entropi Ciddiyeti Kalibrasyonu** | `jev_score` | Somut inceleme bulgularını `[Minor, Important, Critical]` ölçeğinde; `entropy-sweep` adaylarını ise `[Low_Value, High_ROI_Micro_Fix, Needs_Full_Spec]` ölçeğinde puanlar. | İncelemede `Important`/`Critical` geçişi bloklar; temizlikte yalnız `High_ROI_Micro_Fix` adayları mikro-PR'a alınır. |
+
+#### 6.3.1. Alt Ajan Gemini Model ve Efor Profili Matrisi (`Seçenek 1 — Hibrit Kilit`)
+Antigravity `invoke_subagent` şemasında native `Model` (`flash_lite`, `flash`, `inherit`, `pro`) alanı ile `Prompt` başına enjekte edilen davranışsal efor bütçesi (`EFFORT_PROFILE`) aşağıdaki deterministik tabloyla eşlenir:
+
+| `jev` Karmaşıklık Katmanı (`tier`) | `overwrite.Model` | `EFFORT_PROFILE` Direktifi | Kapsanan Alt Ajan / Görev Örnekleri |
+| :--- | :--- | :--- | :--- |
+| **`trivial_lookup`** | `flash_lite` | **`LOW`:** Hedef odaklı çalış; en fazla 3 okuma turu yap, spekülatif dallanma yapma, yanıtı kısa tut. | Tek sembol/dosya yolu bulma, basit şablon/format kontrolü (`research`). |
+| **`bounded_execution`** | `flash` | **`MEDIUM`:** Standart TDD döngüsü uygula; yalnız görev kapsamındaki dosyaları ve doğrudan bağımlılıklarını incele. | Tek dosyalık SDD görevi, izole birim testi yazımı, sınırlı kod araştırması (`self`, `research`). |
+| **`multi_module_integration`** | `inherit` | **`HIGH`:** Katman sınırlarını, LSP tanılamalarını ve kenar durumları çapraz doğrula; her iddiayı dosya/satır kanıtına bağla. | Çok katmanlı özellik kodlaması, `canon-auditor` taban seviyesi, Builder Check (`self`, `research`, `canon-auditor`). |
+| **`critical_architecture_or_audit`** | `pro` | **`MAX`:** Sıfır varsayım; tüm bağımlılık zincirini, karşı-örnekleri (*counter-examples*) ve güvenlik/kanon değişmezlerini satır satır kanıtla. | Karmaşık Domain/CQRS tasarımı, sinsi kök neden analizi ve sabit tabanlı `security-reviewer` + `pr-auditor`. |
 
 ---
 
