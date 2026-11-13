@@ -1,0 +1,62 @@
+{
+  "alps-agy-harness": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./scripts/hooks/session-start.sh",
+        "timeout": 15
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "write_file|edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/hooks/pre-edit-guard.sh",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/hooks/pre-command-guard.sh",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "invoke_subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/hooks/pre-subagent-guard.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/hooks/post-command-hooks.sh",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./scripts/hooks/stop-gate.sh",
+        "timeout": 15
+      }
+    ]
+  }
+}
