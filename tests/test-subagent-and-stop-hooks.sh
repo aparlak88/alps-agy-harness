@@ -13,6 +13,7 @@ STAMP_GATE="$REPO_ROOT/scripts/stamp-gate.sh"
 EXPECTED_LOW="[EFFORT_PROFILE: LOW — Hedef odaklı çalış; en fazla 3 okuma turu yap, spekülatif dallanma yapma, yanıtı kısa tut.]"
 EXPECTED_MEDIUM="[EFFORT_PROFILE: MEDIUM — Standart TDD döngüsü uygula; yalnız görev kapsamındaki dosyaları ve doğrudan bağımlılıklarını incele.]"
 EXPECTED_HIGH="[EFFORT_PROFILE: HIGH — Katman sınırlarını, LSP tanılamalarını ve kenar durumları çapraz doğrula; her iddiayı dosya/satır kanıtına bağla.]"
+EXPECTED_XHIGH="[EFFORT_PROFILE: XHIGH — Derin çok adımlı muhakeme uygula; katman sözleşmelerini, tip güvenliğini ve tüm hata/kenar yollarını uçtan uca doğrula.]"
 EXPECTED_MAX="[EFFORT_PROFILE: MAX — Sıfır varsayım; tüm bağımlılık zincirini, karşı-örnekleri ve güvenlik/kanon değişmezlerini satır satır kanıtla.]"
 EXPECTED_STOP_REASON="PR açıldı; oturumu kapatmadan önce review-pr skill'ini kullanarak pr-auditor değerlendirmesini çalıştır."
 
@@ -396,6 +397,231 @@ test_canon_auditor_floor_upgrade() {
   out4=$(printf '%s\n' "$p4" | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out4" ".overwrite.Model" "pro" "canon-auditor critical_architecture_or_audit uses pro"
   assert_json_field "$out4" ".overwrite.Prompt" "${EXPECTED_MAX}"$'\n\n'"Verify full architecture canon." "canon-auditor critical_architecture_or_audit uses MAX"
+}
+
+test_gemini4_and_orchestrator_parent_aware_subagent_routing() {
+  [ -x "$PRE_SUBAGENT_GUARD" ] || { echo "pre-subagent-guard.sh missing or not executable: $PRE_SUBAGENT_GUARD" >&2; return 1; }
+
+  local repo
+  repo=$(make_temp_repo)
+
+  # 1. Gemini 4 Carbon parent:
+  #    - security-reviewer & pr-auditor stay on inherit (Carbon, never downgraded to Argon!)
+  #    - self bounded_execution steps down to pro (Argon)
+  #    - canon-auditor multi_module_integration defaults to pro (Argon), or preserves explicit caller Model="inherit"
+  #    - research trivial_lookup uses flash_lite
+  local p_carbon_sec out_carbon_sec
+  p_carbon_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-carbon-high",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "security-reviewer",
+        Role: "Carbon Sec Audit",
+        Model: "pro",
+        Prompt: "Audit Carbon auth."
+      }
+    }
+  }')
+  out_carbon_sec=$(printf '%s\n' "$p_carbon_sec" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_carbon_sec" ".overwrite.Model" "inherit" "Carbon parent must keep security-reviewer on inherit (Carbon)"
+  assert_json_field "$out_carbon_sec" ".overwrite.Prompt" "${EXPECTED_MAX}"$'\n\n'"Audit Carbon auth." "Carbon security-reviewer uses MAX"
+
+  local p_carbon_pr out_carbon_pr
+  p_carbon_pr=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Gemini 4 Carbon (Medium)",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "pr-auditor",
+        Role: "Carbon PR Audit",
+        Prompt: "Review PR on Carbon."
+      }
+    }
+  }')
+  out_carbon_pr=$(printf '%s\n' "$p_carbon_pr" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_carbon_pr" ".overwrite.Model" "inherit" "Carbon parent must keep pr-auditor on inherit (Carbon)"
+  assert_json_field "$out_carbon_pr" ".overwrite.Prompt" "${EXPECTED_HIGH}"$'\n\n'"Review PR on Carbon." "Carbon pr-auditor uses HIGH"
+
+  "$STAMP_GATE" dispatch --role "Carbon TDD Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
+  local p_carbon_self out_carbon_self
+  p_carbon_self=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-carbon-high",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "self",
+        Role: "Carbon TDD Worker",
+        Prompt: "Implement OrderService."
+      }
+    }
+  }')
+  out_carbon_self=$(printf '%s\n' "$p_carbon_self" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_carbon_self" ".overwrite.Model" "pro" "Carbon bounded_execution must step down to pro (Gemini 4 Argon)"
+  assert_json_field "$out_carbon_self" ".overwrite.Prompt" "${EXPECTED_MEDIUM}"$'\n\n'"Implement OrderService." "Carbon bounded_execution uses MEDIUM"
+
+  "$STAMP_GATE" dispatch --role "Carbon Canon Default" --type "canon-auditor" --tier "multi_module_integration" --workspace "$repo"
+  local p_carbon_canon1 out_carbon_canon1
+  p_carbon_canon1=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-carbon-high",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "canon-auditor",
+        Role: "Carbon Canon Default",
+        Model: "pro",
+        Prompt: "Check canon on Argon."
+      }
+    }
+  }')
+  out_carbon_canon1=$(printf '%s\n' "$p_carbon_canon1" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_carbon_canon1" ".overwrite.Model" "pro" "Carbon multi_module canon-auditor defaults to pro (Argon)"
+
+  "$STAMP_GATE" dispatch --role "Carbon Canon Inherit" --type "canon-auditor" --tier "multi_module_integration" --workspace "$repo"
+  local p_carbon_canon2 out_carbon_canon2
+  p_carbon_canon2=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-carbon-high",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "canon-auditor",
+        Role: "Carbon Canon Inherit",
+        Model: "inherit",
+        Prompt: "Check canon on Carbon."
+      }
+    }
+  }')
+  out_carbon_canon2=$(printf '%s\n' "$p_carbon_canon2" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_carbon_canon2" ".overwrite.Model" "inherit" "Carbon multi_module canon-auditor preserves explicit Model=inherit"
+
+  # 2. Orchestrator parent (gemini-pro-orchestrator):
+  #    - bounded_execution, multi_module_integration, security-reviewer, pr-auditor -> inherit (Carbon <-> Hydrogen)
+  #    - trivial_lookup -> flash_lite
+  "$STAMP_GATE" dispatch --role "Orch Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
+  local p_orch_self out_orch_self
+  p_orch_self=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-pro-orchestrator",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "self",
+        Role: "Orch Worker",
+        Model: "flash",
+        Prompt: "Write unit test."
+      }
+    }
+  }')
+  out_orch_self=$(printf '%s\n' "$p_orch_self" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_orch_self" ".overwrite.Model" "inherit" "Orchestrator bounded_execution must use inherit (-> Hydrogen)"
+
+  local p_orch_sec out_orch_sec
+  p_orch_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Orchestrator",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "security-reviewer",
+        Role: "Orch Sec",
+        Prompt: "Audit under Orchestrator."
+      }
+    }
+  }')
+  out_orch_sec=$(printf '%s\n' "$p_orch_sec" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_orch_sec" ".overwrite.Model" "inherit" "Orchestrator security-reviewer must use inherit (-> Carbon)"
+
+  # 3. Gemini 4 Hydrogen parent (gemini-4-hydrogen-xhigh):
+  #    - bounded_execution with XHIGH -> inherit + XHIGH header (stays on Hydrogen!)
+  #    - canon-auditor & security-reviewer -> pro (escalated up to Argon!)
+  "$STAMP_GATE" dispatch --role "Hyd XHigh Worker" --type "self" --tier "bounded_execution" --effort "XHIGH" --workspace "$repo"
+  local p_hyd_self out_hyd_self
+  p_hyd_self=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-hydrogen-xhigh",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "self",
+        Role: "Hyd XHigh Worker",
+        Model: "flash",
+        Prompt: "Implement parser."
+      }
+    }
+  }')
+  out_hyd_self=$(printf '%s\n' "$p_hyd_self" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_hyd_self" ".overwrite.Model" "inherit" "Hydrogen bounded_execution keeps inherit (Gemini 4 Hydrogen)"
+  assert_json_field "$out_hyd_self" ".overwrite.Prompt" "${EXPECTED_XHIGH}"$'\n\n'"Implement parser." "Hydrogen XHIGH effort header injected"
+
+  local p_hyd_sec out_hyd_sec
+  p_hyd_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-hydrogen-medium",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "security-reviewer",
+        Role: "Hyd Sec",
+        Prompt: "Audit on Hydrogen."
+      }
+    }
+  }')
+  out_hyd_sec=$(printf '%s\n' "$p_hyd_sec" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_hyd_sec" ".overwrite.Model" "pro" "Hydrogen security-reviewer escalates to pro (Argon)"
+
+  # 4. Argon Low vs Argon High & Gemini 3.8 Flash:
+  local p_argon_low_sec out_argon_low_sec p_argon_high_sec out_argon_high_sec
+  p_argon_low_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-argon-low",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "security-reviewer",
+        Role: "Argon Low Sec",
+        Prompt: "Audit Argon Low."
+      }
+    }
+  }')
+  out_argon_low_sec=$(printf '%s\n' "$p_argon_low_sec" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_argon_low_sec" ".overwrite.Model" "pro" "Argon Low security-reviewer upgrades to pro (Argon Medium)"
+
+  p_argon_high_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-argon-high",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "security-reviewer",
+        Role: "Argon High Sec",
+        Prompt: "Audit Argon High."
+      }
+    }
+  }')
+  out_argon_high_sec=$(printf '%s\n' "$p_argon_high_sec" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_argon_high_sec" ".overwrite.Model" "inherit" "Argon High security-reviewer stays on inherit (Argon High)"
+
+  "$STAMP_GATE" dispatch --role "Flash Canon" --type "canon-auditor" --tier "multi_module_integration" --workspace "$repo"
+  local p_flash_canon out_flash_canon
+  p_flash_canon=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-3.8-flash-low",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "canon-auditor",
+        Role: "Flash Canon",
+        Prompt: "Check canon from Flash parent."
+      }
+    }
+  }')
+  out_flash_canon=$(printf '%s\n' "$p_flash_canon" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_flash_canon" ".overwrite.Model" "pro" "Flash parent canon-auditor escalates from Flash to pro (Argon)"
 }
 
 test_multiline_prompt_with_quotes_backticks_and_dollar_preserved_idempotently() {

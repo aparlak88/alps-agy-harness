@@ -33,13 +33,14 @@ This always-on contract wraps `superpowers` workflows with deterministic lifecyc
 - **Rule of Three:** Outside external boundaries (repositories, 3rd-party SDK/HTTP gateways), never extract single-use `IFooHelper` interfaces, `AbstractBase` classes, `Factory` wrappers, or speculative flags before 3 concrete uses.
 - **Complexity Budget & Scope Lock:** Every Plan declares file-count budget, 1-sentence justification per abstraction, and `Out-of-Scope` items (`jev_ask` simplicity check). Edit **only** planned `allowedFiles`; write out-of-scope ideas or tech debt as 1-line notes in `docs/parking-lot.md` (cleaned via user-invoked `entropy-sweep`).
 
-## 7. Hybrid `jev` Subagent Model & Effort Routing
-- **Fixed Subagents (`pre-subagent-guard.sh` auto-overwrites):** `security-reviewer` -> `Model: "pro"` (`EFFORT_PROFILE: MAX`); `pr-auditor` -> `Model: "pro"` (`EFFORT_PROFILE: HIGH`/`MAX`); `browser` -> `Model: "flash"` default; `image-generator` -> pass-through.
-- **Dynamic Subagents (`self`, `research`, `canon-auditor`, custom):** Before **every** `invoke_subagent`, classify the brief via `jev_classify` / `jev_score` (`act_above: 0.75`; round uncertain up), register via `./scripts/stamp-gate.sh dispatch --role "<Role>" --type "<TypeName>" --tier "<tier>"`, and pass the matching `Model` (`pre-subagent-guard.sh` locks `Model` + `[EFFORT_PROFILE: ...]`):
-  - `trivial_lookup` -> `flash_lite` (`EFFORT_PROFILE: LOW`)
-  - `bounded_execution` -> `flash` (`EFFORT_PROFILE: MEDIUM`)
-  - `multi_module_integration` -> `inherit` (`EFFORT_PROFILE: HIGH`; floor for `canon-auditor`)
-  - `critical_architecture_or_audit` -> `pro` (`EFFORT_PROFILE: MAX`)
+## 7. Hybrid `jev` & Gemini 4 Parent-Aware Subagent Routing
+- **Runtime Tiers:** `invoke_subagent` accepts `inherit | flash_lite | flash | pro` (`pro` = Gemini 4 Argon, `flash` = 3.8 Flash, `inherit` = parent's Carbon / Argon / Hydrogen / `Orchestrator` / Claude). `pre-subagent-guard.sh` reads `HOOK_INPUT.modelName`: Carbon / `Orchestrator` / Argon(Med,High) / Claude audits stay on `inherit`, while Hydrogen / Argon-Low / Flash audits escalate via `pro` (Argon).
+- **Fixed Subagents:** `security-reviewer` -> frontier `inherit`|`pro` (`MAX`); `pr-auditor` -> frontier `inherit`|`pro` (`HIGH`/`XHIGH`/`MAX`); `browser` -> `flash` default; `image-generator` -> pass-through.
+- **Dynamic Subagents (`self`, `research`, `canon-auditor`, custom):** Classify via `jev_classify` / `jev_score` (`act_above: 0.75`) and register `./scripts/stamp-gate.sh dispatch --role "<Role>" --type "<TypeName>" --tier "<tier>" [--effort LOW|MEDIUM|HIGH|XHIGH|MAX]`:
+  - `trivial_lookup` -> `flash_lite` (`LOW`)
+  - `bounded_execution` -> `inherit` (`Orchestrator`/Hydrogen/Argon-Low), `pro` (Carbon/Argon-Med,High/Claude), else `flash` (`MEDIUM`/`XHIGH`)
+  - `multi_module_integration` -> `inherit` (`Orchestrator`/Argon-Med,High/Claude) or `pro` (`inherit` kept on Carbon) (`HIGH`; `canon-auditor` floor)
+  - `critical_architecture_or_audit` -> `inherit` (Carbon/`Orchestrator`/Argon-Med,High/Claude) else `pro` (`MAX`)
 
 ## 8. Context Window Shield (`run-quiet.sh` & `mobile-logs.sh`)
 - Wrap noisy build/test/lint commands (`dotnet build/test`, `npm test`, `ng build`, `npx playwright test`, `xcodebuild`, `./gradlew test/check`) in `./scripts/run-quiet.sh <label> -- <cmd...>` (1-line pass summary; full output in `.harness/logs/last.log`).

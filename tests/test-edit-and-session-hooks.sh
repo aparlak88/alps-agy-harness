@@ -53,6 +53,13 @@ test_session_start_injects_status_and_respects_harness_ignore() {
   assert_contains "$msg" "lessons.md: present" "Must report lessons present"
   assert_contains "$msg" "Graphify Status: present" "Must report graphify present"
 
+  # 2b. Active modelName in HOOK_INPUT is surfaced with classified Gemini 4 / Orchestrator family
+  local model_payload model_out model_msg
+  model_payload=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], modelName: "gemini-4-carbon-high"}')
+  model_out=$(printf '%s' "$model_payload" | "$SESSION_START")
+  model_msg=$(printf '%s' "$model_out" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$model_msg" "Active Session Model: gemini-4-carbon-high (family: carbon)" "SessionStart must surface active modelName and family"
+
   # 3. Test missing CLI warning via HARNESS_CHECK_BINS
   local warned_out
   warned_out=$(printf '%s' "$payload" | HARNESS_CHECK_BINS="nonexistent_harness_binary_123" "$SESSION_START")

@@ -228,6 +228,66 @@ test_dispatch_tier_mapping() {
   fi
 }
 
+test_gemini4_and_orchestrator_parent_model_classification_and_selector() {
+  [ -x "$COMMON_SH" ] || { echo "common.sh missing or not executable" >&2; return 1; }
+  [ -x "$STAMP_GATE" ] || { echo "stamp-gate.sh missing or not executable" >&2; return 1; }
+  # shellcheck source=/dev/null
+  source "$COMMON_SH"
+
+  assert_eq "unset" "$(harness_classify_parent_model "")" "Empty modelName -> unset"
+  assert_eq "carbon" "$(harness_classify_parent_model "gemini-4-carbon-high")" "Carbon slug -> carbon"
+  assert_eq "carbon" "$(harness_classify_parent_model "Gemini 4 Carbon (Medium)")" "Carbon display -> carbon"
+  assert_eq "orchestrator" "$(harness_classify_parent_model "gemini-pro-orchestrator")" "Orchestrator slug -> orchestrator"
+  assert_eq "orchestrator" "$(harness_classify_parent_model "Orchestrator")" "Orchestrator display -> orchestrator"
+  assert_eq "orchestrator" "$(harness_classify_parent_model "auto")" "auto -> orchestrator"
+  assert_eq "argon" "$(harness_classify_parent_model "gemini-4-argon-high")" "Argon High -> argon"
+  assert_eq "argon" "$(harness_classify_parent_model "Gemini 4 Argon (Medium)")" "Argon Medium -> argon"
+  assert_eq "argon_low" "$(harness_classify_parent_model "gemini-4-argon-low")" "Argon Low slug -> argon_low"
+  assert_eq "argon_low" "$(harness_classify_parent_model "Gemini 4 Argon (Low)")" "Argon Low display -> argon_low"
+  assert_eq "hydrogen" "$(harness_classify_parent_model "gemini-4-hydrogen-xhigh")" "Hydrogen XHigh -> hydrogen"
+  assert_eq "claude" "$(harness_classify_parent_model "claude-opus-5-5-high")" "Claude Opus -> claude"
+  assert_eq "flash" "$(harness_classify_parent_model "gemini-3.8-flash-low")" "Gemini 3.8 Flash -> flash"
+  assert_eq "flash" "$(harness_classify_parent_model "gpt-oss-120b-medium")" "GPT-OSS -> flash"
+  assert_eq "custom" "$(harness_classify_parent_model "enterprise-tuned-v1")" "Unknown non-empty -> custom"
+
+  local repo state_dir
+  repo=$(make_temp_repo)
+  state_dir=$(harness_state_dir "$repo")
+
+  # Verify select-model CLI subcommand across Carbon, Orchestrator, Hydrogen, Argon, and Flash
+  local sel_carbon_bounded sel_carbon_crit sel_carbon_multi_default sel_carbon_multi_inherit sel_orch_bounded sel_hyd_bounded sel_hyd_crit sel_flash_multi
+  sel_carbon_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-carbon-high" --workspace "$repo")
+  assert_json_field "$sel_carbon_bounded" ".model" "pro" "Carbon bounded_execution steps down to pro (Argon)"
+  assert_json_field "$sel_carbon_bounded" ".parentFamily" "carbon" "Carbon family reported"
+
+  sel_carbon_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "gemini-4-carbon-high" --workspace "$repo")
+  assert_json_field "$sel_carbon_crit" ".model" "inherit" "Carbon critical audit stays on inherit (Carbon)"
+
+  sel_carbon_multi_default=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-4-carbon-medium" --workspace "$repo")
+  assert_json_field "$sel_carbon_multi_default" ".model" "pro" "Carbon multi_module defaults to pro (Argon)"
+
+  sel_carbon_multi_inherit=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-4-carbon-medium" --caller-model "inherit" --workspace "$repo")
+  assert_json_field "$sel_carbon_multi_inherit" ".model" "inherit" "Carbon multi_module preserves explicit inherit"
+
+  sel_orch_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-pro-orchestrator" --workspace "$repo")
+  assert_json_field "$sel_orch_bounded" ".model" "inherit" "Orchestrator bounded_execution uses inherit (-> Hydrogen)"
+
+  sel_hyd_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-hydrogen-xhigh" --effort "XHIGH" --workspace "$repo")
+  assert_json_field "$sel_hyd_bounded" ".model" "inherit" "Hydrogen bounded_execution keeps inherit (Hydrogen)"
+  assert_json_field "$sel_hyd_bounded" ".effortProfile" "XHIGH" "select-model supports explicit XHIGH effort"
+
+  sel_hyd_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "gemini-4-hydrogen-xhigh" --workspace "$repo")
+  assert_json_field "$sel_hyd_crit" ".model" "pro" "Hydrogen critical audit escalates to pro (Argon)"
+
+  sel_flash_multi=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-3.8-flash-low" --workspace "$repo")
+  assert_json_field "$sel_flash_multi" ".model" "pro" "Flash multi_module escalates to pro (Argon)"
+
+  # Verify dispatch with --parent-model and --effort XHIGH
+  "$STAMP_GATE" dispatch --role "Hydrogen Worker" --type "self" --tier "bounded_execution" --parent-model "gemini-4-hydrogen-xhigh" --effort "XHIGH" --workspace "$repo"
+  assert_json_field "$state_dir/subagent-dispatch.json" '.entries["Hydrogen Worker"].model' "inherit" "Dispatch with Hydrogen parent stores inherit"
+  assert_json_field "$state_dir/subagent-dispatch.json" '.entries["Hydrogen Worker"].effortProfile' "XHIGH" "Dispatch stores XHIGH effortProfile"
+}
+
 test_harness_ignore_detection() {
   [ -x "$COMMON_SH" ] || { echo "common.sh missing or not executable" >&2; return 1; }
   # shellcheck source=/dev/null

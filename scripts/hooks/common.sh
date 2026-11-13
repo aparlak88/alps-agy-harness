@@ -419,6 +419,134 @@ sys.exit(0)
 '
 }
 
+# Classify a parent session modelName (slug or display label) into a canonical routing family:
+#   unset | orchestrator | carbon | argon_low | argon | hydrogen | claude | flash | custom
+harness_classify_parent_model() {
+  local raw="${1:-}"
+  local trimmed="${raw//[[:space:]]/}"
+  if [ -z "$trimmed" ]; then
+    printf 'unset\n'
+    return 0
+  fi
+
+  local norm
+  norm="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+
+  case "$norm" in
+    *orchestrator*|auto)
+      printf 'orchestrator\n'
+      ;;
+    *carbon*)
+      printf 'carbon\n'
+      ;;
+    *argon*)
+      if [[ "$norm" == *-low ]] || [[ "$norm" == *"(low)"* ]] || [[ "$norm" == *" low"* ]]; then
+        printf 'argon_low\n'
+      else
+        printf 'argon\n'
+      fi
+      ;;
+    *hydrogen*)
+      printf 'hydrogen\n'
+      ;;
+    *claude*|*opus*|*sonnet*)
+      printf 'claude\n'
+      ;;
+    *flash*|*gpt-oss*)
+      printf 'flash\n'
+      ;;
+    *)
+      printf 'custom\n'
+      ;;
+  esac
+}
+
+# Return 0 when effort profile is one of LOW | MEDIUM | HIGH | XHIGH | MAX.
+harness_is_valid_effort_profile() {
+  case "${1:-}" in
+    LOW|MEDIUM|HIGH|XHIGH|MAX) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Default EFFORT_PROFILE for a dispatch complexity tier.
+harness_default_effort_for_tier() {
+  case "${1:-}" in
+    trivial_lookup) printf 'LOW\n' ;;
+    bounded_execution) printf 'MEDIUM\n' ;;
+    multi_module_integration) printf 'HIGH\n' ;;
+    critical_architecture_or_audit) printf 'MAX\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+# Resolve parent-aware Antigravity invoke_subagent Model tier (inherit | flash_lite | flash | pro)
+# from ($parent_model, $tier, $caller_model, $floor_upgraded).
+harness_resolve_subagent_model() {
+  local parent_model="${1:-}"
+  local tier="${2:-}"
+  local caller_model="${3:-}"
+  local floor_upgraded="${4:-false}"
+  local family
+  family="$(harness_classify_parent_model "$parent_model")"
+
+  case "$tier" in
+    trivial_lookup)
+      printf 'flash_lite\n'
+      ;;
+    bounded_execution)
+      case "$family" in
+        orchestrator|hydrogen|argon_low)
+          printf 'inherit\n'
+          ;;
+        carbon|argon|claude)
+          printf 'pro\n'
+          ;;
+        *)
+          printf 'flash\n'
+          ;;
+      esac
+      ;;
+    multi_module_integration)
+      case "$family" in
+        orchestrator|argon|claude|custom)
+          printf 'inherit\n'
+          ;;
+        carbon)
+          if [ "$caller_model" = "inherit" ]; then
+            printf 'inherit\n'
+          else
+            printf 'pro\n'
+          fi
+          ;;
+        argon_low|hydrogen|flash)
+          printf 'pro\n'
+          ;;
+        unset)
+          if [ "$floor_upgraded" = "true" ]; then
+            printf 'pro\n'
+          else
+            printf 'inherit\n'
+          fi
+          ;;
+      esac
+      ;;
+    critical_architecture_or_audit)
+      case "$family" in
+        orchestrator|carbon|argon|claude|custom)
+          printf 'inherit\n'
+          ;;
+        *)
+          printf 'pro\n'
+          ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # Antigravity PreToolUse JSON emitters
 emit_allow() {
   jq -nc '{decision: "allow"}'

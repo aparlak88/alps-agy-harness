@@ -52,24 +52,27 @@ Kodlama aşamasına geçmeden önce `main` dalında doğrudan kod yazımı `pre-
 
 ---
 
-## 4. Hibrit Alt Ajan Model ve Efor Yönlendirme
+## 4. Hibrit `jev` ve Gemini 4 / `Orchestrator` Duyarlı Alt Ajan Yönlendirme
 
-Her `invoke_subagent` çağrısından önce, işin karmaşıklığına göre `stamp-gate.sh dispatch` çalıştırarak yönlendirme kararını kaydedin:
+Antigravity'nin `invoke_subagent` aracı yalnızca `inherit | flash_lite | flash | pro` katmanlarını kabul eder (`pro` = **Gemini 4 Argon**, `flash` = **Gemini 3.8 Flash**, `inherit` = ana oturumun aktif **Carbon / Argon / Hydrogen / `Orchestrator` / Claude** modeli).
+
+Her dinamik `invoke_subagent` çağrısından önce, işin karmaşıklığına göre `stamp-gate.sh dispatch` çalıştırarak yönlendirme kararını kaydedin:
 
 ```bash
 ./scripts/stamp-gate.sh dispatch \
   --role "<Alt Ajan Rolü>" \
   --type "self" \
-  --tier "trivial_lookup|bounded_execution|multi_module_integration|critical_architecture_or_audit"
+  --tier "trivial_lookup|bounded_execution|multi_module_integration|critical_architecture_or_audit" \
+  [--effort "LOW|MEDIUM|HIGH|XHIGH|MAX"]
 ```
 
-Katman Eşlemesi:
-- **`trivial_lookup`:** `flash_lite` / `EFFORT_PROFILE: LOW`
-- **`bounded_execution`:** `flash` / `EFFORT_PROFILE: MEDIUM`
-- **`multi_module_integration`:** `inherit` / `EFFORT_PROFILE: HIGH`
-- **`critical_architecture_or_audit`:** `pro` / `EFFORT_PROFILE: MAX`
+Ana Oturum (`HOOK_INPUT.modelName`) Duyarlı Katman Eşlemesi:
+- **`trivial_lookup` (`LOW`):** Tüm ana oturumlarda `flash_lite`.
+- **`bounded_execution` (`MEDIUM` / `XHIGH`):** `Orchestrator`, **Gemini 4 Hydrogen** ve `Argon (Low)` oturumlarında `inherit` (kodlayıcılar eski 3.8 Flash'a düşmez); **Gemini 4 Carbon**, `Argon (Med/High)` ve Claude oturumlarında `pro` (**Gemini 4 Argon**); `3.8 Flash` oturumlarında `flash`.
+- **`multi_module_integration` (`HIGH`, `canon-auditor` tabanı):** `Orchestrator`, `Argon (Med/High)` ve Claude oturumlarında `inherit`; `Carbon` oturumunda varsayılan `pro` (**Argon**; açık `Model: "inherit"` verilirse Carbon korunur); `Hydrogen`, `Argon (Low)` ve `3.8 Flash` oturumlarında `pro` (**Argon**'a yükseltilir).
+- **`critical_architecture_or_audit` (`MAX`, `security-reviewer` ve `pr-auditor`):** `Carbon`, `Orchestrator`, `Argon (Med/High)` ve Claude oturumlarında `inherit` (üst seviye model asla Argon Medium'a düşürülmez); `Hydrogen`, `Argon (Low)` ve `3.8 Flash` oturumlarında `pro` (**Argon**'a yükseltilir).
 
-`pre-subagent-guard.sh` hook'u bu kaydı okur, tek seferlik tüketir (`consumed: true`) ve Antigravity'nin yerel `overwrite` yeteneğiyle alt ajanın modelini ve prompt başlığını fiziksel olarak kilitler.
+`pre-subagent-guard.sh` hook'u canlı `HOOK_INPUT.modelName` alanını ve dispatch kaydını okur, kaydı tek seferlik tüketir (`consumed: true`) ve Antigravity'nin yerel `overwrite` yeteneğiyle alt ajanın modelini ve `[EFFORT_PROFILE: ...]` başlığını fiziksel olarak kilitler.
 
 ---
 

@@ -14,7 +14,7 @@ Büyük dil modelleri tek başlarına bırakıldığında kapsam kaymasına (*sc
 
 **Engineering Harness**, ajanın etrafına kurulan fiziksel güvenlik ve kalite çemberidir:
 - **Fiziksel Kancalar (`hooks.json`):** `main` dalına doğrudan kod yazılmasını, doğrulanmamış paket kurulmasını ve eksik denetimle PR açılmasını kabuk düzeyinde engeller.
-- **Model ve Efor Kilidi (`overwrite`):** Alt ajanların Gemini modellerini (`flash`, `pro`) ve efor bütçelerini (`LOW`, `MEDIUM`, `HIGH`, `MAX`) fiziksel olarak kilitler.
+- **Gemini 4 & `Orchestrator` Duyarlı Model ve Efor Kilidi (`overwrite`):** Ana oturumun modelini (`HOOK_INPUT.modelName`: Carbon, Argon, Hydrogen, `Orchestrator`) algılayarak alt ajan katmanlarını (`inherit`, `pro` [Argon], `flash`, `flash_lite`) ve efor bütçelerini (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`, `MAX`) düşürme kaybı olmadan fiziksel olarak kilitler.
 - **Sessiz Başarı Kalkanı (`run-quiet.sh`):** Binlerce satırlık derleme ve test loglarını süzerek bağlam penceresini korur.
 - **Sıfır-Context Ön-Eleme (`jev`):** Geçmiş dersleri ve PR diff dosyalarını ana modelin context'ini kirletmeden sunucuda değerlendirir.
 
@@ -200,19 +200,19 @@ flowchart TD
 
 | Kategori | Bileşen | Açıklama |
 | :--- | :--- | :--- |
-| **Kancalar (`hooks.json`)** | `session-start.sh` | Oturum başında dal, kanon ve araç durumunu enjekte eder. |
+| **Kancalar (`hooks.json`)** | `session-start.sh` | Oturum başında dal, aktif model ailesi (`modelName`), kanon ve araç durumunu enjekte eder. |
 | | `pre-edit-guard.sh` | `main` dalı kod kilidi, doküman sonu sözlük kapısı ve güvenlik süzgeci. |
 | | `pre-command-guard.sh` | Paket kurulum doğrulaması, logcat koruması ve sert PR açma kapısı. |
-| | `pre-subagent-guard.sh` | Alt ajan Gemini modeli ve efor profili fiziksel `overwrite` kilidi. |
+| | `pre-subagent-guard.sh` | Gemini 4 & `Orchestrator` duyarlı alt ajan modeli (`inherit`/`pro`/`flash`/`flash_lite`) ve efor (`LOW`–`MAX`) `overwrite` kilidi. |
 | | `post-command-hooks.sh` | Başarılı PR sonrası denetim bayrağı ve `graphify` güncellemesi. |
 | | `stop-gate.sh` | `pr-auditor` çalıştırılmadan oturumun kapanmasını engeller. |
 | **Yardımcı Betikler** | `run-quiet.sh` | Derleme/test loglarını sessize alır; tek satır özet ve log kaydı döner. |
 | | `mobile-logs.sh` | iOS Simulator `.ips` crash ve Android Emulator logcat süzgeci. |
-| | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası ve subagent dispatch yöneticisi. |
+| | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası, `select-model` çözümleyicisi ve subagent dispatch yöneticisi. |
 | | `harness-doctor.sh` | 8 MCP, gizli anahtar ve ortam sağlığı kontrol aracı. |
-| **Alt Ajanlar (`agents/`)** | `canon-auditor.md` | Domain glossary, flows ve Clean Architecture denetçisi (`pro`/`HIGH`). |
-| | `security-reviewer.md` | PR diff güvenlik açığı ve secret tarayıcısı (`pro`/`MAX`). |
-| | `pr-auditor.md` | Niyet çapası ve 7 boyutlu derin mimari denetçi (`pro`/`HIGH`). |
+| **Alt Ajanlar (`agents/`)** | `canon-auditor.md` | Domain glossary, flows ve Clean Architecture denetçisi (`inherit`/`pro` + `HIGH` taban). |
+| | `security-reviewer.md` | PR diff güvenlik açığı ve secret tarayıcısı (frontier `inherit`/`pro` + `MAX`). |
+| | `pr-auditor.md` | Niyet çapası ve 7 boyutlu derin mimari denetçi (frontier `inherit`/`pro` + `HIGH`/`MAX`). |
 | **Skill'ler (`skills/`)** | 11 Süreç Skill'i | Orkestrasyon, mimari trade-off, sürüm kilidi, E2E, mobil ve RevenueCat. |
 
 ---

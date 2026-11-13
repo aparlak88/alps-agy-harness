@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Alps AGY Harness - PreToolUse Hybrid jev Subagent Model & Effort Lock (pre-subagent-guard.sh)
-# Enforces:
-#   - security-reviewer -> auto overwrite Model="pro", EFFORT_PROFILE: MAX
-#   - pr-auditor        -> auto overwrite Model="pro", EFFORT_PROFILE: HIGH (or MAX if dispatched as MAX)
+# Alps AGY Harness - PreToolUse Hybrid jev & Gemini 4 Parent-Aware Subagent Lock (pre-subagent-guard.sh)
+# Enforces parent-model-aware (`HOOK_INPUT.modelName`) routing across Gemini 4 Carbon, Argon, Hydrogen, and Orchestrator:
+#   - security-reviewer -> inherit on Carbon/Orchestrator/Argon(Med,High)/Claude, pro (Argon) otherwise; EFFORT_PROFILE: MAX
+#   - pr-auditor        -> inherit on Carbon/Orchestrator/Argon(Med,High)/Claude, pro (Argon) otherwise; EFFORT_PROFILE: HIGH|MAX
 #   - browser           -> overwrite Model="flash" when Model omitted; preserve explicit Model
 #   - image-generator   -> allow directly
 #   - self, research, canon-auditor, and custom subagents -> require unconsumed subagent-dispatch.json
-#     entry for Role, enforce canon-auditor floor (pro / HIGH), mark consumed=true, and idempotently
-#     prepend EFFORT_PROFILE directive byte-for-byte via jq.
+#     entry for Role, enforce canon-auditor floor (HIGH + parent-aware Argon/Carbon/Orchestrator model),
+#     mark consumed=true, and idempotently prepend EFFORT_PROFILE directive byte-for-byte via jq.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -37,6 +37,7 @@ if ! printf '%s\n' "$HOOK_INPUT" | jq -e '(.toolCall.args | type) == "object"' >
   exit 0
 fi
 
+parent_model="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.modelName // empty' 2>/dev/null || true)"
 type_name="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.toolCall.args.TypeName // empty' 2>/dev/null || true)"
 role="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.toolCall.args.Role // empty' 2>/dev/null || true)"
 caller_model="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.toolCall.args.Model // empty' 2>/dev/null || true)"
@@ -52,6 +53,9 @@ effort_header_for_profile() {
       ;;
     HIGH)
       printf '%s' "[EFFORT_PROFILE: HIGH — Katman sınırlarını, LSP tanılamalarını ve kenar durumları çapraz doğrula; her iddiayı dosya/satır kanıtına bağla.]"
+      ;;
+    XHIGH)
+      printf '%s' "[EFFORT_PROFILE: XHIGH — Derin çok adımlı muhakeme uygula; katman sözleşmelerini, tip güvenliğini ve tüm hata/kenar yollarını uçtan uca doğrula.]"
       ;;
     MAX)
       printf '%s' "[EFFORT_PROFILE: MAX — Sıfır varsayım; tüm bağımlılık zincirini, karşı-örnekleri ve güvenlik/kanon değişmezlerini satır satır kanıtla.]"
@@ -115,7 +119,8 @@ case "$type_name" in
 
   security-reviewer)
     mark_role_consumed_if_present "$role"
-    emit_model_and_effort_overwrite "pro" "MAX"
+    sec_model="$(harness_resolve_subagent_model "$parent_model" "critical_architecture_or_audit" "$caller_model" "false")"
+    emit_model_and_effort_overwrite "$sec_model" "MAX"
     exit 0
     ;;
 
@@ -127,14 +132,15 @@ case "$type_name" in
       dispatch_file="$state_dir/subagent-dispatch.json"
       if [ -f "$dispatch_file" ] && jq -e --arg role "$role" 'type == "object" and (.entries | type == "object") and ((.entries[$role] | type) == "object") and ((.entries[$role].consumed // false) == false)' "$dispatch_file" >/dev/null 2>&1; then
         reg_effort="$(jq -r --arg role "$role" '.entries[$role].effortProfile // empty' "$dispatch_file" 2>/dev/null || true)"
-        if [ "$reg_effort" = "MAX" ]; then
-          pr_effort="MAX"
+        if [ "$reg_effort" = "MAX" ] || [ "$reg_effort" = "XHIGH" ]; then
+          pr_effort="$reg_effort"
         fi
         updated_json="$(jq -c --arg role "$role" '.entries[$role].consumed = true' "$dispatch_file")"
         atomic_write_json "$state_dir" "subagent-dispatch.json" "$updated_json"
       fi
     fi
-    emit_model_and_effort_overwrite "pro" "$pr_effort"
+    pr_model="$(harness_resolve_subagent_model "$parent_model" "critical_architecture_or_audit" "$caller_model" "false")"
+    emit_model_and_effort_overwrite "$pr_model" "$pr_effort"
     exit 0
     ;;
 
@@ -168,7 +174,7 @@ case "$type_name" in
     model="$(jq -r --arg role "$role" '.entries[$role].model // empty' "$dispatch_file" 2>/dev/null || true)"
     effort="$(jq -r --arg role "$role" '.entries[$role].effortProfile // empty' "$dispatch_file" 2>/dev/null || true)"
 
-    if [ -z "$model" ] || { [ "$effort" != "LOW" ] && [ "$effort" != "MEDIUM" ] && [ "$effort" != "HIGH" ] && [ "$effort" != "MAX" ]; }; then
+    if [ -z "$model" ] || ! harness_is_valid_effort_profile "$effort"; then
       emit_deny "Alt ajan çağrısı reddedildi ('$type_name' / Role: '$role'): subagent-dispatch.json kaydı geçersiz model veya effortProfile içeriyor. 'scripts/stamp-gate.sh dispatch --role \"$role\" --type \"$type_name\" --tier <katman>' ile kaydı yenileyin."
       exit 0
     fi
@@ -176,12 +182,23 @@ case "$type_name" in
     updated_json="$(jq -c --arg role "$role" '.entries[$role].consumed = true' "$dispatch_file")"
     atomic_write_json "$state_dir" "subagent-dispatch.json" "$updated_json"
 
-    # Ruling #3: canon-auditor floor upgrade (trivial_lookup / bounded_execution -> pro / HIGH)
+    effective_tier="$entry_tier"
+    floor_upgraded="false"
+
+    # Ruling #3: canon-auditor floor upgrade (trivial_lookup / bounded_execution -> multi_module_integration / HIGH)
     if [ "$type_name" = "canon-auditor" ]; then
       if [ "$entry_tier" = "trivial_lookup" ] || [ "$entry_tier" = "bounded_execution" ] || [ "$effort" = "LOW" ] || [ "$effort" = "MEDIUM" ]; then
-        model="pro"
+        effective_tier="multi_module_integration"
         effort="HIGH"
+        floor_upgraded="true"
       fi
+    fi
+
+    parent_family="$(harness_classify_parent_model "$parent_model")"
+    if [ "$parent_family" != "unset" ] && [ -n "$effective_tier" ]; then
+      model="$(harness_resolve_subagent_model "$parent_model" "$effective_tier" "$caller_model" "$floor_upgraded")"
+    elif [ "$floor_upgraded" = "true" ]; then
+      model="pro"
     fi
 
     emit_model_and_effort_overwrite "$model" "$effort"

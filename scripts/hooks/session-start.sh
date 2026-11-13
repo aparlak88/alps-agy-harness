@@ -15,6 +15,9 @@ if harness_is_ignored "$WORKSPACE_ROOT"; then
 fi
 
 branch="$(harness_branch_name "$WORKSPACE_ROOT")"
+parent_model="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.modelName // empty' 2>/dev/null || true)"
+parent_family="$(harness_classify_parent_model "$parent_model")"
+parent_model_display="${parent_model:-unspecified}"
 
 # Check canon files
 canon_glossary="missing"
@@ -45,6 +48,7 @@ fi
 # Build context injection message
 msg="[Alps AGY Harness - Active Session Context]
 - Active Git Branch: $branch
+- Active Session Model: $parent_model_display (family: $parent_family)
 - Canon Status:
   - glossary.md: $canon_glossary
   - flows.md: $canon_flows
@@ -52,6 +56,7 @@ msg="[Alps AGY Harness - Active Session Context]
 - Graphify Status: $graphify_status (graphify-out/graph.json)
 - Protocols:
   - Use jev_classify, jev_check, and jev_ask for intent, architecture trade-offs, and verification.
+  - Parent-aware Gemini 4 / Orchestrator subagent routing is enforced by pre-subagent-guard.sh (never downgrades Carbon/Orchestrator/Argon-High audits; escalates Hydrogen/Flash audits to Argon via pro).
   - Wrap high-output shell commands with scripts/run-quiet.sh.
   - All documentation must conclude with a ## Teknik Terimler Sözlüğü or ## Technical Glossary section."
 

@@ -7,7 +7,7 @@ description: "Açık bir PR için çok boyutlu pr-auditor denetimini orkestre ed
 
 Bu skill, yeni bir PR açıldığında (`stop-gate.sh` kancası tarafından otomatik olarak talep edildiğinde) veya mevcut bir GitHub PR'ını denetlemek için kullanıcı tarafından çağrıldığında devreye girer.
 
-`pr-auditor` alt ajanını en yüksek kalitede (`pro` model ve `HIGH`/`MAX` efor) yönetir; spekülatif soyutlama gürültüsünü filtreleyerek somut mimari bulguları raporlar.
+`pr-auditor` alt ajanını ana oturum modeline duyarlı en yüksek katmanda (Carbon / `Orchestrator` / `Argon High` / Claude oturumlarında `inherit`, Hydrogen / `3.8 Flash` oturumlarında `pro` [Gemini 4 Argon] ve `HIGH`/`XHIGH`/`MAX` efor) yönetir; spekülatif soyutlama gürültüsünü filtreleyerek somut mimari bulguları raporlar.
 
 ---
 
@@ -33,7 +33,7 @@ Bu skill, yeni bir PR açıldığında (`stop-gate.sh` kancası tarafından otom
 ```
 
 ### Adım 2: `invoke_subagent` ile pr-auditor Çağrısı
-`TypeName: "pr-auditor"`, `Role: "PR Auditor"` argümanlarıyla alt ajanı çağırın. `pre-subagent-guard.sh` otomatik olarak modeli `pro` ve prompt başlığını `EFFORT_PROFILE: MAX` (veya `HIGH`) ile yeniden yazar.
+`TypeName: "pr-auditor"`, `Role: "PR Auditor"` argümanlarıyla alt ajanı çağırın. `pre-subagent-guard.sh` ana oturum modeline (`HOOK_INPUT.modelName`) göre modeli `inherit` (Carbon / `Orchestrator` / `Argon High` / Claude) veya `pro` (Gemini 4 Argon) olarak kilitler ve prompt başlığını `EFFORT_PROFILE: MAX` (veya `XHIGH` / `HIGH`) ile yeniden yazar.
 
 ---
 

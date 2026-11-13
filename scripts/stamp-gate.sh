@@ -30,7 +30,8 @@ Usage:
   stamp-gate.sh canon --verdict PASS|FAIL [--plan <path>] [--allow-file <relpath> ...] [--workspace <dir>]
   stamp-gate.sh security --verdict PASS|FAIL --critical <n> --important <n> [--workspace <dir>]
   stamp-gate.sh context7 --package <name> --version <ver> --source locked|greenfield-latest [--workspace <dir>]
-  stamp-gate.sh dispatch --role <role> --type <typeName> --tier <tier> [--workspace <dir>]
+  stamp-gate.sh dispatch --role <role> --type <typeName> --tier <tier> [--parent-model <modelName>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--workspace <dir>]
+  stamp-gate.sh select-model --tier <tier> [--parent-model <modelName>] [--caller-model <tier>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--workspace <dir>]
   stamp-gate.sh verify-pr-stamps [--workspace <dir>]
   stamp-gate.sh clear-pr-audit [--workspace <dir>]
 EOF
@@ -324,6 +325,8 @@ cmd_dispatch() {
   local role=""
   local type_name=""
   local tier=""
+  local parent_model="${HARNESS_PARENT_MODEL:-}"
+  local explicit_effort=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -354,6 +357,24 @@ cmd_dispatch() {
         tier="${1#--tier=}"
         shift
         ;;
+      --parent-model)
+        [ $# -ge 2 ] || { echo "Error: --parent-model requires a model name" >&2; exit 1; }
+        parent_model="$2"
+        shift 2
+        ;;
+      --parent-model=*)
+        parent_model="${1#--parent-model=}"
+        shift
+        ;;
+      --effort)
+        [ $# -ge 2 ] || { echo "Error: --effort requires LOW|MEDIUM|HIGH|XHIGH|MAX" >&2; exit 1; }
+        explicit_effort="$2"
+        shift 2
+        ;;
+      --effort=*)
+        explicit_effort="${1#--effort=}"
+        shift
+        ;;
       *)
         echo "Error: unknown argument for dispatch: $1" >&2
         exit 1
@@ -368,28 +389,20 @@ cmd_dispatch() {
 
   local model=""
   local effort=""
-  case "$tier" in
-    trivial_lookup)
-      model="flash_lite"
-      effort="LOW"
-      ;;
-    bounded_execution)
-      model="flash"
-      effort="MEDIUM"
-      ;;
-    multi_module_integration)
-      model="inherit"
-      effort="HIGH"
-      ;;
-    critical_architecture_or_audit)
-      model="pro"
-      effort="MAX"
-      ;;
-    *)
-      echo "Error: unknown dispatch --tier '$tier' (expected trivial_lookup|bounded_execution|multi_module_integration|critical_architecture_or_audit)" >&2
+  if ! effort="$(harness_default_effort_for_tier "$tier")"; then
+    echo "Error: unknown dispatch --tier '$tier' (expected trivial_lookup|bounded_execution|multi_module_integration|critical_architecture_or_audit)" >&2
+    exit 1
+  fi
+
+  if [ -n "$explicit_effort" ]; then
+    if ! harness_is_valid_effort_profile "$explicit_effort"; then
+      echo "Error: invalid dispatch --effort '$explicit_effort' (expected LOW|MEDIUM|HIGH|XHIGH|MAX)" >&2
       exit 1
-      ;;
-  esac
+    fi
+    effort="$explicit_effort"
+  fi
+
+  model="$(harness_resolve_subagent_model "$parent_model" "$tier" "" "false")"
 
   local state_dir ts existing json_payload
   state_dir="$(harness_state_dir "$WORKSPACE")"
@@ -421,6 +434,84 @@ cmd_dispatch() {
     })')"
 
   atomic_write_json "$state_dir" "subagent-dispatch.json" "$json_payload"
+}
+
+cmd_select_model() {
+  local tier=""
+  local parent_model="${HARNESS_PARENT_MODEL:-}"
+  local caller_model=""
+  local explicit_effort=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tier)
+        [ $# -ge 2 ] || { echo "Error: --tier requires a tier name" >&2; exit 1; }
+        tier="$2"
+        shift 2
+        ;;
+      --tier=*)
+        tier="${1#--tier=}"
+        shift
+        ;;
+      --parent-model)
+        [ $# -ge 2 ] || { echo "Error: --parent-model requires a model name" >&2; exit 1; }
+        parent_model="$2"
+        shift 2
+        ;;
+      --parent-model=*)
+        parent_model="${1#--parent-model=}"
+        shift
+        ;;
+      --caller-model)
+        [ $# -ge 2 ] || { echo "Error: --caller-model requires a model tier" >&2; exit 1; }
+        caller_model="$2"
+        shift 2
+        ;;
+      --caller-model=*)
+        caller_model="${1#--caller-model=}"
+        shift
+        ;;
+      --effort)
+        [ $# -ge 2 ] || { echo "Error: --effort requires LOW|MEDIUM|HIGH|XHIGH|MAX" >&2; exit 1; }
+        explicit_effort="$2"
+        shift 2
+        ;;
+      --effort=*)
+        explicit_effort="${1#--effort=}"
+        shift
+        ;;
+      *)
+        echo "Error: unknown argument for select-model: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  local effort=""
+  if ! effort="$(harness_default_effort_for_tier "$tier")"; then
+    echo "Error: unknown select-model --tier '$tier' (expected trivial_lookup|bounded_execution|multi_module_integration|critical_architecture_or_audit)" >&2
+    exit 1
+  fi
+
+  if [ -n "$explicit_effort" ]; then
+    if ! harness_is_valid_effort_profile "$explicit_effort"; then
+      echo "Error: invalid select-model --effort '$explicit_effort' (expected LOW|MEDIUM|HIGH|XHIGH|MAX)" >&2
+      exit 1
+    fi
+    effort="$explicit_effort"
+  fi
+
+  local family model
+  family="$(harness_classify_parent_model "$parent_model")"
+  model="$(harness_resolve_subagent_model "$parent_model" "$tier" "$caller_model" "false")"
+
+  jq -nc \
+    --arg tier "$tier" \
+    --arg parentModel "$parent_model" \
+    --arg parentFamily "$family" \
+    --arg model "$model" \
+    --arg effort "$effort" \
+    '{tier: $tier, parentModel: $parentModel, parentFamily: $parentFamily, model: $model, effortProfile: $effort}'
 }
 
 cmd_verify_pr_stamps() {
@@ -512,6 +603,9 @@ case "$SUBCMD" in
     ;;
   dispatch)
     cmd_dispatch ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
+    ;;
+  select-model)
+    cmd_select_model ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
     ;;
   verify-pr-stamps)
     cmd_verify_pr_stamps ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
