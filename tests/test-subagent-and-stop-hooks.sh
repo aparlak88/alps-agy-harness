@@ -499,6 +499,25 @@ test_gemini4_and_orchestrator_parent_aware_subagent_routing() {
   out_carbon_canon2=$(printf '%s\n' "$p_carbon_canon2" | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_carbon_canon2" ".overwrite.Model" "inherit" "Carbon multi_module canon-auditor preserves explicit Model=inherit"
 
+  "$STAMP_GATE" dispatch --role "Carbon Canon Crit LowEffort" --type "canon-auditor" --tier "critical_architecture_or_audit" --effort "LOW" --workspace "$repo"
+  local p_carbon_canon3 out_carbon_canon3
+  p_carbon_canon3=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-carbon-high",
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "canon-auditor",
+        Role: "Carbon Canon Crit LowEffort",
+        Model: "pro",
+        Prompt: "Audit critical canon on Carbon."
+      }
+    }
+  }')
+  out_carbon_canon3=$(printf '%s\n' "$p_carbon_canon3" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_carbon_canon3" ".overwrite.Model" "inherit" "Carbon critical_architecture_or_audit canon-auditor must not demote tier when lifting LOW effort floor"
+  assert_json_field "$out_carbon_canon3" ".overwrite.Prompt" "${EXPECTED_HIGH}"$'\n\n'"Audit critical canon on Carbon." "canon-auditor lifts LOW effort up to HIGH floor"
+
   # 2. Orchestrator parent (gemini-pro-orchestrator):
   #    - bounded_execution, multi_module_integration, security-reviewer, pr-auditor -> inherit (Carbon <-> Hydrogen)
   #    - trivial_lookup -> flash_lite

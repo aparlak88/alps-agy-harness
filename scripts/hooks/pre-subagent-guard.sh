@@ -2,7 +2,7 @@
 # Alps AGY Harness - PreToolUse Hybrid jev & Gemini 4 Parent-Aware Subagent Lock (pre-subagent-guard.sh)
 # Enforces parent-model-aware (`HOOK_INPUT.modelName`) routing across Gemini 4 Carbon, Argon, Hydrogen, and Orchestrator:
 #   - security-reviewer -> inherit on Carbon/Orchestrator/Argon(Med,High)/Claude, pro (Argon) otherwise; EFFORT_PROFILE: MAX
-#   - pr-auditor        -> inherit on Carbon/Orchestrator/Argon(Med,High)/Claude, pro (Argon) otherwise; EFFORT_PROFILE: HIGH|MAX
+#   - pr-auditor        -> inherit on Carbon/Orchestrator/Argon(Med,High)/Claude, pro (Argon) otherwise; EFFORT_PROFILE: HIGH|XHIGH|MAX
 #   - browser           -> overwrite Model="flash" when Model omitted; preserve explicit Model
 #   - image-generator   -> allow directly
 #   - self, research, canon-auditor, and custom subagents -> require unconsumed subagent-dispatch.json
@@ -183,21 +183,23 @@ case "$type_name" in
     atomic_write_json "$state_dir" "subagent-dispatch.json" "$updated_json"
 
     effective_tier="$entry_tier"
-    floor_upgraded="false"
+    tier_floor_upgraded="false"
 
-    # Ruling #3: canon-auditor floor upgrade (trivial_lookup / bounded_execution -> multi_module_integration / HIGH)
+    # Ruling #3: canon-auditor decoupled tier & effort floor (never demotes critical_architecture_or_audit)
     if [ "$type_name" = "canon-auditor" ]; then
-      if [ "$entry_tier" = "trivial_lookup" ] || [ "$entry_tier" = "bounded_execution" ] || [ "$effort" = "LOW" ] || [ "$effort" = "MEDIUM" ]; then
+      if [ "$entry_tier" = "trivial_lookup" ] || [ "$entry_tier" = "bounded_execution" ]; then
         effective_tier="multi_module_integration"
+        tier_floor_upgraded="true"
+      fi
+      if [ "$effort" = "LOW" ] || [ "$effort" = "MEDIUM" ]; then
         effort="HIGH"
-        floor_upgraded="true"
       fi
     fi
 
     parent_family="$(harness_classify_parent_model "$parent_model")"
     if [ "$parent_family" != "unset" ] && [ -n "$effective_tier" ]; then
-      model="$(harness_resolve_subagent_model "$parent_model" "$effective_tier" "$caller_model" "$floor_upgraded")"
-    elif [ "$floor_upgraded" = "true" ]; then
+      model="$(harness_resolve_subagent_model "$parent_model" "$effective_tier" "$caller_model" "$tier_floor_upgraded")"
+    elif [ "$tier_floor_upgraded" = "true" ]; then
       model="pro"
     fi
 
