@@ -199,19 +199,20 @@ def parse_frontmatter_tools(fm):
     i = 0
     while i < len(fm_lines):
         line = fm_lines[i]
-        m_inline = re.match(r"^\s*tools:\s*\[(.*)\]\s*$", line)
+        m_inline = re.match(r"^\s*tools:\s*\[(.*?)\]\s*(?:#.*)?$", line)
         if m_inline:
             raw_items = m_inline.group(1).split(",")
             tools.extend(item.strip().strip("\"\x27") for item in raw_items if item.strip())
             break
-        if re.match(r"^\s*tools:\s*$", line):
+        if re.match(r"^\s*tools:\s*(?:#.*)?$", line):
             j = i + 1
             while j < len(fm_lines):
-                m_item = re.match(r"^\s*-\s*(.+?)\s*$", fm_lines[j])
+                stripped_item = re.sub(r"\s+#.*$", "", fm_lines[j])
+                m_item = re.match(r"^\s*-\s*(.+?)\s*$", stripped_item)
                 if m_item:
                     tools.append(m_item.group(1).strip().strip("\"\x27"))
                     j += 1
-                elif not fm_lines[j].strip():
+                elif not fm_lines[j].strip() or fm_lines[j].lstrip().startswith("#"):
                     j += 1
                 else:
                     break
@@ -248,7 +249,7 @@ for adir in agent_dirs:
         if "call_mcp_tool" in tools_list:
             subagent_errors.append(f"{fp}: invalid builtin tool \x27call_mcp_tool\x27 in tools")
         if os.path.basename(fp) in auditor_basenames:
-            if not re.search(r"^inheritMcp:\s*true\s*$", fm, re.MULTILINE):
+            if not re.search(r"^\s*inheritMcp:\s*true(?:\s+#.*)?\s*$", fm, re.MULTILINE):
                 subagent_errors.append(f"{fp}: missing \x27inheritMcp: true\x27 for MCP inheritance")
 
 if subagent_errors:
