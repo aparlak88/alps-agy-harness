@@ -739,6 +739,7 @@ test_stop_gate_blocks_twice_then_releases_and_clears() {
   }')
   printf '%s\n' "$pr_create_payload" | "$POST_COMMAND_HOOKS" >/dev/null
   assert_json_field "$repo/.harness/state/main/pr-audit-pending.json" ".stopRetries" "0" "Initial stopRetries must be 0"
+  assert_json_field "$repo/.harness/state/main/pr-audit-pending.json" ".auditDispatched" "false" "Initial auditDispatched must be false"
 
   # 3. Non-NO_TOOL_CALL terminationReason returns {} without incrementing stopRetries
   local stop_other
@@ -748,20 +749,22 @@ test_stop_gate_blocks_twice_then_releases_and_clears() {
   assert_eq "{}" "$out_other" "Non-NO_TOOL_CALL terminationReason must return {}"
   assert_json_field "$repo/.harness/state/main/pr-audit-pending.json" ".stopRetries" "0" "stopRetries must stay 0 on USER_ABORT"
 
-  # 4. 1st NO_TOOL_CALL -> continue (stopRetries becomes 1)
+  # 4. 1st NO_TOOL_CALL -> continue (stopRetries becomes 1, auditDispatched stays false)
   local out_try1
   out_try1=$(printf '%s\n' "$stop_no_tool" | "$STOP_GATE")
   assert_json_field "$out_try1" ".decision" "continue" "1st NO_TOOL_CALL must return continue"
   assert_json_field "$out_try1" ".reason" "$EXPECTED_STOP_REASON" "1st NO_TOOL_CALL reason must match contract"
   assert_json_field "$repo/.harness/state/main/pr-audit-pending.json" ".stopRetries" "1" "stopRetries must increment to 1"
+  assert_json_field "$repo/.harness/state/main/pr-audit-pending.json" ".auditDispatched" "false" "auditDispatched must remain false after 1st NO_TOOL_CALL"
   assert_json_field "$repo/.harness/state/main/pr-audit-pending.json" ".prUrl" "https://github.com/alps/harness/pull/15" "prUrl must be preserved"
 
-  # 5. 2nd NO_TOOL_CALL -> continue (stopRetries becomes 2)
+  # 5. 2nd NO_TOOL_CALL -> continue (stopRetries becomes 2, auditDispatched stays false)
   local out_try2
   out_try2=$(printf '%s\n' "$stop_no_tool" | "$STOP_GATE")
   assert_json_field "$out_try2" ".decision" "continue" "2nd NO_TOOL_CALL must return continue"
   assert_json_field "$out_try2" ".reason" "$EXPECTED_STOP_REASON" "2nd NO_TOOL_CALL reason must match contract"
   assert_json_field "$repo/.harness/state/main/pr-audit-pending.json" ".stopRetries" "2" "stopRetries must increment to 2"
+  assert_json_field "$repo/.harness/state/main/pr-audit-pending.json" ".auditDispatched" "false" "auditDispatched must remain false after 2nd NO_TOOL_CALL"
 
   # 6. 3rd NO_TOOL_CALL -> {} (escape hatch at stopRetries >= 2)
   local out_try3
@@ -776,6 +779,126 @@ test_stop_gate_blocks_twice_then_releases_and_clears() {
   local out_after_clear
   out_after_clear=$(printf '%s\n' "$stop_no_tool" | "$STOP_GATE" | jq -c .)
   assert_eq "{}" "$out_after_clear" "After clear-pr-audit, 1st NO_TOOL_CALL must return {}"
+}
+
+test_stop_gate_allows_async_wait_when_pr_auditor_dispatched() {
+  [ -x "$PRE_SUBAGENT_GUARD" ] || { echo "pre-subagent-guard.sh missing or not executable: $PRE_SUBAGENT_GUARD" >&2; return 1; }
+  [ -x "$STOP_GATE" ] || { echo "stop-gate.sh missing or not executable: $STOP_GATE" >&2; return 1; }
+
+  local repo
+  repo=$(make_temp_repo)
+  local pending_file="$repo/.harness/state/main/pr-audit-pending.json"
+  local stop_no_tool
+  stop_no_tool=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], terminationReason: "NO_TOOL_CALL"}')
+
+  # 1. Trigger post-command-hooks.sh on gh pr create -> stopRetries=0, auditDispatched=false
+  local pr_create_payload
+  pr_create_payload=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "run_command",
+      args: {CommandLine: "gh pr create --fill"}
+    },
+    toolOutput: {output: "https://github.com/alps/harness/pull/77\n"}
+  }')
+  printf '%s\n' "$pr_create_payload" | "$POST_COMMAND_HOOKS" >/dev/null
+  assert_json_field "$pending_file" ".stopRetries" "0" "Initial stopRetries must be 0"
+  assert_json_field "$pending_file" ".auditDispatched" "false" "Initial auditDispatched must be false"
+
+  # 2. Dispatching pr-auditor flips auditDispatched=true while preserving stopRetries and prUrl
+  local p_pr_auditor
+  p_pr_auditor=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "pr-auditor",
+        Role: "PR #77 Auditor",
+        Prompt: "Audit PR #77."
+      }
+    }
+  }')
+  local out_pr_auditor
+  out_pr_auditor=$(printf '%s\n' "$p_pr_auditor" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_pr_auditor" ".decision" "allow" "pr-auditor invocation must be allowed"
+  assert_json_field "$pending_file" ".auditDispatched" "true" "pr-auditor invocation must set auditDispatched=true"
+  assert_json_field "$pending_file" ".stopRetries" "0" "stopRetries must remain 0 after pr-auditor dispatch"
+  assert_json_field "$pending_file" ".prUrl" "https://github.com/alps/harness/pull/77" "prUrl must be preserved"
+
+  # 3. 1st NO_TOOL_CALL immediately returns {} without touching stopRetries
+  local out_async_wait
+  out_async_wait=$(printf '%s\n' "$stop_no_tool" | "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$out_async_wait" "stop-gate must return {} immediately while pr-auditor is dispatched"
+  assert_json_field "$pending_file" ".stopRetries" "0" "stopRetries must not increment when auditDispatched=true"
+
+  # 4. Re-seed pending state; test unrelated self, unregistered self PR audit, and dispatched self PR audit
+  printf '%s\n' "$pr_create_payload" | "$POST_COMMAND_HOOKS" >/dev/null
+  assert_json_field "$pending_file" ".auditDispatched" "false" "Re-seeded auditDispatched must be false"
+
+  # (a) Unrelated self worker must NOT set auditDispatched=true (even if prompt mentions pr-audit-pending or clear-pr-audit)
+  "$STAMP_GATE" dispatch --role "Formatter Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
+  local p_unrelated_self
+  p_unrelated_self=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "self",
+        Role: "Formatter Worker",
+        Prompt: "Format files and check pr-audit-pending / clear-pr-audit docs."
+      }
+    }
+  }')
+  local out_unrelated
+  out_unrelated=$(printf '%s\n' "$p_unrelated_self" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_unrelated" ".decision" "allow" "Dispatched unrelated self worker must be allowed"
+  assert_json_field "$pending_file" ".auditDispatched" "false" "Unrelated self worker mentioning pr-audit-pending must leave auditDispatched=false"
+
+  # (b) Unregistered self PR audit must be denied and must NOT set auditDispatched=true
+  local p_unreg_self_pr
+  p_unreg_self_pr=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "self",
+        Role: "PR Auditor",
+        Prompt: "Execute review-pr and clear-pr-audit."
+      }
+    }
+  }')
+  local out_unreg_self_pr
+  out_unreg_self_pr=$(printf '%s\n' "$p_unreg_self_pr" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_unreg_self_pr" ".decision" "deny" "Unregistered self PR auditor must be denied"
+  assert_json_field "$pending_file" ".auditDispatched" "false" "Denied self PR auditor must leave auditDispatched=false"
+
+  # (c) Dispatched self PR auditor sets auditDispatched=true and allows immediate {} stop
+  "$STAMP_GATE" dispatch --role "Async PR Auditor" --type "self" --tier "critical_architecture_or_audit" --workspace "$repo"
+  local p_dispatched_self_pr
+  p_dispatched_self_pr=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "self",
+        Role: "Async PR Auditor",
+        Prompt: "Execute review-pr and clear-pr-audit."
+      }
+    }
+  }')
+  local out_dispatched_self_pr
+  out_dispatched_self_pr=$(printf '%s\n' "$p_dispatched_self_pr" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_dispatched_self_pr" ".decision" "allow" "Dispatched self PR auditor must be allowed"
+  assert_json_field "$pending_file" ".auditDispatched" "true" "Dispatched self PR auditor must set auditDispatched=true"
+
+  local out_async_self_wait
+  out_async_self_wait=$(printf '%s\n' "$stop_no_tool" | "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$out_async_self_wait" "stop-gate must return {} immediately after self PR auditor dispatch"
+  assert_json_field "$pending_file" ".stopRetries" "0" "stopRetries must stay 0 after self PR auditor dispatch"
+
+  # 5. clear-pr-audit removes pr-audit-pending.json cleanly
+  "$STAMP_GATE" clear-pr-audit --workspace "$repo"
+  [ ! -f "$pending_file" ] || { echo "clear-pr-audit must remove pr-audit-pending.json" >&2; return 1; }
 }
 
 run_tests

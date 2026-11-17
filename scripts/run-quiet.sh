@@ -91,7 +91,7 @@ cp -f "$log_file" "$log_dir/.last.log.tmp"
 mv -f "$log_dir/.last.log.tmp" "$log_dir/last.log"
 
 if [ "$rc" -eq 0 ]; then
-  warning_count="$(grep -Ec 'warning|WARN|CS[0-9]{4}|TS[0-9]{4}' "$log_file" 2>/dev/null || true)"
+  warning_count="$({ grep -Ev '^(✅ PASS \[|❌ FAIL \[)' "$log_file" 2>/dev/null || true; } | { grep -Ec '\b(warning|WARN)\b|\b(CS|TS)[0-9]{4}\b' || true; })"
   printf '✅ PASS [%s] (süre: %ss, warnings: %s — log: .harness/logs/last.log)\n' \
     "$label" "$elapsed" "$warning_count"
   exit 0

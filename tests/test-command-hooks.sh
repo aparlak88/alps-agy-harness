@@ -773,6 +773,7 @@ test_post_command_sets_pr_audit_flag_and_triggers_graphify_on_merge() {
   state_dir="$(cd "$REPO_ROOT" && ./scripts/stamp-gate.sh tree-sha --workspace "$repo" >/dev/null && source "$REPO_ROOT/scripts/hooks/common.sh" && harness_state_dir "$repo")"
   [ -f "$state_dir/pr-audit-pending.json" ] || { echo "Expected pr-audit-pending.json to be created" >&2; return 1; }
   assert_json_field "$state_dir/pr-audit-pending.json" ".stopRetries" "0"
+  assert_json_field "$state_dir/pr-audit-pending.json" ".auditDispatched" "false"
   assert_json_field "$state_dir/pr-audit-pending.json" ".prUrl" "https://github.com/example/repo/pull/42"
 
   # 2. Failed gh pr create (error present) does NOT write flag

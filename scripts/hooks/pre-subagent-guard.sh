@@ -102,6 +102,28 @@ mark_role_consumed_if_present() {
   fi
 }
 
+mark_pr_audit_dispatched_if_pending() {
+  local slug state_dir pending_file
+  slug="$(harness_branch_slug "$WORKSPACE_ROOT")"
+  state_dir="$WORKSPACE_ROOT/.harness/state/$slug"
+  pending_file="$state_dir/pr-audit-pending.json"
+
+  [ -f "$pending_file" ] || return 0
+
+  if jq -e 'type == "object" and ((.auditDispatched // false) == false)' "$pending_file" >/dev/null 2>&1; then
+    local updated_pending
+    updated_pending="$(jq -c '.auditDispatched = true' "$pending_file")"
+    atomic_write_json "$state_dir" "pr-audit-pending.json" "$updated_pending"
+  fi
+}
+
+is_self_pr_audit_invocation() {
+  local target_role="${1:-}"
+  local norm_role
+  norm_role="$(printf '%s' "$target_role" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  printf '%s\n' "$norm_role" | grep -Eq '(pr[-_[:space:]]*audit|post[-_[:space:]]*pr|review[-_[:space:]]*pr|pr[-_[:space:]]*review|pr[-_[:space:]]*denet|pull[-_[:space:]]*request[-_[:space:]]*(audit|review))'
+}
+
 case "$type_name" in
   image-generator)
     emit_allow
@@ -140,6 +162,7 @@ case "$type_name" in
       fi
     fi
     pr_model="$(harness_resolve_subagent_model "$parent_model" "critical_architecture_or_audit" "$caller_model" "false")"
+    mark_pr_audit_dispatched_if_pending
     emit_model_and_effort_overwrite "$pr_model" "$pr_effort"
     exit 0
     ;;
@@ -181,6 +204,10 @@ case "$type_name" in
 
     updated_json="$(jq -c --arg role "$role" '.entries[$role].consumed = true' "$dispatch_file")"
     atomic_write_json "$state_dir" "subagent-dispatch.json" "$updated_json"
+
+    if [ "$type_name" = "self" ] && is_self_pr_audit_invocation "$role"; then
+      mark_pr_audit_dispatched_if_pending
+    fi
 
     effective_tier="$entry_tier"
     tier_floor_upgraded="false"

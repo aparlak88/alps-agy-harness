@@ -31,6 +31,7 @@ Proje kökünde `docs/canon/` altında yaşayan bu kaynaklar, `canon-auditor` al
 - **Amaç:** Çözülen zor kök nedenlerin, platform tuzaklarının ve gizli hataların tekrar yaşanmasını engellemek.
 - **Şablon:** `skills/domain-canon/templates/lessons-template.md` dosyasını temel alır.
 - **Sözleşme:** Yalnızca sinsi ve tekrarlanabilir kök nedenler kaydedilir. Planlama ve hata ayıklama aşamasında `jev_triage` ile sıfır-context taranarak ilgili dersler göreve otomatik enjekte edilir.
+- **Yürütülebilir Ders Koruması (`Executable Lesson Guard`):** Statik veya davranışsal olarak test edilebilir her `LSN-*` kaydı, kuralı koruyan otomatik birim/entegrasyon/fitness testini **ve** bu testin PR CI kapısında çalıştığını belgelemek zorundadır; pasif kaynak dosya referansı tek başına yetersizdir. Yalnızca dış ağ, donanım veya bulut çalışma zamanına bağlı davranışlar için açık `[Runtime-Only]` muafiyeti ve gerekçesi kabul edilir.
 
 ---
 

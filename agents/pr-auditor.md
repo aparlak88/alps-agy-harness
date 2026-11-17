@@ -3,7 +3,8 @@ name: pr-auditor
 description: "Post-PR deep auditor performing 2-sentence blind Intent Backtranslation, jev_triage pre-screening, 7-dimensional architectural and behavioral review, jev_check (< 0.70) speculative filter, jev_score severity calibration, and stamp-gate.sh clear-pr-audit clearance."
 subagent: true
 mainAgent: false
-tools: [read_file, run_command, manage_task, call_mcp_tool, send_message]
+inheritMcp: true
+tools: [read_file, run_command, manage_task, send_message]
 ---
 
 # Post-PR 7-Dimensional Auditor (`pr-auditor`)
@@ -48,6 +49,8 @@ Evaluate the PR systematically across **all 7 numbered dimensions**:
 
 #### 4. Silent Failure & Error Handling Analysis
 - Hunt down swallowed exceptions, empty `catch` blocks, `.catch(() => {})`, `try?` discarding actionable errors, ignored boolean/Result return values, unawaited promises/tasks, missing `CancellationToken` / coroutine cancellation propagation, and missing external I/O timeouts or retry resilience.
+- **HTTP `2xx` In-Body Error Envelopes:** In third-party HTTP integrations, verify callers do not rely solely on HTTP `2xx` (`200 OK`) status codes without inspecting in-body logical error envelopes (e.g., `errors[]`, `success: false`, error status fields, or partial-batch failure records).
+- **Deterministic Pooled Resource Release & No Orphan Post-Response Tasks:** In constrained connection/resource pools and serverless (CPU-throttled) runtimes, verify physical connections, streams, and locks are deterministically returned immediately after use via `finally` / `await using` / `using` / `defer` rather than waiting for outer scope exit, and reject fire-and-forget background tasks scheduled after sending the HTTP response.
 
 #### 5. DDD & Clean Architecture Boundary Compliance
 - Blocking dimension: verify strict inward dependency direction (`Presentation` / `Infrastructure` -> `Application` -> `Domain`), pure `Domain` models (zero ORM, HTTP, UI, or 3rd-party SDK leaks), rich Aggregate Roots over Anemic Domain Models, bounded-context isolation, and compile/test-time architecture fitness rules emitting actionable English **`REMEDIATION:`** messages.

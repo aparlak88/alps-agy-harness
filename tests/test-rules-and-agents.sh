@@ -188,9 +188,9 @@ assert_subagent_frontmatter() {
     return 1
   fi
 
-  # Strict frontmatter schema: only name, description, subagent, mainAgent, tools allowed
+  # Strict frontmatter schema: only name, description, subagent, mainAgent, inheritMcp, tools allowed
   local unexpected_lines
-  unexpected_lines="$(printf '%s\n' "$fm" | grep -Ev '^(name|description|subagent|mainAgent|tools):' || true)"
+  unexpected_lines="$(printf '%s\n' "$fm" | grep -Ev '^(name|description|subagent|mainAgent|inheritMcp|tools):' || true)"
   if [ -n "$unexpected_lines" ]; then
     echo "$filename frontmatter contains unexpected lines/fields: $unexpected_lines" >&2
     return 1
@@ -198,20 +198,23 @@ assert_subagent_frontmatter() {
 
   local line_count
   line_count="$(printf '%s\n' "$fm" | wc -l | tr -d ' ')"
-  assert_eq "5" "$line_count" "$filename frontmatter must have exactly 5 single-line YAML fields"
+  assert_eq "6" "$line_count" "$filename frontmatter must have exactly 6 single-line YAML fields"
 
-  local name_line subagent_line main_line tools_line desc_line
+  local name_line subagent_line main_line inherit_mcp_line tools_line desc_line
   name_line="$(printf '%s\n' "$fm" | grep -E '^name:' || true)"
   desc_line="$(printf '%s\n' "$fm" | grep -E '^description:' || true)"
   subagent_line="$(printf '%s\n' "$fm" | grep -E '^subagent:' || true)"
   main_line="$(printf '%s\n' "$fm" | grep -E '^mainAgent:' || true)"
+  inherit_mcp_line="$(printf '%s\n' "$fm" | grep -E '^inheritMcp:' || true)"
   tools_line="$(printf '%s\n' "$fm" | grep -E '^tools:' || true)"
 
   assert_eq "name: $expected_name" "$name_line" "$filename frontmatter name must equal $expected_name"
   [ -n "$desc_line" ] || { echo "$filename frontmatter missing description:" >&2; return 1; }
   assert_eq "subagent: true" "$subagent_line" "$filename frontmatter must set subagent: true"
   assert_eq "mainAgent: false" "$main_line" "$filename frontmatter must set mainAgent: false"
-  assert_eq "tools: [read_file, run_command, manage_task, call_mcp_tool, send_message]" "$tools_line" "$filename frontmatter tools must match exact list"
+  assert_eq "inheritMcp: true" "$inherit_mcp_line" "$filename frontmatter must set inheritMcp: true"
+  assert_not_contains "$tools_line" "call_mcp_tool" "$filename frontmatter tools must NOT contain invalid component call_mcp_tool"
+  assert_eq "tools: [read_file, run_command, manage_task, send_message]" "$tools_line" "$filename frontmatter tools must match exact valid list"
 
   local content
   content="$(cat "$filepath")"
@@ -247,11 +250,19 @@ test_subagents_frontmatter_and_audit_contracts() {
   assert_contains "$canon_content" "--verdict PASS" "canon-auditor must document exact --verdict PASS flag"
   assert_contains "$canon_content" "--allow-file" "canon-auditor must document exact --allow-file flag"
   assert_contains "$canon_content" "--plan" "canon-auditor must document exact --plan flag"
+  assert_contains "$canon_content" "Executable Lesson Guard" "canon-auditor must enforce Executable Lesson Guard"
+  assert_contains "$canon_content" "[Runtime-Only]" "canon-auditor must recognize [Runtime-Only] exemption"
+  assert_contains "$canon_content" "PR CI" "canon-auditor must require PR CI test gate reference for lessons"
 
   # 2. security-reviewer contracts
   assert_contains "$sec_content" "jev_triage" "security-reviewer must pre-screen diff via jev_triage"
   assert_contains "$sec_content" "jev_score" "security-reviewer must calibrate findings via jev_score"
+  assert_contains "$sec_content" "Mandatory 7-Surface" "security-reviewer must cover all 7 mandatory security surfaces"
   assert_contains "$sec_content" "IDOR" "security-reviewer must check Authn/Authz and IDOR"
+  assert_contains "$sec_content" "RequestUri" "security-reviewer Surface 3 must forbid leaking raw RequestUri in logs/responses"
+  assert_contains "$sec_content" "?api_key=" "security-reviewer Surface 3 must flag ?api_key= query secret exposure"
+  assert_contains "$sec_content" "?token=" "security-reviewer Surface 3 must flag ?token= query secret exposure"
+  assert_contains "$sec_content" "?key=" "security-reviewer Surface 3 must flag ?key= query secret exposure"
   assert_contains "$sec_content" "firestore.rules" "security-reviewer must audit Firebase firestore.rules"
   assert_contains "$sec_content" "storage.rules" "security-reviewer must audit Firebase storage.rules"
   assert_contains "$sec_content" "Keychain" "security-reviewer must verify iOS Keychain storage"
@@ -259,6 +270,12 @@ test_subagents_frontmatter_and_audit_contracts() {
   assert_contains "$sec_content" "Keystore" "security-reviewer must verify Android Keystore"
   assert_contains "$sec_content" "UserDefaults" "security-reviewer must forbid plaintext tokens/PII in UserDefaults"
   assert_contains "$sec_content" "SharedPreferences" "security-reviewer must forbid plaintext tokens/PII in SharedPreferences"
+  assert_contains "$sec_content" "7. **CI/CD Workflow & Runner Isolation:**" "security-reviewer must define Surface 7: CI/CD Workflow & Runner Isolation"
+  assert_contains "$sec_content" "pull_request_target" "security-reviewer Surface 7 must guard pull_request_target triggers"
+  assert_contains "$sec_content" "self-hosted" "security-reviewer Surface 7 must isolate self-hosted runners from untrusted PRs"
+  assert_contains "$sec_content" "40-character" "security-reviewer Surface 7 must require 40-character commit SHA pinning"
+  assert_contains "$sec_content" '${{' "security-reviewer Surface 7 must prevent inline expression shell injection"
+  assert_contains "$sec_content" "always()" "security-reviewer Surface 7 must verify always() secret/Keychain cleanup"
   assert_contains "$sec_content" "stamp-gate.sh security" "security-reviewer must invoke stamp-gate.sh security"
   assert_contains "$sec_content" "--verdict PASS --critical 0 --important 0" "security-reviewer must document exact zero-finding PASS stamp command"
 
@@ -283,6 +300,11 @@ test_subagents_frontmatter_and_audit_contracts() {
   assert_contains "$pr_content" "3. Type Safety & API/Schema Contract Integrity" "pr-auditor must define Dimension 3: Type Safety & API/Schema Contract Integrity"
   assert_contains "$pr_content" "RFC 7807" "pr-auditor Dimension 3 must check RFC 7807 error contracts"
   assert_contains "$pr_content" "4. Silent Failure & Error Handling Analysis" "pr-auditor must define Dimension 4: Silent Failure & Error Handling Analysis"
+  assert_contains "$pr_content" "2xx" "pr-auditor Dimension 4 must check HTTP 2xx in-body error envelopes"
+  assert_contains "$pr_content" "envelope" "pr-auditor Dimension 4 must inspect logical error envelopes"
+  assert_contains "$pr_content" "finally" "pr-auditor Dimension 4 must enforce deterministic finally release"
+  assert_contains "$pr_content" "await using" "pr-auditor Dimension 4 must enforce deterministic await using release"
+  assert_contains "$pr_content" "defer" "pr-auditor Dimension 4 must enforce deterministic defer release"
   assert_contains "$pr_content" "5. DDD & Clean Architecture Boundary Compliance" "pr-auditor must define Dimension 5: DDD & Clean Architecture Boundary Compliance"
   assert_contains "$pr_content" "REMEDIATION:" "pr-auditor Dimension 5 must check English REMEDIATION: fitness rules"
   assert_contains "$pr_content" "6. Anti-Overengineering & Scope Creep Penalty" "pr-auditor must define Dimension 6: Anti-Overengineering & Scope Creep Penalty"
