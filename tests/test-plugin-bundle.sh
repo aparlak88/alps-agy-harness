@@ -131,6 +131,16 @@ test_templates_and_readme_glossary_and_mermaid_contracts() {
   assert_contains "$glossary_content" "Invariants" "Glossary template must have Invariants column"
   assert_contains "$glossary_content" "Forbidden Aliases" "Glossary template must have Forbidden Aliases column"
 
+  # 3b. Executable Lesson Guard & zero-vendor leakage checks on domain-canon skill and lessons template
+  local lessons_content domain_canon_skill_content
+  lessons_content=$(cat "$lessons_tpl")
+  domain_canon_skill_content=$(cat "$REPO_ROOT/skills/domain-canon/SKILL.md")
+  assert_contains "$lessons_content" "Executable Lesson Guard" "lessons-template.md must enforce Executable Lesson Guard"
+  assert_contains "$lessons_content" "[Runtime-Only]" "lessons-template.md must document [Runtime-Only] exemption"
+  assert_not_contains "$lessons_content" "RevenueCat" "lessons-template.md must remain vendor-neutral without RevenueCat references"
+  assert_contains "$domain_canon_skill_content" "Executable Lesson Guard" "domain-canon/SKILL.md must enforce Executable Lesson Guard"
+  assert_contains "$domain_canon_skill_content" "[Runtime-Only]" "domain-canon/SKILL.md must document [Runtime-Only] exemption"
+
   # 4. Walkthrough template checks: >= 2 mermaid diagrams and all 6 mandatory deep engineering sections
   local wt_content
   wt_content=$(cat "$wt_tpl")

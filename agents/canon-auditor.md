@@ -1,9 +1,10 @@
 ---
 name: canon-auditor
-description: "Audits Specs, Plans, and Pre-PR code diffs for Intent Backtranslation, 3-part Domain Canon alignment (glossary, flows, lessons), jev_ask anti-overengineering budget (< 0.60), Clean Architecture boundaries, end-of-doc glossaries, and stamp-gate.sh canon stamping."
+description: "Audits Specs, Plans, and Pre-PR code diffs for Intent Backtranslation, 3-part Domain Canon alignment (glossary, flows, executable lessons), jev_ask anti-overengineering budget (< 0.60), Clean Architecture boundaries, end-of-doc glossaries, and stamp-gate.sh canon stamping."
 subagent: true
 mainAgent: false
-tools: [read_file, run_command, manage_task, call_mcp_tool, send_message]
+inheritMcp: true
+tools: [read_file, run_command, manage_task, send_message]
 ---
 
 # Canon Auditor (`canon-auditor`)
@@ -39,9 +40,10 @@ Use `jev_triage` (via `call_mcp_tool` -> `ServerName: "jev"`, `ToolName: "jev_tr
 2. **`docs/canon/flows.md` (Canonical Flows & Sequence/State Sync):**
    - Verify every touched workflow preserves its ordered mandatory steps and `Invariants`.
    - Skipping, reordering, or mutating a canonical flow step — or leaving sequence/state diagrams out of sync with changed runtime behavior — without explicit user canon-revision approval is a blocking `Critical`/`Important` defect.
-3. **`docs/canon/lessons.md` (Compound Lessons Adherence):**
+3. **`docs/canon/lessons.md` (Compound Lessons Adherence & Executable Lesson Guard):**
    - Verify the Plan/diff respects all relevant `LSN-*` preventive rules (`>= 0.50` relevance).
    - If the task resolved a non-obvious architectural/SDK root cause (`bug_investigation`), verify a concise `LSN-*` rule was recorded in `docs/canon/lessons.md` *before* stamping `canon` (`lessons.md` is part of `codeTreeSha`) — and reject noisy syntax/typo entries.
+   - **Executable Lesson Guard:** Verify every statically or behaviorally testable `LSN-*` entry added or modified in `docs/canon/lessons.md` links **both** the automated unit/integration/architecture fitness test guarding the rule **and** the PR CI gate/workflow executing that test. Reject passive source-file-only `LSN-*` entries as blocking `Important` defects unless explicitly marked with **`[Runtime-Only]`** and a concrete justification for external network, hardware, or cloud runtime behavior that cannot be deterministically tested in CI.
 
 ### Step 3: Anti-Overengineering, Rule of Three & Scope Lock via `jev_ask`
 Evaluate the Plan's Complexity Budget and/or code diff in a single `jev_ask` pass (`ServerName: "jev"`, `ToolName: "jev_ask"`):

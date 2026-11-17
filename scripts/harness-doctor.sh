@@ -32,9 +32,10 @@ typesafe_key_file="${HARNESS_TYPESAFE_KEY_FILE:-$HOME/.config/typesafe/key}"
 gh_bin="${HARNESS_GH_BIN:-gh}"
 xcrun_bin="${HARNESS_XCRUN_BIN:-xcrun}"
 adb_bin="${HARNESS_ADB_BIN:-adb}"
+harness_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 
 python3 -c '
-import os, sys, json, shutil, subprocess, fnmatch
+import os, sys, json, shutil, subprocess, fnmatch, glob, re
 
 workspace = sys.argv[1]
 config_dir = sys.argv[2]
@@ -43,6 +44,7 @@ gh_bin = sys.argv[4]
 xcrun_bin = sys.argv[5]
 adb_bin = sys.argv[6]
 json_mode = (sys.argv[7] == "true")
+harness_root = sys.argv[8]
 
 # Zero-secret-leakage check: do not store the key value anywhere
 raw_env_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
@@ -176,6 +178,94 @@ for p_name, p_desc, p_fix in plugins_to_check:
         add_check(p_name, "plugins", "OK", f"Plugin {p_name} is installed")
     else:
         add_check(p_name, "plugins", "FAIL", f"Plugin {p_name} is missing ({p_desc})", f"Fix: {p_fix}")
+
+# 2b. Subagent frontmatter validation (forbid call_mcp_tool, enforce inheritMcp: true on auditors)
+def extract_yaml_frontmatter(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return None
+    if not lines or lines[0].strip() != "---":
+        return None
+    for idx in range(1, len(lines)):
+        if lines[idx].strip() == "---":
+            return "\n".join(lines[1:idx])
+    return None
+
+def parse_frontmatter_tools(fm):
+    tools = []
+    fm_lines = fm.splitlines()
+    i = 0
+    while i < len(fm_lines):
+        line = fm_lines[i]
+        m_inline = re.match(r"^\s*tools:\s*\[(.*)\]\s*$", line)
+        if m_inline:
+            raw_items = m_inline.group(1).split(",")
+            tools.extend(item.strip().strip("\"\x27") for item in raw_items if item.strip())
+            break
+        if re.match(r"^\s*tools:\s*$", line):
+            j = i + 1
+            while j < len(fm_lines):
+                m_item = re.match(r"^\s*-\s*(.+?)\s*$", fm_lines[j])
+                if m_item:
+                    tools.append(m_item.group(1).strip().strip("\"\x27"))
+                    j += 1
+                elif not fm_lines[j].strip():
+                    j += 1
+                else:
+                    break
+            break
+        i += 1
+    return tools
+
+agent_dirs = [
+    os.path.join(harness_root, "agents"),
+    os.path.join(workspace, "agents"),
+    os.path.join(workspace, ".agents", "agents"),
+]
+agent_dirs.extend(glob.glob(os.path.join(workspace, ".agents", "plugins", "*", "agents")))
+agent_dirs.extend(glob.glob(os.path.join(config_dir, "plugins", "*", "agents")))
+
+seen_agent_files = set()
+subagent_errors = []
+checked_agent_count = 0
+auditor_basenames = {"canon-auditor.md", "security-reviewer.md", "pr-auditor.md"}
+
+for adir in agent_dirs:
+    if not os.path.isdir(adir):
+        continue
+    for fp in sorted(glob.glob(os.path.join(adir, "*.md"))):
+        real_fp = os.path.realpath(fp)
+        if real_fp in seen_agent_files:
+            continue
+        seen_agent_files.add(real_fp)
+        fm = extract_yaml_frontmatter(fp)
+        if fm is None:
+            continue
+        checked_agent_count += 1
+        tools_list = parse_frontmatter_tools(fm)
+        if "call_mcp_tool" in tools_list:
+            subagent_errors.append(f"{fp}: invalid builtin tool \x27call_mcp_tool\x27 in tools")
+        if os.path.basename(fp) in auditor_basenames:
+            if not re.search(r"^inheritMcp:\s*true\s*$", fm, re.MULTILINE):
+                subagent_errors.append(f"{fp}: missing \x27inheritMcp: true\x27 for MCP inheritance")
+
+if subagent_errors:
+    add_check(
+        "subagent_frontmatter",
+        "plugins",
+        "FAIL",
+        "Invalid subagent frontmatter: " + "; ".join(subagent_errors),
+        "Fix: Set inheritMcp: true and remove call_mcp_tool from tools: in agents/*.md frontmatter",
+    )
+else:
+    add_check(
+        "subagent_frontmatter",
+        "plugins",
+        "OK",
+        f"Validated {checked_agent_count} subagent definition(s) (inheritMcp: true, zero invalid call_mcp_tool)",
+    )
 
 # -------------------------------------------------------------
 # 3. 8 Mandatory Global MCP Servers
@@ -445,4 +535,4 @@ else:
     print("==================================================")
 
 sys.exit(0 if healthy else 1)
-' "$workspace" "$config_dir" "$typesafe_key_file" "$gh_bin" "$xcrun_bin" "$adb_bin" "$json_mode"
+' "$workspace" "$config_dir" "$typesafe_key_file" "$gh_bin" "$xcrun_bin" "$adb_bin" "$json_mode" "$harness_root"

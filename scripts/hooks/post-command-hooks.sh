@@ -81,7 +81,7 @@ for ((s_idx = 0; s_idx < num_segments; s_idx++)); do
       fi
 
       state_dir="$(harness_state_dir "$WORKSPACE_ROOT")"
-      payload="$(jq -nc --arg url "$pr_url" '{prUrl: $url, stopRetries: 0}')"
+      payload="$(jq -nc --arg url "$pr_url" '{prUrl: $url, stopRetries: 0, auditDispatched: false}')"
       atomic_write_json "$state_dir" "pr-audit-pending.json" "$payload"
     fi
 

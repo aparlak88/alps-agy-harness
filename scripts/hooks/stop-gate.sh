@@ -31,6 +31,11 @@ if [ ! -f "$pending_file" ]; then
   exit 0
 fi
 
+if jq -e '(.auditDispatched // false) == true' "$pending_file" >/dev/null 2>&1; then
+  echo "{}"
+  exit 0
+fi
+
 retries="$(jq -r '.stopRetries // 0' "$pending_file" 2>/dev/null || echo "2")"
 if [[ ! "$retries" =~ ^[0-9]+$ ]] || [ "$retries" -ge 2 ]; then
   echo "{}"

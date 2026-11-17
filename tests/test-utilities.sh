@@ -93,6 +93,36 @@ test_run_quiet_workspace_flag_positions() {
   [ -f "$tmp_repo/.harness/logs/last.log" ] || { echo "last.log missing" >&2; return 1; }
 }
 
+test_run_quiet_nested_summary_and_hyphenated_codes_zero_warnings() {
+  local tmp_repo
+  tmp_repo="$(make_temp_repo)"
+
+  # 1. Outer run-quiet wrapping inner run-quiet plus hyphenated codes and warning-like identifiers -> warnings: 0
+  local output_zero
+  output_zero=$("$REPO_ROOT/scripts/run-quiet.sh" --workspace "$tmp_repo" outer-nested -- bash -c "
+    \"$REPO_ROOT/scripts/run-quiet.sh\" --workspace \"$tmp_repo\" inner-step -- echo 'inner build ok'
+    echo '❌ FAIL [simulated-summary] (exit: 1 — log: .harness/logs/last.log)'
+    echo 'Ticket TS-1050 and CS-2040 processed'
+    echo 'warnings_disabled=true MY_WARNING_VAR=1'
+  ")
+  local rc_zero=$?
+  assert_eq "0" "$rc_zero" "Nested run-quiet must exit 0"
+  assert_contains "$output_zero" "✅ PASS [outer-nested]"
+  assert_contains "$output_zero" "warnings: 0" "Nested summary lines and hyphenated codes must yield warnings: 0"
+
+  # 2. Outer run-quiet wrapping inner run-quiet plus 2 genuine compiler/runtime warnings -> warnings: 2
+  local output_two
+  output_two=$("$REPO_ROOT/scripts/run-quiet.sh" --workspace "$tmp_repo" outer-real-warns -- bash -c "
+    \"$REPO_ROOT/scripts/run-quiet.sh\" --workspace \"$tmp_repo\" inner-step -- echo 'inner build ok'
+    echo 'src/Service.cs(10,3): warning CS0168: Variable unused'
+    echo 'WARN: slow query detected'
+  ")
+  local rc_two=$?
+  assert_eq "0" "$rc_two" "Nested run-quiet with real warnings must exit 0"
+  assert_contains "$output_two" "✅ PASS [outer-real-warns]"
+  assert_contains "$output_two" "warnings: 2" "Real warnings alongside nested summary must count exactly 2"
+}
+
 test_mobile_logs_ios_and_android_mocked_binaries() {
   local tmp_repo
   tmp_repo="$(make_temp_repo)"
@@ -476,6 +506,99 @@ EOF
   assert_eq "1" "$rc_ios" "Missing xcrun in iOS workspace must fail doctor"
   assert_contains "$ios_fail_out" "xcrun"
   assert_contains "$ios_fail_out" "Fix:"
+}
+
+test_harness_doctor_validates_subagent_frontmatter_and_forbids_call_mcp_tool() {
+  local tmp_repo
+  tmp_repo="$(make_temp_repo)"
+
+  local mock_config_dir="$tmp_repo/gemini-config"
+  local mock_bin_dir="$tmp_repo/doctor-bin"
+  mkdir -p "$mock_config_dir/plugins/superpowers" "$mock_bin_dir"
+  cat <<'EOF' > "$mock_config_dir/plugins.json"
+{
+  "plugins": [{"name": "superpowers"}, {"name": "firebase"}, {"name": "postman"}, {"name": "chrome-devtools-plugin"}]
+}
+EOF
+  cat <<'EOF' > "$mock_config_dir/mcp_config.json"
+{
+  "mcpServers": {
+    "jev": {}, "context7": {}, "csharp-lsp": {}, "typescript-lsp": {},
+    "playwright": {}, "graphify": {}, "revenuecat": {}, "filesystem": {}
+  }
+}
+EOF
+  cat <<'EOF' > "$mock_bin_dir/gh"
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$mock_bin_dir/gh"
+
+  # 1. Healthy baseline workspace includes subagent_frontmatter = OK
+  local ok_json
+  ok_json=$(TYPESAFE_API_KEY="test_key" \
+            HARNESS_CONFIG_DIR="$mock_config_dir" \
+            HARNESS_GH_BIN="$mock_bin_dir/gh" \
+            "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$tmp_repo" --json)
+  assert_json_field "$ok_json" ".healthy" "true"
+  assert_json_field "$ok_json" '.checks[] | select(.name=="subagent_frontmatter") | .status' "OK"
+
+  # 2. Invalid call_mcp_tool in workspace plugin agent frontmatter -> FAIL naming call_mcp_tool
+  local bad_ws="$tmp_repo/bad-ws-call-mcp"
+  mkdir -p "$bad_ws/.agents/plugins/alps-agy-harness/agents"
+  cat <<'EOF' > "$bad_ws/.agents/plugins/alps-agy-harness/agents/canon-auditor.md"
+---
+name: canon-auditor
+description: "Bad agent"
+subagent: true
+mainAgent: false
+inheritMcp: true
+tools: [read_file, run_command, call_mcp_tool, send_message]
+---
+# Bad Agent
+EOF
+
+  set +e
+  local bad_call_mcp_json
+  bad_call_mcp_json=$(TYPESAFE_API_KEY="test_key" \
+                      HARNESS_CONFIG_DIR="$mock_config_dir" \
+                      HARNESS_GH_BIN="$mock_bin_dir/gh" \
+                      "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$bad_ws" --json)
+  local rc_bad1=$?
+  set -e
+  assert_eq "1" "$rc_bad1" "Doctor must fail when agent frontmatter lists call_mcp_tool"
+  assert_json_field "$bad_call_mcp_json" ".healthy" "false"
+  assert_json_field "$bad_call_mcp_json" '.checks[] | select(.name=="subagent_frontmatter") | .status' "FAIL"
+  local msg_bad1
+  msg_bad1=$(printf '%s\n' "$bad_call_mcp_json" | jq -r '.checks[] | select(.name=="subagent_frontmatter") | .message')
+  assert_contains "$msg_bad1" "call_mcp_tool" "subagent_frontmatter failure must mention call_mcp_tool"
+
+  # 3. Missing inheritMcp: true on canon-auditor.md -> FAIL naming inheritMcp
+  cat <<'EOF' > "$bad_ws/.agents/plugins/alps-agy-harness/agents/canon-auditor.md"
+---
+name: canon-auditor
+description: "Missing inheritMcp"
+subagent: true
+mainAgent: false
+tools: [read_file, run_command, manage_task, send_message]
+---
+# Missing inheritMcp
+EOF
+
+  set +e
+  local bad_inherit_json
+  bad_inherit_json=$(TYPESAFE_API_KEY="test_key" \
+                     HARNESS_CONFIG_DIR="$mock_config_dir" \
+                     HARNESS_GH_BIN="$mock_bin_dir/gh" \
+                     "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$bad_ws" --json)
+  local rc_bad2=$?
+  set -e
+  assert_eq "1" "$rc_bad2" "Doctor must fail when auditor frontmatter omits inheritMcp: true"
+  assert_json_field "$bad_inherit_json" ".healthy" "false"
+  assert_json_field "$bad_inherit_json" '.checks[] | select(.name=="subagent_frontmatter") | .status' "FAIL"
+  local msg_bad2
+  msg_bad2=$(printf '%s\n' "$bad_inherit_json" | jq -r '.checks[] | select(.name=="subagent_frontmatter") | .message')
+  assert_contains "$msg_bad2" "inheritMcp" "subagent_frontmatter failure must mention inheritMcp"
 }
 
 run_tests "test_"
