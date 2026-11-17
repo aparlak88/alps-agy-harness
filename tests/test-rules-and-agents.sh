@@ -137,7 +137,9 @@ test_platform_rules_valid_glob_frontmatter_and_under_24kb() {
     "dotnet-clean-arch.md" \
     "**/*.cs, **/*.xaml, **/*.csproj, **/*.sln, **/*.slnx, **/Directory.Packages.props" \
     "XMLDoc" \
-    "Domain" "Application" "Infrastructure" "Presentation" "RFC 7807" "NetArchTest" "csharp-lsp" "xaml_validate"
+    "Domain" "Application" "Infrastructure" "Presentation" "RFC 7807" "NetArchTest" "csharp-lsp" "xaml_validate" \
+    "Dual Disposal" "IAsyncDisposable" "IDisposable" "CreateScope" "GetAwaiter().GetResult()" \
+    "Explicit Decorator Prerequisite Guard" "IServiceCollection" "InvalidOperationException"
 
   assert_platform_rule_contract \
     "angular-typescript.md" \
@@ -259,6 +261,15 @@ test_subagents_frontmatter_and_audit_contracts() {
   assert_contains "$sec_content" "jev_score" "security-reviewer must calibrate findings via jev_score"
   assert_contains "$sec_content" "Mandatory 7-Surface" "security-reviewer must cover all 7 mandatory security surfaces"
   assert_contains "$sec_content" "IDOR" "security-reviewer must check Authn/Authz and IDOR"
+  assert_contains "$sec_content" "Fail-Closed Auth" "security-reviewer Surface 1 must enforce Fail-Closed Auth Middleware/Filter/Guard"
+  assert_contains "$sec_content" "fail-open" "security-reviewer Surface 1 must prohibit silent fail-open pass-through"
+  assert_contains "$sec_content" "Length-Hiding Constant-Time Secret Comparison" "security-reviewer Surface 1 must require length-hiding constant-time secret comparison"
+  assert_contains "$sec_content" "FixedTimeEquals" "security-reviewer Surface 1 must mention FixedTimeEquals"
+  assert_contains "$sec_content" "timingSafeEqual" "security-reviewer Surface 1 must mention timingSafeEqual"
+  assert_contains "$sec_content" "hmac.compare_digest" "security-reviewer Surface 1 must mention hmac.compare_digest"
+  assert_contains "$sec_content" "SHA-256" "security-reviewer Surface 1 must require fixed-size SHA-256/HMAC digest normalization"
+  assert_contains "$sec_content" "Anonymous Endpoint Cache-Key Cardinality Guard" "security-reviewer Surface 2 must enforce Anonymous Endpoint Cache-Key Cardinality Guard"
+  assert_contains "$sec_content" "allowlist" "security-reviewer must enforce strict allowlists"
   assert_contains "$sec_content" "RequestUri" "security-reviewer Surface 3 must forbid leaking raw RequestUri in logs/responses"
   assert_contains "$sec_content" "?api_key=" "security-reviewer Surface 3 must flag ?api_key= query secret exposure"
   assert_contains "$sec_content" "?token=" "security-reviewer Surface 3 must flag ?token= query secret exposure"
@@ -276,6 +287,10 @@ test_subagents_frontmatter_and_audit_contracts() {
   assert_contains "$sec_content" "40-character" "security-reviewer Surface 7 must require 40-character commit SHA pinning"
   assert_contains "$sec_content" '${{' "security-reviewer Surface 7 must prevent inline expression shell injection"
   assert_contains "$sec_content" "always()" "security-reviewer Surface 7 must verify always() secret/Keychain cleanup"
+  assert_contains "$sec_content" "rejectUnauthorized: false" "security-reviewer Surface 7 must check insecure rejectUnauthorized: false flag"
+  assert_contains "$sec_content" "InsecureSkipVerify" "security-reviewer Surface 7 must check InsecureSkipVerify flag"
+  assert_contains "$sec_content" "docker-compose" "security-reviewer Surface 7 must inspect local docker-compose port bindings"
+  assert_contains "$sec_content" "127.0.0.1:" "security-reviewer Surface 7 must prefer 127.0.0.1: loopback binding"
   assert_contains "$sec_content" "stamp-gate.sh security" "security-reviewer must invoke stamp-gate.sh security"
   assert_contains "$sec_content" "--verdict PASS --critical 0 --important 0" "security-reviewer must document exact zero-finding PASS stamp command"
 
@@ -297,6 +312,12 @@ test_subagents_frontmatter_and_audit_contracts() {
   assert_contains "$pr_content" "stale" "pr-auditor Dimension 1 must flag stale comments"
 
   assert_contains "$pr_content" "2. Test Coverage & Behavioral Rigor" "pr-auditor must define Dimension 2: Test Coverage & Behavioral Rigor"
+  assert_contains "$pr_content" "Deterministic Concurrency Testing" "pr-auditor Dimension 2 must require Deterministic Concurrency Testing"
+  assert_contains "$pr_content" "FOR UPDATE" "pr-auditor Dimension 2 must cover row-lock FOR UPDATE tests"
+  assert_contains "$pr_content" "SKIP LOCKED" "pr-auditor Dimension 2 must cover SKIP LOCKED concurrency tests"
+  assert_contains "$pr_content" "Barrier" "pr-auditor Dimension 2 must mention Barrier synchronization"
+  assert_contains "$pr_content" "TaskCompletionSource" "pr-auditor Dimension 2 must mention TaskCompletionSource synchronization"
+  assert_contains "$pr_content" "CountDownLatch" "pr-auditor Dimension 2 must mention CountDownLatch synchronization"
   assert_contains "$pr_content" "3. Type Safety & API/Schema Contract Integrity" "pr-auditor must define Dimension 3: Type Safety & API/Schema Contract Integrity"
   assert_contains "$pr_content" "RFC 7807" "pr-auditor Dimension 3 must check RFC 7807 error contracts"
   assert_contains "$pr_content" "4. Silent Failure & Error Handling Analysis" "pr-auditor must define Dimension 4: Silent Failure & Error Handling Analysis"

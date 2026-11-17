@@ -17,6 +17,7 @@ Bu skill, kod tabanında zamanla biriken küçük pürüzleri, V2 otoparkında (
 
 1. **V2 Otopark Notları (`docs/parking-lot.md`):**
    - Önceki geliştirme turlarında kapsam dışı bırakılmış teknik borç veya refactoring notları.
+   - **Güncellik Kontrolü (`stale check` — `jev_score` Öncesi Zorunlu):** `docs/parking-lot.md` maddelerini `jev_score` ile puanlamadan önce güncel kod tabanında ve git geçmişinde doğrula; önceki PR'larda zaten çözülmüş veya geçerliliğini yitirmiş maddeleri ayrı bir mikro-PR açmadan doğrudan temizlenecekler listesine ayır.
 2. **Ölü Kod ve Kullanılmayan Dışa Aktarımlar (Dead Exports):**
    - `graphify` veya LSP referans sorgusuyla (`csharp_references` vb.) referansı kalmamış sınıflar, metodlar veya arayüzler.
 3. **Kanon Uyuşmazlıkları ve Bayat Yorumlar:**
@@ -28,7 +29,7 @@ Bu skill, kod tabanında zamanla biriken küçük pürüzleri, V2 otoparkında (
 
 ## 2. `jev_score` ile ROI Puanlaması
 
-Aday maddeler toplanır ve `jev_score` motoruna gönderilerek puanlanır:
+Yalnızca `stale check` sonrasında geçerliliğini koruyan aktif aday maddeler toplanır ve `jev_score` motoruna gönderilerek puanlanır (zaten çözülmüş/bayat `docs/parking-lot.md` satırları bu aşamaya sokulmaz, mikro-PR açılmadan doğrudan temizlenir):
 
 ```json
 {

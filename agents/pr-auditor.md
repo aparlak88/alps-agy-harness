@@ -42,6 +42,7 @@ Evaluate the PR systematically across **all 7 numbered dimensions**:
 #### 2. Test Coverage & Behavioral Rigor
 - Verify unit, integration, fitness, and E2E tests assert real observable domain/application behavior rather than tautological mock-echo assertions (`verify(mock).called` with zero state/output verification).
 - Check missing edge cases (null/empty inputs, boundary values, concurrency/idempotency, error/rollback paths), regression tests for bugfixes, and zero-console-error E2E guards on web flows.
+- **Deterministic Concurrency Testing:** In concurrency tests verifying race conditions, optimistic concurrency, or row/resource locks (`FOR UPDATE`, `SKIP LOCKED`, mutex/semaphore), reject reliance on instant synchronous mocks/fakes or arbitrary `sleep` delays; require deterministic synchronization barriers (`Barrier`, `TaskCompletionSource`, `CountDownLatch`, or bounded channels) proving parallel workers simultaneously entered the contested critical section.
 
 #### 3. Type Safety & API/Schema Contract Integrity
 - Audit strict nullability, exhaustive union/enum handling, immutable Value Objects instead of primitive obsession, and explicit DTO <-> Domain mapping in `Infrastructure`/`Data`/`Presentation`.
