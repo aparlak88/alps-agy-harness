@@ -96,3 +96,8 @@ public sealed class ArchitectureTests
 /// </exception>
 public void EnterGracePeriod(DateTimeOffset graceExpiresAtUtc) { ... }
 ```
+
+## 5. DI Lifetime, Dual Disposal & Registration Safety
+
+- **Dual Disposal & Zero Sync-Over-Async (`IAsyncDisposable` + `IDisposable`):** Infrastructure components registered as `Scoped` or `Transient` that implement `IAsyncDisposable` must also implement `IDisposable` when synchronous scope teardown (`IServiceProvider.CreateScope()`) can occur, preventing runtime `InvalidOperationException` on container disposal. Synchronous `Dispose()` must **never** call `DisposeAsync().AsTask().GetAwaiter().GetResult()` or `.Result` (*sync-over-async*); instead, invoke underlying resources' native synchronous `Dispose()` methods.
+- **Explicit Decorator Prerequisite Guard:** Any `IServiceCollection` extension method that wraps an existing service contract with a decorator must explicitly verify that the prerequisite service registration already exists in `IServiceCollection` (throwing an actionable `InvalidOperationException` at startup if missing) and enforce deterministic registration ordering so later registrations cannot silently overwrite the decorator.

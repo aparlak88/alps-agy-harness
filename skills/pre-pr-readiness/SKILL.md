@@ -37,7 +37,9 @@ Okuyucunun IDE'yi açmadan tüm işi, mimari kararları ve her bir dosyadaki de�
    git diff --name-status <base>..HEAD
    git diff --stat <base>..HEAD
    ```
-2. **Şablonu Okuyun ve Rehberi Üretin:**
+2. **Bayat Otopark Kayıtlarını Temizleyin (`docs/parking-lot.md`):**
+   Mevcut dal farkının (`git diff <base>..HEAD`) `docs/parking-lot.md` içindeki herhangi bir maddeyi zaten çözüp çözmediğini kontrol edin; bu dalda çözülmüş maddeleri PR açmadan önce `docs/parking-lot.md` dosyasından temizleyin (`codeTreeSha` hesabı `docs/parking-lot.md` dosyasını dışarıda bıraktığı için mevcut `canon` veya `security` denetim damgalarını bozmaz).
+3. **Şablonu Okuyun ve Rehberi Üretin:**
    `skills/pre-pr-readiness/templates/walkthrough-template.md` şablonunu okuyun ve `docs/walkthroughs/YYYY-MM-DD-<ozellik>.md` dosyasını oluşturun. Şablondaki köşeli parantez yer tutucularının tamamını gerçek proje bilgileriyle değiştirin:
    - **Problem Bağlamı ve Mimari Kararlar:** Çözülen gerçek kök problemi, neden bu yaklaşımın seçildiğini, elenen alternatifleri ve ödünleşimleri (*trade-offs*) açıklayın.
    - **Mimari ve Veri Akışı Diyagramları (`>= 2` Mermaid):** Jenerik isimler (`[Feature]Controller`, `A --> B`) yerine projedeki gerçek sınıf, arayüz, modül ve metod adlarıyla en az 2 adet ```` ```mermaid ```` diyagramı çizin.
@@ -47,9 +49,9 @@ Okuyucunun IDE'yi açmadan tüm işi, mimari kararları ve her bir dosyadaki de�
    - **Kritik İş Mantığı, Kenar Durumlar ve Hata Yönetimi:** Sınır durumları ve hata davranışlarını detaylandırın.
    - **Somut Doğrulama Kanıtları:** "Tüm testler geçti" demek yerine hangi test dosyasının neyi kanıtladığını, çalıştırılan gerçek komutları ve gerçek çıktı özetlerini yazın.
    - **Kapsam Dışı ve Sözlük:** `docs/parking-lot.md` notlarını ekleyin ve dokümanı eksiksiz `## Teknik Terimler Sözlüğü` tablosuyla bitirin.
-3. **Fiziksel Hook Kuralını Unutmayın:**
+4. **Fiziksel Hook Kuralını Unutmayın:**
    `pre-command-guard.sh`, `git diff --name-only <base>..HEAD` içindeki tek bir dosyanın bile `## Dosya Bazlı Değişiklik Analizi` altında yer almaması veya `Ne` / `Neden` açıklamalarının yüzeysel bırakılması durumunda `gh pr create` ve yerel `git merge` komutlarını `deny` ile fiziksel olarak reddeder!
-4. **Rehberi Commit Edin:**
+5. **Rehberi Commit Edin:**
    ```bash
    git add docs/walkthroughs/
    git commit -m "docs: add comprehensive PR engineering walkthrough"

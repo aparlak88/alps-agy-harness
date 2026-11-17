@@ -82,6 +82,23 @@ test_all_eleven_skills_frontmatter_and_folder_match() {
     return 1
   fi
 
+  # 3b. Specific contract assertions on pre-pr-readiness/SKILL.md and entropy-sweep/SKILL.md
+  local pre_pr_file="$REPO_ROOT/skills/pre-pr-readiness/SKILL.md"
+  local entropy_file="$REPO_ROOT/skills/entropy-sweep/SKILL.md"
+  local pre_pr_content entropy_content
+  pre_pr_content=$(cat "$pre_pr_file")
+  entropy_content=$(cat "$entropy_file")
+
+  assert_contains "$pre_pr_content" "docs/parking-lot.md" "pre-pr-readiness must inspect docs/parking-lot.md before PR"
+  assert_contains "$pre_pr_content" "git diff" "pre-pr-readiness must compare docs/parking-lot.md against git diff"
+  assert_contains "$pre_pr_content" "codeTreeSha" "pre-pr-readiness must explain docs/parking-lot.md exclusion from codeTreeSha"
+  assert_contains "$pre_pr_content" "çözülmüş" "pre-pr-readiness must instruct cleaning resolved parking-lot items"
+
+  assert_contains "$entropy_content" "docs/parking-lot.md" "entropy-sweep must inspect docs/parking-lot.md"
+  assert_contains "$entropy_content" "stale check" "entropy-sweep must perform stale check before jev_score"
+  assert_contains "$entropy_content" "jev_score" "entropy-sweep must score surviving entries with jev_score"
+  assert_contains "$entropy_content" "mikro-PR" "entropy-sweep must remove stale entries without opening mikro-PR"
+
   # 4. Verify total tracked/staged/working plugin bundle file count (excluding project lifecycle docs)
   local bundle_count
   bundle_count=$(git -C "$REPO_ROOT" ls-files -c -o --exclude-standard | grep -Ev "^docs/(superpowers|walkthroughs|canon)/|^docs/parking-lot\.md$" | wc -l | tr -d '[:space:]')
