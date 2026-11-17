@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Alps AGY Harness - Post-PR Stop Continuation Gate (stop-gate.sh)
 # When pr-audit-pending.json exists and terminationReason == "NO_TOOL_CALL":
-#   - If stopRetries < 2: atomically increments stopRetries by +1 and returns {"decision":"continue","reason":"..."}
+#   - If auditDispatched == true: returns {} immediately without incrementing stopRetries (allows async wait for pr-auditor)
+#   - Else if stopRetries < 2: atomically increments stopRetries by +1 and returns {"decision":"continue","reason":"..."}
 #   - If stopRetries >= 2 (or non-NO_TOOL_CALL / .harness-ignore / file absent): returns {}
 set -euo pipefail
 

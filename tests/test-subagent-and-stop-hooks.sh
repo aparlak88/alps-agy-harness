@@ -835,7 +835,7 @@ test_stop_gate_allows_async_wait_when_pr_auditor_dispatched() {
   printf '%s\n' "$pr_create_payload" | "$POST_COMMAND_HOOKS" >/dev/null
   assert_json_field "$pending_file" ".auditDispatched" "false" "Re-seeded auditDispatched must be false"
 
-  # (a) Unrelated self worker must NOT set auditDispatched=true
+  # (a) Unrelated self worker must NOT set auditDispatched=true (even if prompt mentions pr-audit-pending or clear-pr-audit)
   "$STAMP_GATE" dispatch --role "Formatter Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
   local p_unrelated_self
   p_unrelated_self=$(jq -nc --arg ws "$repo" '{
@@ -845,14 +845,14 @@ test_stop_gate_allows_async_wait_when_pr_auditor_dispatched() {
       args: {
         TypeName: "self",
         Role: "Formatter Worker",
-        Prompt: "Format files."
+        Prompt: "Format files and check pr-audit-pending / clear-pr-audit docs."
       }
     }
   }')
   local out_unrelated
   out_unrelated=$(printf '%s\n' "$p_unrelated_self" | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_unrelated" ".decision" "allow" "Dispatched unrelated self worker must be allowed"
-  assert_json_field "$pending_file" ".auditDispatched" "false" "Unrelated self worker must leave auditDispatched=false"
+  assert_json_field "$pending_file" ".auditDispatched" "false" "Unrelated self worker mentioning pr-audit-pending must leave auditDispatched=false"
 
   # (b) Unregistered self PR audit must be denied and must NOT set auditDispatched=true
   local p_unreg_self_pr

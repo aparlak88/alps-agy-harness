@@ -41,7 +41,6 @@ parent_model="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.modelName // empty' 2>/dev
 type_name="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.toolCall.args.TypeName // empty' 2>/dev/null || true)"
 role="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.toolCall.args.Role // empty' 2>/dev/null || true)"
 caller_model="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.toolCall.args.Model // empty' 2>/dev/null || true)"
-orig_prompt="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.toolCall.args.Prompt // empty' 2>/dev/null || true)"
 
 effort_header_for_profile() {
   local level="$1"
@@ -120,14 +119,9 @@ mark_pr_audit_dispatched_if_pending() {
 
 is_self_pr_audit_invocation() {
   local target_role="${1:-}"
-  local target_prompt="${2:-}"
-  local norm_role norm_prompt
+  local norm_role
   norm_role="$(printf '%s' "$target_role" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
-  norm_prompt="$(printf '%s' "$target_prompt" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
-  if printf '%s\n' "$norm_role" | grep -Eq '(pr[-_[:space:]]*audit|post[-_[:space:]]*pr|review[-_[:space:]]*pr|pr[-_[:space:]]*review|pr[-_[:space:]]*denet|pull[-_[:space:]]*request[-_[:space:]]*(audit|review))'; then
-    return 0
-  fi
-  printf '%s\n' "$norm_prompt" | grep -Eq '(agents/pr-auditor\.md|clear-pr-audit|pr-audit-pending)'
+  printf '%s\n' "$norm_role" | grep -Eq '(pr[-_[:space:]]*audit|post[-_[:space:]]*pr|review[-_[:space:]]*pr|pr[-_[:space:]]*review|pr[-_[:space:]]*denet|pull[-_[:space:]]*request[-_[:space:]]*(audit|review))'
 }
 
 case "$type_name" in
@@ -211,7 +205,7 @@ case "$type_name" in
     updated_json="$(jq -c --arg role "$role" '.entries[$role].consumed = true' "$dispatch_file")"
     atomic_write_json "$state_dir" "subagent-dispatch.json" "$updated_json"
 
-    if [ "$type_name" = "self" ] && is_self_pr_audit_invocation "$role" "$orig_prompt"; then
+    if [ "$type_name" = "self" ] && is_self_pr_audit_invocation "$role"; then
       mark_pr_audit_dispatched_if_pending
     fi
 
