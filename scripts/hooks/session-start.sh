@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Alps AGY Harness - SessionStart Hook (session-start.sh)
-# Injects workspace branch status, canon and graphify readiness, tool warnings, and protocols.
+# Uses warm harness-daemon when available, falling back deterministically to harness_core.py.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -14,24 +14,17 @@ if harness_is_ignored "$WORKSPACE_ROOT"; then
   exit 0
 fi
 
-branch="$(harness_branch_name "$WORKSPACE_ROOT")"
-parent_model="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.modelName // empty' 2>/dev/null || true)"
-parent_family="$(harness_classify_parent_model "$parent_model")"
-parent_model_display="${parent_model:-unspecified}"
+if [ "${HARNESS_AUTO_START_DAEMON:-0}" = "1" ] && [ "${HARNESS_DISABLE_DAEMON:-0}" != "1" ]; then
+  sock_path="$(harness_daemon_socket_path)"
+  if ! harness_is_safe_daemon_socket "$sock_path"; then
+    daemon_py="$_HARNESS_PLUGIN_ROOT/sidecars/harness-daemon/daemon.py"
+    if [ -f "$daemon_py" ]; then
+      nohup python3 -B "$daemon_py" >/dev/null 2>&1 &
+    fi
+  fi
+fi
 
-# Check canon files
-canon_glossary="missing"
-canon_flows="missing"
-canon_lessons="missing"
-[ -f "$WORKSPACE_ROOT/docs/canon/glossary.md" ] && canon_glossary="present"
-[ -f "$WORKSPACE_ROOT/docs/canon/flows.md" ] && canon_flows="present"
-[ -f "$WORKSPACE_ROOT/docs/canon/lessons.md" ] && canon_lessons="present"
-
-# Check graphify
-graphify_status="missing"
-[ -f "$WORKSPACE_ROOT/graphify-out/graph.json" ] && graphify_status="present"
-
-# Check required CLI tools (test override via HARNESS_CHECK_BINS)
+# Evaluate client-side PATH bins locally for strict test/env parity
 missing_bins=()
 check_bins="${HARNESS_CHECK_BINS:-gh jq}"
 for b in $check_bins; do
@@ -39,30 +32,33 @@ for b in $check_bins; do
     missing_bins+=("$b")
   fi
 done
-
-tool_warning=""
+missing_bins_json="[]"
 if [ ${#missing_bins[@]} -gt 0 ]; then
-  tool_warning="[WARNING] Missing required tool(s): ${missing_bins[*]}. Run scripts/harness-doctor.sh to diagnose and resolve environment prerequisites."
+  missing_bins_json="$(printf '%s\n' "${missing_bins[@]}" | jq -R . | jq -sc .)"
 fi
 
-# Build context injection message
-msg="[Alps AGY Harness - Active Session Context]
-- Active Git Branch: $branch
-- Active Session Model: $parent_model_display (family: $parent_family)
-- Canon Status:
-  - glossary.md: $canon_glossary
-  - flows.md: $canon_flows
-  - lessons.md: $canon_lessons
-- Graphify Status: $graphify_status (graphify-out/graph.json)
-- Protocols:
-  - Use jev_classify, jev_check, and jev_ask for intent, architecture trade-offs, and verification.
-  - Parent-aware Gemini 4 / Orchestrator subagent routing is enforced by pre-subagent-guard.sh (never downgrades Carbon/Orchestrator/Argon-High audits; escalates Hydrogen/Flash audits to Argon via pro).
-  - Wrap high-output shell commands with scripts/run-quiet.sh.
-  - All documentation must conclude with a ## Teknik Terimler Sözlüğü or ## Technical Glossary section."
-
-if [ -n "$tool_warning" ]; then
-  msg="$msg
-$tool_warning"
+# Share boolean-only key presence hint (never the secret string itself)
+env_key_present=false
+trimmed_key="${TYPESAFE_API_KEY:-}"
+trimmed_key="${trimmed_key//[[:space:]]/}"
+if [ -n "$trimmed_key" ]; then
+  case "$trimmed_key" in
+    \<*\>) ;;
+    *) env_key_present=true ;;
+  esac
 fi
 
-jq -nc --arg msg "$msg" '{injectSteps: [{systemMessage: {systemMessage: $msg}}]}'
+req_payload="$(jq -nc \
+  --argjson orig "$HOOK_INPUT" \
+  --arg ws "$WORKSPACE_ROOT" \
+  --argjson missing "$missing_bins_json" \
+  --argjson ekp "$env_key_present" \
+  '($orig | if type == "object" then . else {} end) + {workspace: $ws, missingBins: $missing, envKeyPresent: $ekp}' 2>/dev/null || printf '{}')"
+
+if daemon_resp="$(harness_daemon_call "/hook/session-start" "$req_payload")" && \
+   printf '%s' "$daemon_resp" | jq -e 'type == "object" and (.injectSteps | type == "array") and ((.injectSteps[0].systemMessage.systemMessage // "") | length > 0)' >/dev/null 2>&1; then
+  printf '%s\n' "$daemon_resp"
+  exit 0
+fi
+
+printf '%s' "$HOOK_INPUT" | python3 -B "$(harness_core_python)" eval-session-start --workspace "$WORKSPACE_ROOT"

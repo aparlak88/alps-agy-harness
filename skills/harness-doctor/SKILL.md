@@ -48,10 +48,11 @@ Geliştirici ortamını test etmek için çalışma alanı kökünde `harness-do
    - `csharp-ls` ve `csharp-lsp-mcp` ikilileri.
    - `graphify` erişilebilirliği.
    - Projede iOS (`.swift`, `Package.swift`) veya Android (`.kt`, `build.gradle.kts`) dosyaları varsa `xcrun simctl` ve `adb` hazırlığı.
-6. **Aktif Çalışma Alanı Sağlığı:**
+6. **Aktif Çalışma Alanı ve Sidecar Sağlığı:**
    - Kurulum modu (Global veya Proje Bazlı).
    - `.gitignore` veya `.git/info/exclude` içinde `.harness/` kaydı.
    - `docs/canon/{glossary,flows,lessons}.md` ve `graphify-out/graph.json` mevcudiyeti.
+   - `harness_daemon`: `sidecars/harness-daemon/sidecar.json` manifesto bütünlüğü ve canlı Unix socket `/health` durumu (`[OK]` çalışıyor, `[INFO]` yedek soğuk fallback aktif).
 
 ---
 
