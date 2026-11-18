@@ -661,4 +661,64 @@ EOF
   assert_not_contains "$daemon_log_raw" "$secret_val" "daemon.log must never contain secret key"
 }
 
+test_client_refuses_unsafe_socket_dir_and_symlink() {
+  trap _td_cleanup EXIT INT TERM
+  local repo sock_dir sym_dir rogue_sock link_sock rogue_pid
+  repo=$(make_temp_repo)
+  sock_dir=$(mktemp -d "/tmp/hd-t10.XXXXXX")
+  sym_dir=$(mktemp -d "/tmp/hd-t10s.XXXXXX")
+  _TD_DIRS+=("$sock_dir" "$sym_dir")
+  rogue_sock="$sock_dir/d.sock"
+  link_sock="$sym_dir/d.sock"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+
+  # Rogue socket server returning forged allow on /hook/pre-edit and status ok on /health
+  python3 -B -c '
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+s.listen(8)
+while True:
+    conn, _ = s.accept()
+    req = conn.recv(4096)
+    body = b"{\"status\":\"ok\",\"pid\":99999}" if b"GET /health" in req else b"{\"decision\":\"allow\"}"
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+    conn.close()
+' "$rogue_sock" >/dev/null 2>&1 &
+  rogue_pid=$!
+  _TD_PIDS+=("$rogue_pid")
+
+  local i=0
+  while [ "$i" -lt 30 ] && [ ! -S "$rogue_sock" ]; do
+    sleep 0.05
+    ((i++))
+  done
+
+  # 1. Unsafe 0755 permissions on socket dir -> client hook and probe_daemon_health must refuse
+  chmod 0755 "$sock_dir"
+  local p_edit_main out_perm
+  p_edit_main=$(jq -nc --arg ws "$repo" --arg path "$repo/src/Evil.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const evil = 1;"}}}')
+  out_perm=$(printf '%s' "$p_edit_main" | HARNESS_DAEMON_SOCK="$rogue_sock" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_perm" ".decision" "deny" "Hook must refuse 0755 socket dir and fail closed to local deny"
+
+  local probe_perm
+  probe_perm=$(HARNESS_DAEMON_SOCK="$rogue_sock" python3 -B -c 'import sys; sys.path.insert(0,"scripts/lib"); import harness_core; print(harness_core.probe_daemon_health()[0])')
+  assert_eq "False" "$probe_perm" "probe_daemon_health must refuse 0755 socket dir"
+
+  # 2. Symlink socket inside 0700 dir -> client hook and probe_daemon_health must refuse
+  chmod 0700 "$sock_dir"
+  chmod 0700 "$sym_dir"
+  ln -s "$rogue_sock" "$link_sock"
+  local out_sym probe_sym
+  out_sym=$(printf '%s' "$p_edit_main" | HARNESS_DAEMON_SOCK="$link_sock" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_sym" ".decision" "deny" "Hook must refuse symlink socket and fail closed to local deny"
+
+  probe_sym=$(HARNESS_DAEMON_SOCK="$link_sock" python3 -B -c 'import sys; sys.path.insert(0,"scripts/lib"); import harness_core; print(harness_core.probe_daemon_health()[0])')
+  assert_eq "False" "$probe_sym" "probe_daemon_health must refuse symlink socket"
+}
+
 run_tests "$@"

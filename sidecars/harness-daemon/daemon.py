@@ -120,8 +120,11 @@ def validate_and_prepare_socket_dir(sock_path: Path) -> None:
             raise NotADirectoryError(f"Socket parent is not a directory: {sock_dir}")
         os.chmod(sock_dir, 0o700)
     else:
-        sock_dir.mkdir(parents=True, exist_ok=True)
+        sock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(sock_dir, 0o700)
+        st = sock_dir.lstat()
+        if st.st_uid != os.getuid() or (st.st_mode & 0o077) != 0:
+            raise PermissionError(f"Unsafe permissions or owner on socket directory: {sock_dir}")
 
 
 class HarnessDaemonState:
@@ -598,6 +601,8 @@ class HarnessDaemonState:
                         job["running"] = True
                         due_graphify.append((ws_key, str(job.get("reason", "queued"))))
 
+                dirty_snapshot = set(self._dirty_workspaces)
+
             for ws_key, reason in due_graphify:
                 t = threading.Thread(
                     target=self._run_graphify_job,
@@ -608,7 +613,7 @@ class HarnessDaemonState:
                 t.start()
 
             # Prioritize explicitly dirty workspaces first
-            ordered_refresh = sorted(to_refresh, key=lambda k: (0 if k in self._dirty_workspaces else 1))
+            ordered_refresh = sorted(to_refresh, key=lambda k: (0 if k in dirty_snapshot else 1))
             for ws_key in ordered_refresh:
                 if self.stop_event.is_set():
                     break
@@ -862,10 +867,28 @@ def run_daemon() -> int:
         lock_fd.close()
         return 0
 
+    # Re-validate socket directory immediately after lock acquisition to close standby TOCTOU
+    try:
+        validate_and_prepare_socket_dir(sock_path)
+    except Exception as exc:
+        logger.log("ERROR", f"Post-lock socket security validation failed: {exc}")
+        lock_fd.close()
+        return 1
+
     # Stale socket recovery once advisory lock is held
     if sock_path.exists() or sock_path.is_symlink():
         if sock_path.is_symlink():
             logger.log("ERROR", f"Refusing symlink socket at {sock_path}")
+            lock_fd.close()
+            return 1
+        try:
+            sock_st = sock_path.lstat()
+            if sock_st.st_uid != os.getuid():
+                logger.log("ERROR", f"Refusing socket not owned by UID {os.getuid()}: {sock_path}")
+                lock_fd.close()
+                return 1
+        except OSError as exc:
+            logger.log("ERROR", f"Cannot stat socket {sock_path}: {exc}")
             lock_fd.close()
             return 1
         alive, _ = harness_core.probe_daemon_health(sock_path)

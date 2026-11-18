@@ -23,9 +23,10 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
+import threading
 import time
-import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -51,15 +52,7 @@ GLOSSARY_H2_RE = re.compile(r"^## ([0-9]+\. )?(Teknik Terimler Sözlüğü|Techn
 DOTNET_VAL_FLAGS = frozenset(
     ("--version", "-v", "--framework", "-f", "--source", "-s", "--package-directory", "--project", "--file")
 )
-IOS_NOISE_RE = re.compile(
-    r"(runningboardd|SpringBoard|mDNSResponder|CoreAnalytics|symptomsd|analyticsd|distnoted|dasd|powerd)",
-    re.IGNORECASE,
-)
 AUDITOR_BASENAMES = frozenset(("canon-auditor.md", "security-reviewer.md", "pr-auditor.md"))
-PR_AUDIT_ROLE_RE = re.compile(
-    r"(pr[-_\s]*audit|post[-_\s]*pr|review[-_\s]*pr|pr[-_\s]*review|pr[-_\s]*denet|pull[-_\s]*request[-_\s]*(audit|review))",
-    re.IGNORECASE,
-)
 PBXPROJ_BUNDLE_RE = re.compile(r"PRODUCT_BUNDLE_IDENTIFIER\s*=\s*\"?([^;\n\"]+)\"?\s*;")
 
 
@@ -90,13 +83,7 @@ def atomic_write_json(target_dir: Path, filename: str, data: Any) -> Path:
     content = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, indent=2)
     if not content.endswith("\n"):
         content += "\n"
-    tmp_path = target_dir / f".{filename}.tmp.{os.getpid()}.{os.get_ident() if hasattr(os, 'get_ident') else 0}"
-    try:
-        import threading
-
-        tmp_path = target_dir / f".{filename}.tmp.{os.getpid()}.{threading.get_ident()}"
-    except Exception:
-        pass
+    tmp_path = target_dir / f".{filename}.tmp.{os.getpid()}.{threading.get_ident()}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as fh:
             fh.write(content)
@@ -974,11 +961,20 @@ def _resolve_rel_path(workspace: Path, raw_path: str) -> tuple[str, bool]:
         else:
             return "", True
     else:
-        rel_path = os.path.normpath(target_path)
-        if rel_path == ".." or rel_path.startswith("../"):
+        rel_norm = os.path.normpath(target_path)
+        if rel_norm == ".." or rel_norm.startswith("../"):
             return "", True
-        if rel_path == ".":
+        joined = os.path.join(real_ws or ws_root, "" if rel_norm == "." else rel_norm)
+        try:
+            real_joined = os.path.realpath(joined)
+        except OSError:
+            real_joined = joined
+        if real_ws and real_joined.startswith(real_ws + "/"):
+            rel_path = real_joined[len(real_ws) + 1 :]
+        elif real_joined == real_ws:
             rel_path = ""
+        else:
+            return "", True
 
     while rel_path.startswith("./"):
         rel_path = rel_path[2:]
@@ -1002,7 +998,7 @@ def evaluate_pre_edit(workspace: Path, hook_input: dict[str, Any]) -> dict[str, 
     if is_external:
         return {"decision": "allow"}
 
-    if rel_path.startswith(".superpowers") or rel_path.startswith(".harness"):
+    if rel_path == ".superpowers" or rel_path.startswith(".superpowers/") or rel_path == ".harness" or rel_path.startswith(".harness/"):
         return {"decision": "allow"}
 
     # Rule 1: main/master lock when HEAD exists
@@ -1427,9 +1423,10 @@ def run_sync_graphify(workspace: Path) -> int:
         graphify_bin = os.environ.get("HARNESS_GRAPHIFY_BIN", "graphify")
         cmd = [graphify_bin, "--update", "--no-viz"]
 
+    timeout_sec = max(1, int(os.environ.get("HARNESS_GRAPHIFY_TIMEOUT_SEC", "120")))
     try:
         with open(log_file, "a", encoding="utf-8") as lf:
-            proc = subprocess.run(cmd, cwd=str(workspace), stdout=lf, stderr=subprocess.STDOUT)
+            proc = subprocess.run(cmd, cwd=str(workspace), stdout=lf, stderr=subprocess.STDOUT, timeout=timeout_sec)
         return proc.returncode
     except Exception as exc:
         try:
@@ -1776,15 +1773,32 @@ def _parse_frontmatter_tools(fm: str) -> list[str]:
     return tools
 
 
+def is_safe_socket_path(sock: Path) -> bool:
+    """Verify socket and parent dir are non-symlinks, UID-owned, and 0700-restricted."""
+    try:
+        sock_dir = sock.parent
+        dir_st = os.lstat(sock_dir)
+        if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
+            return False
+        if dir_st.st_uid != os.getuid() or (stat.S_IMODE(dir_st.st_mode) & 0o077) != 0:
+            return False
+
+        sock_st = os.lstat(sock)
+        if stat.S_ISLNK(sock_st.st_mode) or not stat.S_ISSOCK(sock_st.st_mode):
+            return False
+        if sock_st.st_uid != os.getuid():
+            return False
+        return True
+    except OSError:
+        return False
+
+
 def probe_daemon_health(sock_path: Optional[Path] = None, timeout_sec: float = 0.25) -> tuple[bool, Optional[dict[str, Any]]]:
-    """Query ``GET /health`` over the Unix domain socket if present and non-disabled."""
+    """Query ``GET /health`` over the Unix domain socket if present, safe, and non-disabled."""
     if os.environ.get("HARNESS_DISABLE_DAEMON") == "1":
         return False, None
     sock = sock_path or default_socket_path()
-    try:
-        if not sock.exists():
-            return False, None
-    except OSError:
+    if not is_safe_socket_path(sock):
         return False, None
 
     conn = None

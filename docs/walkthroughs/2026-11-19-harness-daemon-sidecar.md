@@ -127,8 +127,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Hem terminal CLI hem de daemon'ın 300 saniyelik `health.json` yenileme döngüsünün birebir aynı kontrol mantığını ve sıfır-sızıntılı `TYPESAFE_API_KEY` kurallarını kullanmasını (*Single Source of Truth*) sağlamak için güncellendi.
 
 ### `scripts/hooks/common.sh` — [GÜNCELLENDİ] (`Paylaşımlı Kanca Kütüphanesi`)
-- **Ne Değişti / Ne Üretildi?:** `harness_core_python()`, `harness_daemon_socket_path()` ve `harness_daemon_call()` IPC yardımcıları eklendi; `harness_validate_walkthrough()` ile `harness_parse_command_segments()` fonksiyonları `python3 -B "$(harness_core_python)"` alt komutlarına delege edilirken tüm dışa aktarılan fonksiyon imzaları korundu.
-- **Neden Değişti / Neden Üretildi?:** Tüm kancaların tek bir soket çağrı ve fail-closed geri dönüş mekanizmasını paylaşmasını sağlamak ve `common.sh` içindeki yinelenen Python ayrıştırma kodunu `harness_core.py` modülünde birleştirmek için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `harness_core_python()`, `harness_daemon_socket_path()`, `harness_is_safe_daemon_socket()` (istemci tarafında soket üst dizini için `0700` / UID / non-symlink ve soket dosyası için non-symlink / `-S` / UID kontrolü) ve `harness_daemon_call()` IPC yardımcıları eklendi; `harness_validate_walkthrough()` ile `harness_parse_command_segments()` fonksiyonları `python3 -B "$(harness_core_python)"` alt komutlarına delege edildi.
+- **Neden Değişti / Neden Üretildi?:** Tüm kancaların paylaşımlı `/tmp` ortamında soket ele geçirme saldırılarına kapalı tek bir fail-closed IPC çağrı mekanizmasını kullanmasını sağlamak ve `common.sh` içindeki yinelenen Python ayrıştırma kodunu tek merkezde toplamak için güncellendi.
 
 ### `scripts/hooks/post-command-hooks.sh` — [GÜNCELLENDİ] (`PostToolUse Kancası`)
 - **Ne Değişti / Ne Üretildi?:** Çalışma alanı yoksayılmamışsa ve istemci tarafından özel `HARNESS_GRAPHIFY_BIN` override'ı verilmemişse önce `/hook/post-command` soket çağrısını dener ve asenkron `graphify` kuyruklamasıyla anında `{}` döner; soket yoksa/hatalıysa `harness_core.py eval-post-command` senkron yoluna düşer.
@@ -147,16 +147,16 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Oturum başında doktor hataları, bayat `codeTreeSha` damgaları, arka plan `graphify` durumu ve taze iOS `.ips` crash özetlerinin sıfır gecikmeyle modele sunulması için güncellendi.
 
 ### `scripts/lib/harness_core.py` — [ÜRETİLDİ] (`Paylaşımlı Çekirdek Kütüphane`)
-- **Ne Değişti / Ne Üretildi?:** `sys.dont_write_bytecode = True` ayarlı sıfır bağımlılıklı modül oluşturuldu; `parse_command_segments`, `extract_install_packages`, `build_spec_package_index`, `has_glossary_section`, `validate_walkthrough`, `build_doc_validation_cache`, `compute_code_tree_sha`, `compute_tree_and_stamp_state`, `verify_pr_stamps`, `evaluate_pre_edit`, `evaluate_pre_command`, `evaluate_post_command`, `build_session_start_payload`, `extract_ios_bundle_identifiers`, `parse_ios_crash_report`, `run_doctor_checks` (`harness_daemon` kontrolü dahil) ve 10 CLI alt komutu uygulandı.
-- **Neden Değişti / Neden Üretildi?:** `daemon.py` ile tüm kabuk kancaları ve CLI betikleri arasında tek doğruluk kaynağı kurarak kural sapmasını kalıcı olarak engellemek ve macOS `TMPDIR` çift `/` + `..` path traversal kenar durumlarını tek merkezde çözmek amacıyla üretildi.
+- **Ne Değişti / Ne Üretildi?:** `sys.dont_write_bytecode = True` ayarlı sıfır bağımlılıklı modül oluşturuldu; `is_safe_socket_path()`, `probe_daemon_health()`, `parse_command_segments()`, `extract_install_packages()`, `build_spec_package_index()`, `has_glossary_section()`, `validate_walkthrough()`, `build_doc_validation_cache()`, `compute_code_tree_sha()`, `compute_tree_and_stamp_state()`, `verify_pr_stamps()`, `evaluate_pre_edit()`, `evaluate_pre_command()`, `evaluate_post_command()`, `build_session_start_payload()`, `extract_ios_bundle_identifiers()`, `parse_ios_crash_report()`, `run_doctor_checks()` ve 10 CLI alt komutu uygulandı (`run_sync_graphify` 120s timeout korumalı).
+- **Neden Değişti / Neden Üretildi?:** `daemon.py` ile tüm kabuk kancaları ve CLI betikleri arasında tek doğruluk kaynağı kurarak kural sapmasını kalıcı olarak engellemek ve macOS `TMPDIR` çift `/`, göreli symlink ve `..` traversal + istemci soket güvenliği açıklarını tek merkezde çözmek amacıyla üretildi.
 
 ### `scripts/mobile-logs.sh` — [GÜNCELLENDİ] (`Mobil Teşhis Betiği`)
 - **Ne Değişti / Ne Üretildi?:** iOS `.ips`/`.crash` dosyalarını okuyan 116 satırlık satır içi Python bloğu kaldırılarak `python3 -B "$SCRIPT_DIR/lib/harness_core.py" parse-ios-crash --diag-dir "$diag_dir" --bundle-id "$bundle_id"` çağrısına bağlandı; tüm CLI bayrakları ve Android akışı korundu.
 - **Neden Değişti / Neden Üretildi?:** iOS crash özetleme biçiminin elle çalıştırılan `mobile-logs.sh` çıktısı ile daemon'ın arka plan `mobile-crashes.json` izleyicisi arasında birebir uyumlu kalması için güncellendi.
 
 ### `sidecars/harness-daemon/daemon.py` — [ÜRETİLDİ] (`Sidecar Daemon Süreci`)
-- **Ne Değişti / Ne Üretildi?:** `PLUGIN_ROOT` yolunu `cwd` bağımsız çözen, başlangıçta `TYPESAFE_API_KEY` anahtarını yalnızca `bool` olarak yakalayıp `os.environ` içinden temizleyen, GUI `launchd` için tek seferlik login shell `PATH` zenginleştirmesi yapan, `/tmp/agy-hd-<uid>/d.sock` (`0700`/`0600` UID + non-symlink doğrulamalı) üzerinde `ThreadingUnixHTTPServer` açan, `fcntl.flock` pasif standby döngüsü, TTL evict eden çoklu çalışma alanı kaydı (`workspaces.json`), hedefli `1.5s` watcher (`tree-state`, `spec-packages`, `doc-validation`, `health`, koşullu iOS `mobile-crashes`), single-flight debounced `graphify` worker ve temiz `SIGTERM` kapanışı içeren daemon yazıldı.
-- **Neden Değişti / Neden Üretildi?:** Antigravity Sidecar Manager tarafından yönetilen sürekli arka plan servisi olarak Spec'teki tüm ön-hesaplama, asenkron kuyruk, IPC güvenlik izolasyonu ve sıfır-gecikme hedeflerini gerçekleştirmek üzere üretildi.
+- **Ne Değişti / Ne Üretildi?:** `PLUGIN_ROOT` yolunu `cwd` bağımsız çözen, başlangıçta `TYPESAFE_API_KEY` anahtarını yalnızca `bool` olarak yakalayıp `os.environ` içinden temizleyen, GUI `launchd` için tek seferlik login shell `PATH` zenginleştirmesi yapan, kilit (`fcntl.flock`) alımından önce ve hemen sonra `/tmp/agy-hd-<uid>/d.sock` (`0700`/`0600` UID + non-symlink) doğrulaması yapan `ThreadingUnixHTTPServer`, kilit korumalı TTL evict eden çoklu çalışma alanı kaydı (`workspaces.json`), hedefli `1.5s` watcher (`tree-state`, `spec-packages`, `doc-validation`, `health`, koşullu iOS `mobile-crashes`), single-flight debounced `graphify` worker ve temiz `SIGTERM` kapanışı içeren daemon yazıldı.
+- **Neden Değişti / Neden Üretildi?:** Antigravity Sidecar Manager tarafından yönetilen sürekli arka plan servisi olarak Spec'teki tüm ön-hesaplama, asenkron kuyruk, TOCTOU'ya kapalı soket güvenliği, IPC ortam izolasyonu ve sıfır-gecikme hedeflerini gerçekleştirmek üzere üretildi.
 
 ### `sidecars/harness-daemon/sidecar.json` — [ÜRETİLDİ] (`Sidecar Manifestosu`)
 - **Ne Değişti / Ne Üretildi?:** `"display_name": "Alps Harness Daemon"`, `"command": "python3"`, `"args": ["daemon.py"]`, `"restart_policy": "always"` alanlarını `snake_case` şemada tanımlayan ve `has_web_ui` içermeyen başsız sidecar manifestosu oluşturuldu.
@@ -175,8 +175,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Eklenti paketine eklenen 4 yeni çekirdek dosyanın paket bütünlüğü kapısında izlenmesini sağlamak ve yetim dosya kaymasını engellemek için güncellendi.
 
 ### `tests/test-sidecar-daemon.sh` — [ÜRETİLDİ] (`Sidecar Daemon Test Paketi`)
-- **Ne Değişti / Ne Üretildi?:** Manifest şeması, `0700`/`0600` izinler ve `flock` pasif standby + stale soket kurtarma + `SIGTERM`, daemon açık/kapalı kanca paritesi, asılı/bozuk sokette fail-closed fallback, `< 500ms` asenkron `graphify` ve coalescing, commit sonrası stale `codeTreeSha` / sahte önbellek reddi, spec/doc önbellek yenilemesi, `.harness-ignore` + TTL eviction, koşullu iOS `.ips` vs Android/plain atlaması ve sıfır-gizli-anahtar sızıntısı kontrollerini içeren 10 otonom test senaryosu yazıldı.
-- **Neden Değişti / Neden Üretildi?:** `harness-daemon` yaşam döngüsü, güvenlik sınırları, gecikme kazanımı ve yedek yol garantilerini CI/yerel test koşularında deterministik olarak kanıtlamak için üretildi.
+- **Ne Değişti / Ne Üretildi?:** Manifest şeması, `0700`/`0600` izinler ve `flock` pasif standby + stale soket kurtarma + `SIGTERM`, daemon açık/kapalı kanca paritesi, asılı/bozuk sokette fail-closed fallback, `0755` soket dizini ve symlink soket istemci reddi (`test_client_refuses_unsafe_socket_dir_and_symlink`), `< 500ms` asenkron `graphify` ve coalescing, commit sonrası stale `codeTreeSha` / sahte önbellek reddi, spec/doc önbellek yenilemesi, `.harness-ignore` + TTL eviction, koşullu iOS `.ips` vs Android/plain atlaması ve sıfır-gizli-anahtar sızıntısı kontrollerini içeren 11 otonom test senaryosu yazıldı.
+- **Neden Değişti / Neden Üretildi?:** `harness-daemon` yaşam döngüsü, istemci/sunucu soket güvenlik sınırları, gecikme kazanımı ve yedek yol garantilerini CI/yerel test koşularında deterministik olarak kanıtlamak için üretildi.
 
 ---
 
@@ -185,7 +185,7 @@ sequenceDiagram
 | Senaryo / Kenar Durum | Sistemin Davranışı ve Korunan Kural (Invariant) | Üretilen Hata / Yanıt Sözleşmesi |
 | :--- | :--- | :--- |
 | **Soket Yok / Timeout (`0.35s`) / Bozuk JSON** | `common.sh` içindeki `harness_daemon_call` sıfırdan farklı kodla çıkar; `pre-edit-guard.sh` ve `pre-command-guard.sh` **asla** fail-open olmaz, yerel `harness_core.py` Motoruna düşer. | Deterministik `allow` / `deny` / `force_ask` kararı |
-| **macOS 104-Bayt `sun_path` & Symlink Güvenliği** | Soket `/tmp/agy-hd-<uid>/d.sock` (~27 bayt) altında açılır; başlangıçta dizin sahipliği (`st_uid == getuid`), gerçek dizin olması (`not islink`) ve `0700`/`0600` izinler doğrulanır. | İhlalde daemon açılışı reddeder (`exit 1`) |
+| **macOS 104-Bayt `sun_path` & İstemci/Sunucu Soket Güvenliği** | Soket `/tmp/agy-hd-<uid>/d.sock` (~27 bayt) altında açılır; hem sunucu (`daemon.py`) kilit öncesi/sonrası hem de istemciler (`harness_is_safe_daemon_socket`, `is_safe_socket_path`) dizin sahipliğini, `not islink`, `0700` modunu ve soket sahipliğini doğrular. | İhlalde daemon başlangıcı reddeder; istemci bağlantıyı reddedip fail-closed fallback'e düşer |
 | **`restart_policy: "always"` Yeniden Başlatma Döngüsü** | İkinci daemon `daemon.lock` (`fcntl.flock`) alamayıp canlı `/health` gördüğünde `exit 0` vermek yerine `5s` aralıklı pasif standby'da bekler. | Sonsuz süreç doğumu önlenir; otomatik devralma korunur |
 | **`TYPESAFE_API_KEY` 300s Doktor Yenilemesi** | Başlangıçta yalnızca boolean varlık yakalanıp `os.environ`'dan silinir; `/hook/session-start` yalnızca `envKeyPresent: bool` geçebilir. | `health.json`, `daemon.log` ve stdout'ta sıfır sır |
 | **Bayat `tree-state.json` & Sahte Önbellek** | `verify_pr_stamps` her zaman canlı `get_head_oid(workspace)` ile `headOid` eşleşmesini doğrular; uyuşmazlıkta anlık `compute_code_tree_sha` çalıştırır. | Eski/sahte damgalı PR `deny` alır |
@@ -204,7 +204,7 @@ sequenceDiagram
 | `tests/test-manifest.sh` | 9/9: `plugin.json` `1.1.0` sürümü ve katı üst düzey anahtarlar, `hooks.json` matcher/timeout kontratları, logo, `.gitignore`, `test-helpers` | `PASS` |
 | `tests/test-plugin-bundle.sh` | 3/3: 11 skill frontmatter/boyut sınırı, **53 çekirdek dosya sayısı**, şablon/`README` sözlükleri ve uçtan uca yaşam döngüsü | `PASS` |
 | `tests/test-rules-and-agents.sh` | 3/3: `AGENTS.md` `< 8 KB`, platform kuralları `< 24 KB`, denetçi alt ajan frontmatter kuralları | `PASS` |
-| `tests/test-sidecar-daemon.sh` | 10/10: Sidecar manifest, izinler & standby, parite, timeout/bozuk sokette fail-closed fallback, `< 500ms` async `graphify`, bayat `codeTreeSha` reddi, spec/doc önbelleği, TTL eviction, koşullu iOS crash watcher ve sıfır sır | `PASS` |
+| `tests/test-sidecar-daemon.sh` | 11/11: Sidecar manifest, izinler & standby, parite, timeout/bozuk sokette fail-closed fallback, `0755`/symlink soket istemci reddi, `< 500ms` async `graphify`, bayat `codeTreeSha` reddi, spec/doc önbelleği, TTL eviction, koşullu iOS crash watcher ve sıfır sır | `PASS` |
 | `tests/test-stamp-and-common.sh` | 12/12: Dal slug'ları, `codeTreeSha`, güvenlik/canon damgaları, Gemini 4 & `Orchestrator` yönlendirmesi, sözlük & JSON yayıcıları | `PASS` |
 | `tests/test-subagent-and-stop-hooks.sh` | 8/8: Alt ajan yönlendirme, `canon-auditor` taban yükseltme, çok satırlı prompt `overwrite`, async `stop-gate` | `PASS` |
 | `tests/test-utilities.sh` | 8/8: `run-quiet.sh`, `mobile-logs.sh` (iOS & Android), `harness-doctor.sh` sıfır gizli anahtar ve frontmatter kontrolleri | `PASS` |
@@ -212,7 +212,7 @@ sequenceDiagram
 ### Çalıştırılan Komutlar ve Çıktı Özetleri
 - **Tam Test Koşusu:**
   - Komut: `./scripts/run-quiet.sh test-suite -- bash tests/run-all.sh`
-  - Çıktı Özeti: `✅ PASS [test-suite] (süre: 73.1s, warnings: 0 — log: .harness/logs/last.log)` (`Overall Result: 9 passed, 0 failed, 9 total` — toplam `65` test geçti, `0` hata).
+  - Çıktı Özeti: `✅ PASS [test-suite] (süre: 74.1s, warnings: 0 — log: .harness/logs/last.log)` (`Overall Result: 9 passed, 0 failed, 9 total` — toplam `66` test geçti, `0` hata).
 - **Ortam Sağlığı (`harness-doctor.sh`):**
   - Komut: `./scripts/harness-doctor.sh --workspace . --json | jq '{healthy, daemon: (.checks[] | select(.name=="harness_daemon"))}'`
   - Çıktı Özeti: `"healthy": true`, `harness_daemon`: `status: "INFO"` (`harness-daemon manifest valid (not running; cold fallback active)`).

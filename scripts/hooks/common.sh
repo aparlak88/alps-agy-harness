@@ -19,8 +19,24 @@ harness_daemon_socket_path() {
   fi
 }
 
+# Return 0 when socket path and parent dir pass UID, non-symlink, and strict 0700 checks.
+harness_is_safe_daemon_socket() {
+  local sock="${1:-}"
+  [ -n "$sock" ] || return 1
+  local sock_dir
+  sock_dir="$(dirname "$sock")"
+  [ -n "$sock_dir" ] || return 1
+  [ ! -L "$sock_dir" ] && [ -d "$sock_dir" ] && [ -O "$sock_dir" ] || return 1
+  local dir_mode
+  dir_mode="$(stat -f '%Lp' "$sock_dir" 2>/dev/null || stat -c '%a' "$sock_dir" 2>/dev/null || true)"
+  [[ "$dir_mode" =~ ^[0-7]+$ ]] || return 1
+  [ "$(( 8#$dir_mode & 8#077 ))" -eq 0 ] || return 1
+  [ ! -L "$sock" ] && [ -S "$sock" ] && [ -O "$sock" ] || return 1
+  return 0
+}
+
 # Query the background harness-daemon over its Unix domain socket.
-# Returns 1 immediately when daemon is disabled, socket is absent, or curl fails.
+# Returns 1 immediately when daemon is disabled, socket fails safety checks, or curl fails.
 harness_daemon_call() {
   local endpoint="${1:?endpoint required}"
   local payload="${2:?payload required}"
@@ -29,7 +45,7 @@ harness_daemon_call() {
   fi
   local sock
   sock="$(harness_daemon_socket_path)"
-  [ -S "$sock" ] || return 1
+  harness_is_safe_daemon_socket "$sock" || return 1
   local timeout_sec="${HARNESS_DAEMON_TIMEOUT_SEC:-0.35}"
   curl -fsS --max-time "$timeout_sec" --unix-socket "$sock" \
     -H "Content-Type: application/json" \

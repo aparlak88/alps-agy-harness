@@ -16,7 +16,7 @@ fi
 
 if [ "${HARNESS_AUTO_START_DAEMON:-0}" = "1" ] && [ "${HARNESS_DISABLE_DAEMON:-0}" != "1" ]; then
   sock_path="$(harness_daemon_socket_path)"
-  if [ ! -S "$sock_path" ]; then
+  if ! harness_is_safe_daemon_socket "$sock_path"; then
     daemon_py="$_HARNESS_PLUGIN_ROOT/sidecars/harness-daemon/daemon.py"
     if [ -f "$daemon_py" ]; then
       nohup python3 -B "$daemon_py" >/dev/null 2>&1 &
