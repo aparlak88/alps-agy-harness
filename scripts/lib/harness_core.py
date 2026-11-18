@@ -735,9 +735,10 @@ def build_doc_validation_cache(workspace: Path, existing_cache: Optional[dict[st
     if base_ref and head_oid != "UNBORN":
         mb_res = _run_git(workspace, ["merge-base", base_ref, "HEAD"])
         merge_base = mb_res.stdout.strip() if mb_res.returncode == 0 else base_ref
-        diff_key = f"{merge_base}..{head_oid}"
-        diff_res = _run_git(workspace, ["diff", "--name-only", diff_key])
+        candidate_diff_key = f"{merge_base}..{head_oid}"
+        diff_res = _run_git(workspace, ["diff", "--name-only", candidate_diff_key])
         if diff_res.returncode == 0:
+            diff_key = candidate_diff_key
             all_diff = [line for line in diff_res.stdout.splitlines() if line.strip()]
 
     for rel, path in candidates:
@@ -1156,6 +1157,14 @@ def evaluate_pre_command(
                                 targets_main = "targets_main"
                                 break
 
+                    if rem_res.returncode != 0 and (
+                        targets_main == "targets_main"
+                        or (targets_main in ("bare", "remote_only") and active_branch in ("main", "master"))
+                    ):
+                        return {
+                            "decision": "deny",
+                            "reason": "Unable to verify git remotes on main/master (git remote failed or timed out).",
+                        }
                     if remotes:
                         if targets_main == "targets_main":
                             return {
@@ -1169,6 +1178,11 @@ def evaluate_pre_command(
                             }
             elif git_subcmd == "merge" and active_branch in ("main", "master"):
                 if "--ff-only" not in seg:
+                    if rem_res.returncode != 0:
+                        return {
+                            "decision": "deny",
+                            "reason": "Unable to verify git remotes on main/master (git remote failed or timed out).",
+                        }
                     if remotes:
                         return {
                             "decision": "deny",
@@ -1182,6 +1196,11 @@ def evaluate_pre_command(
                         merge_base = mb_res.stdout.strip() if mb_res.returncode == 0 else "HEAD"
                         diff_res = _run_git(workspace, ["diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}..{target_branch}"])
                         all_res = _run_git(workspace, ["diff", "--name-only", f"{merge_base}..{target_branch}"])
+                        if diff_res.returncode != 0 or all_res.returncode != 0:
+                            return {
+                                "decision": "deny",
+                                "reason": "Merge blocked: unable to inspect branch diff (git diff failed or timed out).",
+                            }
                         diff_files = [l for l in diff_res.stdout.splitlines() if l.strip()]
                         all_merge_diff = [l for l in all_res.stdout.splitlines() if l.strip()]
 
@@ -1282,6 +1301,11 @@ def evaluate_pre_command(
                         "reason": "PR creation blocked: pull requests cannot be opened from main/master branch",
                     }
                 st_res = _run_git(workspace, ["status", "--porcelain"])
+                if st_res.returncode != 0:
+                    return {
+                        "decision": "deny",
+                        "reason": "PR creation blocked: unable to verify working tree status (git status failed or timed out).",
+                    }
                 if st_res.stdout.strip():
                     return {
                         "decision": "deny",
@@ -1293,6 +1317,11 @@ def evaluate_pre_command(
                 diff_key = f"{merge_base}..{get_head_oid(workspace)}"
                 diff_res = _run_git(workspace, ["diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}..HEAD"])
                 all_res = _run_git(workspace, ["diff", "--name-only", f"{merge_base}..HEAD"])
+                if diff_res.returncode != 0 or all_res.returncode != 0:
+                    return {
+                        "decision": "deny",
+                        "reason": "PR creation blocked: unable to inspect PR diff (git diff failed or timed out).",
+                    }
                 diff_files = [l for l in diff_res.stdout.splitlines() if l.strip()]
                 all_diff = [l for l in all_res.stdout.splitlines() if l.strip()]
 
@@ -1376,6 +1405,11 @@ def evaluate_pre_command(
                 if isinstance(allowed_files, list) and len(allowed_files) > 0:
                     allowed_set = set(str(x) for x in allowed_files)
                     base_diff_res = _run_git(workspace, ["diff", "--name-only", f"{base}..HEAD"])
+                    if base_diff_res.returncode != 0:
+                        return {
+                            "decision": "deny",
+                            "reason": "PR creation blocked: unable to verify allowedFiles scope (git diff failed or timed out).",
+                        }
                     for f in [l for l in base_diff_res.stdout.splitlines() if l.strip()]:
                         if (
                             f.startswith("docs/superpowers/")
