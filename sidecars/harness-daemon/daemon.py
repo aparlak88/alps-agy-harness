@@ -20,6 +20,7 @@ import os
 import signal
 import socket
 import socketserver
+import stat
 import subprocess
 import threading
 import time
@@ -123,7 +124,12 @@ def validate_and_prepare_socket_dir(sock_path: Path) -> None:
         sock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(sock_dir, 0o700)
         st = sock_dir.lstat()
-        if st.st_uid != os.getuid() or (st.st_mode & 0o077) != 0:
+        if (
+            not stat.S_ISDIR(st.st_mode)
+            or stat.S_ISLNK(st.st_mode)
+            or st.st_uid != os.getuid()
+            or (stat.S_IMODE(st.st_mode) & 0o077) != 0
+        ):
             raise PermissionError(f"Unsafe permissions or owner on socket directory: {sock_dir}")
 
 
@@ -671,7 +677,11 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
         super().__init__(server_address, handler_cls)
 
     def server_bind(self) -> None:
-        super().server_bind()
+        old_umask = os.umask(0o177)
+        try:
+            super().server_bind()
+        finally:
+            os.umask(old_umask)
         os.chmod(self.server_address, 0o600)
 
 

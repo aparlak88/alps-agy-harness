@@ -32,6 +32,10 @@ harness_is_safe_daemon_socket() {
   [[ "$dir_mode" =~ ^[0-7]+$ ]] || return 1
   [ "$(( 8#$dir_mode & 8#077 ))" -eq 0 ] || return 1
   [ ! -L "$sock" ] && [ -S "$sock" ] && [ -O "$sock" ] || return 1
+  local sock_mode
+  sock_mode="$(stat -c '%a' "$sock" 2>/dev/null || stat -f '%Lp' "$sock" 2>/dev/null || true)"
+  [[ "$sock_mode" =~ ^[0-7]+$ ]] || return 1
+  [ "$(( 8#$sock_mode & 8#077 ))" -eq 0 ] || return 1
   return 0
 }
 
@@ -414,5 +418,5 @@ harness_parse_command_segments() {
     printf '[]\n'
     return 0
   fi
-  python3 -B "$(harness_core_python)" parse-segments --cmd "$cmd"
+  printf '%s' "$cmd" | python3 -B "$(harness_core_python)" parse-segments
 }

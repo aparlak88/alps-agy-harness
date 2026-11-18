@@ -205,9 +205,10 @@ test_fail_closed_fallback_on_timeout_and_corrupt_socket() {
   git -C "$repo" commit -m "chore: init" --quiet
 
   python3 -B -c '
-import socket, sys, time
+import os, socket, sys, time
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(sys.argv[1])
+os.chmod(sys.argv[1], 0o600)
 s.listen(8)
 while True:
     conn, _ = s.accept()
@@ -218,9 +219,10 @@ while True:
   _TD_PIDS+=("$pid_hang")
 
   python3 -B -c '
-import socket, sys
+import os, socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.bind(sys.argv[1])
+os.chmod(sys.argv[1], 0o600)
 s.listen(8)
 while True:
     conn, _ = s.accept()
@@ -814,6 +816,60 @@ EOF
   local run_count
   run_count=$(grep -c '^RUN:' "$call_log" 2>/dev/null || true)
   [ "$run_count" -ge 1 ] || { echo "Expected mock graphify to run in linked worktree" >&2; return 1; }
+}
+
+test_pre_edit_symlink_parent_traversal_blocked() {
+  trap _td_cleanup EXIT INT TERM
+  local repo sock_dir data_dir sock_path dpid
+  repo=$(make_temp_repo)
+  sock_dir=$(mktemp -d "/tmp/hd-t13.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d13.XXXXXX")
+  _TD_DIRS+=("$sock_dir" "$data_dir")
+  sock_path="$sock_dir/d.sock"
+
+  mkdir -p "$repo/docs/superpowers/specs" "$repo/src"
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  ln -s ../../../src "$repo/docs/superpowers/specs/sub"
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
+
+  local rel_evil="docs/superpowers/specs/sub/../src/evil.ts"
+  local abs_evil="$repo/docs/superpowers/specs/sub/../src/evil.ts"
+  local evil_content=$'eval(x);\n-----BEGIN RSA PRIVATE KEY-----\n'
+  local p_rel p_abs out_rel_on out_rel_off out_abs_on out_abs_off out_feat_on out_feat_off
+
+  p_rel=$(jq -nc --arg ws "$repo" --arg path "$rel_evil" --arg content "$evil_content" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: $content}}}')
+  p_abs=$(jq -nc --arg ws "$repo" --arg path "$abs_evil" --arg content "$evil_content" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: $content}}}')
+
+  out_rel_on=$(printf '%s' "$p_rel" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_on" ".decision" "deny" "Relative symlink+.. traversal on main must be denied (daemon ON)"
+
+  out_rel_off=$(printf '%s' "$p_rel" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_off" ".decision" "deny" "Relative symlink+.. traversal on main must be denied (cold fallback)"
+
+  out_abs_on=$(printf '%s' "$p_abs" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_abs_on" ".decision" "deny" "Absolute symlink+.. traversal on main must be denied (daemon ON)"
+
+  out_abs_off=$(printf '%s' "$p_abs" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_abs_off" ".decision" "deny" "Absolute symlink+.. traversal on main must be denied (cold fallback)"
+
+  git -C "$repo" checkout -b "feat/symlink-check" --quiet
+  out_feat_on=$(printf '%s' "$p_rel" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_feat_on" ".decision" "deny" "Rule 3 dangerous pattern/key must not be bypassed via symlink+.. on feature branch (daemon ON)"
+
+  out_feat_off=$(printf '%s' "$p_rel" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_feat_off" ".decision" "deny" "Rule 3 dangerous pattern/key must not be bypassed via symlink+.. on feature branch (cold fallback)"
 }
 
 run_tests "$@"

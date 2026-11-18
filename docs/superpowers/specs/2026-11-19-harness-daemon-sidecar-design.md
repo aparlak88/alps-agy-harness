@@ -218,8 +218,8 @@ Tüm dosyalar hedef projenin `.harness/cache/` dizininde saklanır (`.gitignore`
 - **Hata Kapalı (*Fail-Closed*) Fallback:** Daemon yanıtındaki her ağ, zaman aşımı, HTTP hata kodu veya JSON biçim bozukluğu doğrudan yerel deterministik doğrulamaya düşer; hiçbir koruma kapısı sessizce atlanmaz.
 - **Disk Önbelleği Zehirlenmesine Karşı Güven Sınırı:** Zorlayıcı karar yolları (`/hook/pre-command`, soğuk fallback `eval-pre-command` ve daemon içi önbellek tohumlaması) çalışma alanı içindeki `.harness/cache/*.json` dosyalarını diskten okuyup güvenmez; yalnızca daemon'ın kendi belleğinde hesapladığı önbellekler veya canlı Git/dosya kontrolleri esas alınır.
 
-### 5.2. Doğrulama ve Test Planı (`tests/test-sidecar-daemon.sh` — 12 Senaryo + Mevcut 8 Test Paketi)
-Uygulama sonrasında mevcut 8 test paketi (`tests/run-all.sh`) korunarak yeni `tests/test-sidecar-daemon.sh` paketi (12 senaryo) eklenir ve 9 paketin tamamı (`bash tests/run-all.sh`) sıfır hata ile doğrulanır:
+### 5.2. Doğrulama ve Test Planı (`tests/test-sidecar-daemon.sh` — 13 Senaryo + Mevcut 8 Test Paketi)
+Uygulama sonrasında mevcut 8 test paketi (`tests/run-all.sh`) korunarak yeni `tests/test-sidecar-daemon.sh` paketi (13 senaryo) eklenir ve 9 paketin tamamı (`bash tests/run-all.sh`) sıfır hata ile doğrulanır:
 
 1. **Manifest ve Başlangıç:** `sidecars/harness-daemon/sidecar.json` alan doğrulaması (`snake_case`, `restart_policy: "always"`, geçerli script yolu), daemon açılışı, `GET /health` yanıtı, tekil örnek/bayat soket kurtarma ve `SIGTERM` temiz kapanış.
 2. **Daemon Açık / Kapalı Parite Testleri:** `session-start.sh`, `pre-edit-guard.sh`, `pre-command-guard.sh` ve `post-command-hooks.sh` betiklerinin aynı senaryolarda daemon açıkken ve `HARNESS_DISABLE_DAEMON=1` iken birebir aynı kararları (`allow`/`deny`/`force_ask`) ürettiğinin doğrulanması.
@@ -230,7 +230,7 @@ Uygulama sonrasında mevcut 8 test paketi (`tests/run-all.sh`) korunarak yeni `t
 7. **`.harness-ignore` & Çalışma Alanı TTL Eviction:** `.harness-ignore` bulunan çalışma alanının muaf kalması ve düşük TTL (`HARNESS_DAEMON_WORKSPACE_TTL_SEC=1`) ile kullanılmayan çalışma alanının kayıttan düşmesi.
 8. **Koşullu Mobil Crash İzleyici:** Sahte `.xcodeproj` + sahte `HARNESS_DIAG_REPORTS_DIR/*.ips` ile `mobile-crashes.json` oluşması; mobil olmayan çalışma alanında bu dosyanın hiç oluşturulmaması.
 9. **`harness-doctor.sh` Güvenlik & Daemon Kontrolü:** Gizli anahtar değerinin ne terminal çıktısına ne de `.harness/cache/health.json` dosyasına yazılmadığının kanıtlanması ve `harness_daemon` `OK`/`INFO`/`FAIL` durumları.
-10. **İstemci Soket Güvenliği & Bağlı Worktree İzleme:** İstemcilerin güvensiz izinli (`0755`) veya symlink soketi reddetmesi, sahte aynı-`headOid` `tree-state.json` zehirlenmesinin soğuk yedek ve daemon'da engellenmesi ve `git worktree add` ile bağlanan worktree'lerin değişimlerinin/asenkron `graphify` tetiklemelerinin izlenmesi.
+10. **İstemci Soket Güvenliği, Sembolik Bağ & Bağlı Worktree İzleme:** İstemcilerin güvensiz izinli (`0755`) veya symlink soketi reddetmesi, sahte aynı-`headOid` `tree-state.json` zehirlenmesinin soğuk yedek ve daemon'da engellenmesi, `pre-edit` içinde izinli klasör altındaki symlink + `..` yol çözümleme atlatmalarının (`docs/superpowers/specs/sub/../src/evil.ts`) daemon ve soğuk yedekte engellenmesi ve `git worktree add` ile bağlanan worktree'lerin değişimlerinin/asenkron `graphify` tetiklemelerinin izlenmesi.
 
 ---
 

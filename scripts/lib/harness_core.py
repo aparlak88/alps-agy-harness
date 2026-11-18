@@ -779,6 +779,11 @@ def build_doc_validation_cache(workspace: Path, existing_cache: Optional[dict[st
     }
 
 
+def _is_zero_int(val: Any) -> bool:
+    """Return True strictly when ``val`` is an integer equal to 0 (rejecting booleans)."""
+    return type(val) is int and val == 0
+
+
 def _evaluate_stamp_status(stamp_data: Optional[dict[str, Any]], current_sha: str, require_zero_findings: bool = False) -> tuple[str, str]:
     """Return ``(status, stamp_sha)`` where status is ``fresh|stale|fail|missing``."""
     if not isinstance(stamp_data, dict):
@@ -787,7 +792,7 @@ def _evaluate_stamp_status(stamp_data: Optional[dict[str, Any]], current_sha: st
     stamp_sha = str(stamp_data.get("codeTreeSha", ""))
     if verdict != "PASS":
         return "fail", stamp_sha
-    if require_zero_findings and (stamp_data.get("criticalCount") != 0 or stamp_data.get("importantCount") != 0):
+    if require_zero_findings and (not _is_zero_int(stamp_data.get("criticalCount")) or not _is_zero_int(stamp_data.get("importantCount"))):
         return "fail", stamp_sha
     if current_sha == "UNBORN" or stamp_sha != current_sha:
         return "stale", stamp_sha
@@ -875,7 +880,7 @@ def verify_pr_stamps(workspace: Path) -> tuple[bool, str]:
     sec_sha = str(sec_data.get("codeTreeSha", ""))
     if sec_verdict != "PASS":
         return False, f"Error: verify-pr-stamps failed: security-pass.json verdict is '{sec_verdict}' (expected PASS)"
-    if sec_data.get("criticalCount") != 0 or sec_data.get("importantCount") != 0:
+    if not _is_zero_int(sec_data.get("criticalCount")) or not _is_zero_int(sec_data.get("importantCount")):
         return False, "Error: verify-pr-stamps failed: security-pass.json has non-zero criticalCount or importantCount"
     if sec_sha != current_sha:
         return (
@@ -923,46 +928,32 @@ def _resolve_base_branch(workspace: Path) -> str:
 
 
 def _resolve_rel_path(workspace: Path, raw_path: str) -> tuple[str, bool]:
-    """Resolve hook target path relative to ``workspace``.
+    """Resolve hook target path relative to ``workspace`` with symlink-first realpath resolution.
 
-    Returns ``(rel_path, is_external)``. Paths outside ``workspace`` or
-    escaping via ``..`` return ``("", True)``.
+    Returns ``(rel_path, is_external)``. Paths outside ``workspace`` or escaping
+    via symlinks/``..`` return ``("", True)``.
     """
-    target_path = os.path.normpath(os.path.expanduser(raw_path))
-    ws_root = os.path.normpath(str(workspace))
+    expanded = os.path.expanduser(raw_path)
     try:
-        real_ws = os.path.realpath(ws_root) if os.path.isdir(ws_root) else ws_root
+        real_ws = os.path.realpath(str(workspace))
     except OSError:
-        real_ws = ws_root
+        real_ws = os.path.normpath(str(workspace))
+    real_ws = real_ws.rstrip("/") or "/"
 
-    if target_path.startswith("/"):
-        try:
-            real_target = os.path.realpath(target_path)
-        except OSError:
-            real_target = target_path
-        if real_ws and real_target.startswith(real_ws + "/"):
-            rel_path = real_target[len(real_ws) + 1 :]
-        elif target_path.startswith(ws_root + "/"):
-            rel_path = target_path[len(ws_root) + 1 :]
-        elif real_target == real_ws or target_path == ws_root:
-            rel_path = ""
-        else:
-            return "", True
+    candidate = expanded if os.path.isabs(expanded) else os.path.join(real_ws, expanded)
+    try:
+        real_target = os.path.realpath(candidate)
+    except OSError:
+        return "", True
+
+    if real_ws == "/":
+        rel_path = real_target.lstrip("/")
+    elif real_target == real_ws:
+        rel_path = ""
+    elif real_target.startswith(real_ws + "/"):
+        rel_path = real_target[len(real_ws) + 1 :]
     else:
-        rel_norm = os.path.normpath(target_path)
-        if rel_norm == ".." or rel_norm.startswith("../"):
-            return "", True
-        joined = os.path.join(real_ws or ws_root, "" if rel_norm == "." else rel_norm)
-        try:
-            real_joined = os.path.realpath(joined)
-        except OSError:
-            real_joined = joined
-        if real_ws and real_joined.startswith(real_ws + "/"):
-            rel_path = real_joined[len(real_ws) + 1 :]
-        elif real_joined == real_ws:
-            rel_path = ""
-        else:
-            return "", True
+        return "", True
 
     while rel_path.startswith("./"):
         rel_path = rel_path[2:]
@@ -1806,7 +1797,7 @@ def is_safe_socket_path(sock: Path) -> bool:
         sock_st = os.lstat(sock)
         if stat.S_ISLNK(sock_st.st_mode) or not stat.S_ISSOCK(sock_st.st_mode):
             return False
-        if sock_st.st_uid != os.getuid():
+        if sock_st.st_uid != os.getuid() or (stat.S_IMODE(sock_st.st_mode) & 0o077) != 0:
             return False
         return True
     except OSError:
