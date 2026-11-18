@@ -102,7 +102,7 @@ test_all_eleven_skills_frontmatter_and_folder_match() {
   # 4. Verify total tracked/staged/working plugin bundle file count (excluding project lifecycle docs)
   local bundle_count
   bundle_count=$(git -C "$REPO_ROOT" ls-files -c -o --exclude-standard | grep -Ev "^docs/(superpowers|walkthroughs|canon)/|^docs/parking-lot\.md$" | wc -l | tr -d '[:space:]')
-  assert_eq "49" "$bundle_count" "Plugin bundle must have exactly 49 core files (excluding docs/superpowers/, docs/walkthroughs/, docs/canon/, docs/parking-lot.md)"
+  assert_eq "53" "$bundle_count" "Plugin bundle must have exactly 53 core files (excluding docs/superpowers/, docs/walkthroughs/, docs/canon/, docs/parking-lot.md)"
 }
 
 test_templates_and_readme_glossary_and_mermaid_contracts() {

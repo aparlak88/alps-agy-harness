@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+"""Alps AGY Harness background daemon sidecar (``harness-daemon``).
+
+Provides warm HTTP-over-Unix-Domain-Socket hook evaluation, atomic
+``.harness/cache/*.json`` pre-computation, single-flight debounced async
+``graphify`` updates, and conditional iOS crash watching with zero third-party
+dependencies.
+"""
+
+from __future__ import annotations
+
+import sys
+
+sys.dont_write_bytecode = True
+
+import fcntl
+import http.server
+import json
+import os
+import signal
+import socket
+import socketserver
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Any, Optional
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[2]
+LIB_DIR = PLUGIN_ROOT / "scripts" / "lib"
+if str(LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(LIB_DIR))
+
+import harness_core  # noqa: E402
+
+MAX_REQUEST_BYTES = 2 * 1024 * 1024
+LOG_MAX_BYTES = 1024 * 1024
+MACOS_UNIX_PATH_MAX = 103
+
+
+class DaemonLogger:
+    """Thread-safe size-rotating logger that never persists secret values."""
+
+    def __init__(self, log_path: Path) -> None:
+        self._path = log_path
+        self._lock = threading.Lock()
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+
+    def log(self, level: str, msg: str) -> None:
+        """Append a timestamped log entry, rotating ``daemon.log`` at 1 MiB."""
+        line = f"{harness_core.utc_now_iso()} [{level}] {msg}\n"
+        with self._lock:
+            try:
+                if self._path.is_file() and self._path.stat().st_size >= LOG_MAX_BYTES:
+                    backup = self._path.with_suffix(".log.1")
+                    if backup.exists():
+                        backup.unlink()
+                    os.replace(self._path, backup)
+                with open(self._path, "a", encoding="utf-8") as fh:
+                    fh.write(line)
+            except OSError:
+                pass
+
+
+def enrich_startup_path() -> None:
+    """Merge login-shell PATH into ``os.environ['PATH']`` for macOS GUI sidecars."""
+    if os.environ.get("HARNESS_SKIP_SHELL_PATH_SYNC") == "1":
+        return
+
+    current_path = os.environ.get("PATH", "")
+    parts = [p for p in current_path.split(os.pathsep) if p]
+    seen = set(parts)
+
+    fallback_dirs = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        str(Path.home() / ".local" / "bin"),
+        str(Path.home() / ".dotnet" / "tools"),
+    ]
+
+    shell_bin = os.environ.get("SHELL") or "/bin/zsh"
+    shell_parts: list[str] = []
+    if os.path.isabs(shell_bin) and os.access(shell_bin, os.X_OK):
+        try:
+            proc = subprocess.run(
+                [shell_bin, "-lc", 'printf "%s" "$PATH"'],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                shell_parts = [p for p in proc.stdout.strip().split(os.pathsep) if p]
+        except Exception:
+            pass
+
+    for candidate in [*shell_parts, *fallback_dirs]:
+        if candidate not in seen and os.path.isdir(candidate):
+            seen.add(candidate)
+            parts.append(candidate)
+
+    os.environ["PATH"] = os.pathsep.join(parts)
+
+
+def validate_and_prepare_socket_dir(sock_path: Path) -> None:
+    """Validate socket path length, real-dir status, UID ownership, and 0700 mode."""
+    sock_bytes = len(str(sock_path).encode("utf-8"))
+    if sys.platform == "darwin" and sock_bytes > MACOS_UNIX_PATH_MAX:
+        raise ValueError(
+            f"AF_UNIX socket path exceeds macOS {MACOS_UNIX_PATH_MAX}-byte sun_path limit ({sock_bytes} bytes): {sock_path}"
+        )
+
+    sock_dir = sock_path.parent
+    if sock_dir.exists() or sock_dir.is_symlink():
+        if sock_dir.is_symlink():
+            raise PermissionError(f"Refusing symlink socket directory: {sock_dir}")
+        st = sock_dir.lstat()
+        if st.st_uid != os.getuid():
+            raise PermissionError(f"Socket directory {sock_dir} is not owned by UID {os.getuid()}")
+        if not sock_dir.is_dir():
+            raise NotADirectoryError(f"Socket parent is not a directory: {sock_dir}")
+        os.chmod(sock_dir, 0o700)
+    else:
+        sock_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(sock_dir, 0o700)
+
+
+class HarnessDaemonState:
+    """Thread-safe coordinator for workspace registry, caches, watchers, and graphify queue."""
+
+    def __init__(self, data_dir: Path, logger: DaemonLogger, startup_env_key_present: bool) -> None:
+        self.data_dir = data_dir
+        self.logger = logger
+        self.started_at = time.time()
+        self.startup_env_key_present = startup_env_key_present
+        self.stop_event = threading.Event()
+        self.wake_event = threading.Event()
+
+        self._lock = threading.RLock()
+        self._workspaces: dict[str, dict[str, Any]] = {}
+        self._caches: dict[str, dict[str, Any]] = {}
+        self._dirty_workspaces: set[str] = set()
+        self._graphify_queue: dict[str, dict[str, Any]] = {}
+
+        self.poll_interval_sec = max(0.05, float(os.environ.get("HARNESS_DAEMON_POLL_INTERVAL_SEC", "1.5")))
+        self.workspace_ttl_sec = max(0.1, float(os.environ.get("HARNESS_DAEMON_WORKSPACE_TTL_SEC", "1800")))
+        self.health_ttl_sec = max(1.0, float(os.environ.get("HARNESS_HEALTH_TTL_SEC", "300")))
+        self.graphify_debounce_sec = max(0.0, float(os.environ.get("HARNESS_GRAPHIFY_DEBOUNCE_SEC", "3.0")))
+
+        self._load_registry()
+
+    def _registry_path(self) -> Path:
+        return self.data_dir / "workspaces.json"
+
+    def _load_registry(self) -> None:
+        raw = harness_core.read_json_file(self._registry_path())
+        if not isinstance(raw, dict):
+            return
+        entries = raw.get("workspaces")
+        if not isinstance(entries, dict):
+            return
+        now = time.time()
+        for ws_str, meta in entries.items():
+            if not isinstance(meta, dict):
+                continue
+            ws_path = Path(ws_str)
+            last_seen = float(meta.get("lastSeenAt", 0))
+            if (now - last_seen) > self.workspace_ttl_sec or not ws_path.is_dir() or harness_core.is_harness_ignored(ws_path):
+                continue
+            self._workspaces[ws_str] = {
+                "registeredAt": float(meta.get("registeredAt", last_seen or now)),
+                "lastSeenAt": last_seen or now,
+                "envKeyHint": meta.get("envKeyHint"),
+            }
+            self._dirty_workspaces.add(ws_str)
+
+    def _persist_registry_locked(self) -> None:
+        serializable = {
+            ws: {
+                "registeredAt": meta.get("registeredAt", 0),
+                "lastSeenAt": meta.get("lastSeenAt", 0),
+                "envKeyHint": meta.get("envKeyHint"),
+            }
+            for ws, meta in self._workspaces.items()
+        }
+        try:
+            harness_core.atomic_write_json(self.data_dir, "workspaces.json", {"workspaces": serializable})
+        except Exception as exc:
+            self.logger.log("WARN", f"Failed to persist workspaces.json: {exc}")
+
+    def register_workspace(
+        self,
+        raw_workspace: str,
+        env_key_hint: Optional[bool] = None,
+        warm_now: bool = False,
+    ) -> tuple[Optional[Path], bool]:
+        """Register or refresh ``raw_workspace``. Returns ``(real_path, is_ignored)``."""
+        if not raw_workspace:
+            return None, False
+        try:
+            ws_path = Path(os.path.realpath(os.path.expanduser(raw_workspace)))
+        except OSError:
+            return None, False
+
+        if not ws_path.is_dir():
+            return ws_path, False
+
+        ws_key = str(ws_path)
+        if harness_core.is_harness_ignored(ws_path):
+            with self._lock:
+                if ws_key in self._workspaces:
+                    self._workspaces.pop(ws_key, None)
+                    self._caches.pop(ws_key, None)
+                    self._graphify_queue.pop(ws_key, None)
+                    self._persist_registry_locked()
+            return ws_path, True
+
+        now = time.time()
+        with self._lock:
+            is_new = ws_key not in self._workspaces
+            meta = self._workspaces.setdefault(
+                ws_key,
+                {"registeredAt": now, "lastSeenAt": now, "envKeyHint": None},
+            )
+            meta["lastSeenAt"] = now
+            if env_key_hint is not None:
+                meta["envKeyHint"] = bool(env_key_hint)
+            self._dirty_workspaces.add(ws_key)
+            if is_new or env_key_hint is not None:
+                self._persist_registry_locked()
+
+        if warm_now:
+            self.refresh_workspace(ws_path, force_health=False)
+        else:
+            self.wake_event.set()
+        return ws_path, False
+
+    def mark_dirty(self, ws_path: Path) -> None:
+        """Schedule an immediate background cache refresh for ``ws_path``."""
+        ws_key = str(ws_path)
+        with self._lock:
+            if ws_key in self._workspaces:
+                self._dirty_workspaces.add(ws_key)
+        self.wake_event.set()
+
+    def active_workspace_count(self) -> int:
+        """Return count of currently registered active workspaces."""
+        with self._lock:
+            return len(self._workspaces)
+
+    def queue_depth(self) -> int:
+        """Return count of pending or active graphify jobs across workspaces."""
+        with self._lock:
+            return sum(1 for item in self._graphify_queue.values() if item.get("queued") or item.get("running"))
+
+    def get_caches(self, ws_path: Path) -> dict[str, Any]:
+        """Return shallow copy of in-memory caches for ``ws_path``, hydrating from disk if needed."""
+        ws_key = str(ws_path)
+        with self._lock:
+            entry = dict(self._caches.get(ws_key, {}))
+        if not entry:
+            entry = {
+                "health": harness_core.read_json_file(ws_path / ".harness" / "cache" / "health.json"),
+                "treeState": harness_core.read_json_file(ws_path / ".harness" / "cache" / "tree-state.json"),
+                "specPackages": harness_core.read_json_file(ws_path / ".harness" / "cache" / "spec-packages.json"),
+                "docValidation": harness_core.read_json_file(ws_path / ".harness" / "cache" / "doc-validation.json"),
+                "graphifyStatus": harness_core.read_json_file(ws_path / ".harness" / "cache" / "graphify-status.json"),
+                "mobileCrashes": harness_core.read_json_file(ws_path / ".harness" / "cache" / "mobile-crashes.json"),
+            }
+        return entry
+
+    def enqueue_graphify(self, ws_path: Path, reason: str) -> None:
+        """Enqueue a debounced single-flight async graphify update for ``ws_path``."""
+        if harness_core.is_harness_ignored(ws_path) or not (ws_path / "graphify-out").is_dir():
+            return
+        ws_key = str(ws_path)
+        now = time.time()
+        due_at = now + self.graphify_debounce_sec
+
+        with self._lock:
+            job = self._graphify_queue.get(ws_key)
+            if job is None:
+                job = {
+                    "queued": True,
+                    "running": False,
+                    "rerunPending": False,
+                    "queuedAt": harness_core.utc_now_iso(),
+                    "dueAt": due_at,
+                    "reason": reason,
+                }
+                self._graphify_queue[ws_key] = job
+            elif job.get("running"):
+                job["rerunPending"] = True
+                job["reason"] = reason
+            else:
+                job["queued"] = True
+                job["dueAt"] = due_at
+                job["reason"] = reason
+
+            status_payload = {
+                "schemaVersion": harness_core.CACHE_SCHEMA_VERSION,
+                "state": "running" if job.get("running") else "queued",
+                "reason": reason,
+                "lastHeadSha": harness_core.get_head_oid(ws_path),
+                "queuedAt": job.get("queuedAt"),
+                "logPath": ".harness/logs/graphify-hook.log",
+            }
+            self._caches.setdefault(ws_key, {})["graphifyStatus"] = status_payload
+
+        try:
+            cache_dir = harness_core.get_cache_dir(ws_path)
+            harness_core.atomic_write_json(cache_dir, "graphify-status.json", status_payload)
+        except OSError:
+            pass
+        self.wake_event.set()
+
+    def _signature_for_workspace(self, ws_path: Path, is_ios: bool) -> dict[str, Any]:
+        """Compute lightweight mtime signature across watched workspace paths."""
+        git_dir = ws_path / ".git"
+        git_mtimes: dict[str, int] = {}
+        for rel in ("HEAD", "packed-refs", "index"):
+            p = git_dir / rel
+            if p.is_file():
+                try:
+                    git_mtimes[rel] = p.stat().st_mtime_ns
+                except OSError:
+                    pass
+        if (git_dir / "HEAD").is_file():
+            try:
+                head_txt = (git_dir / "HEAD").read_text(encoding="utf-8", errors="ignore").strip()
+                if head_txt.startswith("ref:"):
+                    ref_rel = head_txt.split(":", 1)[1].strip()
+                    ref_p = git_dir / ref_rel
+                    if ref_p.is_file():
+                        git_mtimes[ref_rel] = ref_p.stat().st_mtime_ns
+            except OSError:
+                pass
+
+        slug = harness_core.get_branch_slug(ws_path)
+        state_mtimes: dict[str, int] = {}
+        state_dir = ws_path / ".harness" / "state" / slug
+        for fn in ("canon-pass.json", "security-pass.json", "pr-audit-pending.json"):
+            p = state_dir / fn
+            if p.is_file():
+                try:
+                    state_mtimes[fn] = p.stat().st_mtime_ns
+                except OSError:
+                    pass
+
+        spec_mtimes: dict[str, tuple[int, int]] = {}
+        specs_dir = ws_path / "docs" / "superpowers" / "specs"
+        if specs_dir.is_dir():
+            for sp in sorted(specs_dir.glob("*.md")):
+                try:
+                    st = sp.stat()
+                    spec_mtimes[sp.name] = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
+
+        doc_mtimes: dict[str, tuple[int, int]] = {}
+        readme = ws_path / "README.md"
+        if readme.is_file():
+            try:
+                st = readme.stat()
+                doc_mtimes["README.md"] = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+        docs_dir = ws_path / "docs"
+        if docs_dir.is_dir():
+            for dp in sorted(docs_dir.rglob("*.md")):
+                try:
+                    st = dp.stat()
+                    doc_mtimes[dp.relative_to(ws_path).as_posix()] = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
+
+        cfg_dir = Path(os.environ.get("HARNESS_CONFIG_DIR") or (Path.home() / ".gemini" / "config"))
+        key_file = Path(os.environ.get("HARNESS_TYPESAFE_KEY_FILE") or (Path.home() / ".config" / "typesafe" / "key"))
+        cfg_mtimes: dict[str, int] = {}
+        for cp in (cfg_dir / "mcp_config.json", cfg_dir / "config.json", cfg_dir / "plugins.json", key_file):
+            if cp.is_file():
+                try:
+                    cfg_mtimes[str(cp)] = cp.stat().st_mtime_ns
+                except OSError:
+                    pass
+
+        diag_mtime = 0
+        if is_ios:
+            diag_dir = Path(os.environ.get("HARNESS_DIAG_REPORTS_DIR") or (Path.home() / "Library" / "Logs" / "DiagnosticReports"))
+            if diag_dir.is_dir():
+                try:
+                    diag_mtime = max(
+                        (p.stat().st_mtime_ns for p in [*diag_dir.glob("*.ips"), *diag_dir.glob("*.crash")]),
+                        default=0,
+                    )
+                except OSError:
+                    diag_mtime = 0
+
+        return {
+            "git": git_mtimes,
+            "state": state_mtimes,
+            "specs": spec_mtimes,
+            "docs": doc_mtimes,
+            "cfg": cfg_mtimes,
+            "diagMtime": diag_mtime,
+        }
+
+    def refresh_workspace(self, ws_path: Path, force_health: bool = False) -> None:
+        """Incrementally refresh stale workspace caches and detect HEAD transitions."""
+        if not ws_path.is_dir() or harness_core.is_harness_ignored(ws_path):
+            return
+
+        ws_key = str(ws_path)
+        with self._lock:
+            ws_meta = self._workspaces.get(ws_key)
+            if ws_meta is None:
+                return
+            env_hint = ws_meta.get("envKeyHint")
+            cache_entry = self._caches.setdefault(ws_key, {})
+            prev_sig = cache_entry.get("_sig", {})
+            prev_head = cache_entry.get("_lastHeadOid")
+            last_mobile_check = float(cache_entry.get("_lastMobileDetect", 0))
+
+        now = time.time()
+        if (now - last_mobile_check) >= 120.0 or "_hasIos" not in cache_entry:
+            has_ios, has_android = harness_core.detect_mobile_workspace(ws_path)
+            with self._lock:
+                c = self._caches.setdefault(ws_key, {})
+                c["_hasIos"] = has_ios
+                c["_hasAndroid"] = has_android
+                c["_lastMobileDetect"] = now
+        else:
+            has_ios = bool(cache_entry.get("_hasIos"))
+
+        sig = self._signature_for_workspace(ws_path, is_ios=has_ios)
+        cache_dir = harness_core.get_cache_dir(ws_path)
+
+        # 1. Tree state & HEAD change detection
+        tree_file_missing = not (cache_dir / "tree-state.json").is_file()
+        if tree_file_missing or sig["git"] != prev_sig.get("git") or sig["state"] != prev_sig.get("state"):
+            prev_tree = cache_entry.get("treeState") or harness_core.read_json_file(cache_dir / "tree-state.json")
+            new_tree = harness_core.compute_tree_and_stamp_state(ws_path, existing_cache=prev_tree)
+            harness_core.atomic_write_json(cache_dir, "tree-state.json", new_tree)
+            with self._lock:
+                c = self._caches.setdefault(ws_key, {})
+                c["treeState"] = new_tree
+                new_head = new_tree.get("headOid")
+                c["_lastHeadOid"] = new_head
+            if prev_head and new_head and prev_head != new_head and (ws_path / "graphify-out").is_dir():
+                self.enqueue_graphify(ws_path, "git_head_changed")
+
+        # 2. Spec package index
+        spec_file_missing = not (cache_dir / "spec-packages.json").is_file()
+        if spec_file_missing or sig["specs"] != prev_sig.get("specs"):
+            prev_spec = cache_entry.get("specPackages") or harness_core.read_json_file(cache_dir / "spec-packages.json")
+            new_spec = harness_core.build_spec_package_index(ws_path, existing_index=prev_spec)
+            harness_core.atomic_write_json(cache_dir, "spec-packages.json", new_spec)
+            with self._lock:
+                self._caches.setdefault(ws_key, {})["specPackages"] = new_spec
+
+        # 3. Doc validation cache
+        doc_file_missing = not (cache_dir / "doc-validation.json").is_file()
+        if doc_file_missing or sig["docs"] != prev_sig.get("docs") or sig["git"] != prev_sig.get("git"):
+            prev_doc = cache_entry.get("docValidation") or harness_core.read_json_file(cache_dir / "doc-validation.json")
+            new_doc = harness_core.build_doc_validation_cache(ws_path, existing_cache=prev_doc)
+            harness_core.atomic_write_json(cache_dir, "doc-validation.json", new_doc)
+            with self._lock:
+                self._caches.setdefault(ws_key, {})["docValidation"] = new_doc
+
+        # 4. Doctor health cache (TTL + config mtimes; never writes secret values)
+        prev_health = cache_entry.get("health") or harness_core.read_json_file(cache_dir / "health.json")
+        health_epoch = float(prev_health.get("epoch", 0)) if isinstance(prev_health, dict) else 0.0
+        health_expired = (now - health_epoch) >= self.health_ttl_sec
+        if force_health or prev_health is None or health_expired or sig["cfg"] != prev_sig.get("cfg"):
+            effective_env_key = self.startup_env_key_present or bool(env_hint)
+            doctor_res = harness_core.run_doctor_checks(
+                ws_path,
+                env_key_present=effective_env_key,
+                scrub_env=False,
+                probe_daemon=False,
+            )
+            health_summary = harness_core.build_health_cache_summary(doctor_res)
+            harness_core.atomic_write_json(cache_dir, "health.json", health_summary)
+            with self._lock:
+                self._caches.setdefault(ws_key, {})["health"] = health_summary
+
+        # 5. Conditional iOS crash watcher (never writes anything on Android-only or non-mobile repos)
+        if has_ios:
+            diag_override = bool(os.environ.get("HARNESS_DIAG_REPORTS_DIR", "").strip())
+            diag_dir = Path(os.environ.get("HARNESS_DIAG_REPORTS_DIR") or (Path.home() / "Library" / "Logs" / "DiagnosticReports"))
+            prev_crash = cache_entry.get("mobileCrashes") or harness_core.read_json_file(cache_dir / "mobile-crashes.json")
+            if prev_sig.get("diagMtime") != sig["diagMtime"] or prev_crash is None:
+                bundle_ids = harness_core.extract_ios_bundle_identifiers(ws_path)
+                allow_fallback = diag_override or (len(bundle_ids) == 0)
+                parsed = harness_core.parse_ios_crash_report(
+                    diag_dir,
+                    candidate_ids=bundle_ids,
+                    allow_unmatched_fallback=allow_fallback,
+                )
+                if parsed.get("found"):
+                    crash_payload = {
+                        "schemaVersion": harness_core.CACHE_SCHEMA_VERSION,
+                        "platform": "ios",
+                        "updatedAt": harness_core.utc_now_iso(),
+                        "latestReportName": parsed["reportName"],
+                        "latestMtimeNs": parsed["mtimeNs"],
+                        "summaryLines": parsed["lines"],
+                    }
+                    harness_core.atomic_write_json(cache_dir, "mobile-crashes.json", crash_payload)
+                    with self._lock:
+                        self._caches.setdefault(ws_key, {})["mobileCrashes"] = crash_payload
+
+        with self._lock:
+            self._caches.setdefault(ws_key, {})["_sig"] = sig
+            self._dirty_workspaces.discard(ws_key)
+
+    def _run_graphify_job(self, ws_key: str, reason: str) -> None:
+        ws_path = Path(ws_key)
+        started_at = harness_core.utc_now_iso()
+        t0 = time.monotonic()
+
+        running_status = {
+            "schemaVersion": harness_core.CACHE_SCHEMA_VERSION,
+            "state": "running",
+            "reason": reason,
+            "lastHeadSha": harness_core.get_head_oid(ws_path),
+            "startedAt": started_at,
+            "logPath": ".harness/logs/graphify-hook.log",
+        }
+        with self._lock:
+            self._caches.setdefault(ws_key, {})["graphifyStatus"] = running_status
+        try:
+            harness_core.atomic_write_json(harness_core.get_cache_dir(ws_path), "graphify-status.json", running_status)
+        except OSError:
+            pass
+
+        rc = harness_core.run_sync_graphify(ws_path)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        finished_status = {
+            "schemaVersion": harness_core.CACHE_SCHEMA_VERSION,
+            "state": "succeeded" if rc == 0 else "failed",
+            "reason": reason,
+            "lastHeadSha": harness_core.get_head_oid(ws_path),
+            "startedAt": started_at,
+            "finishedAt": harness_core.utc_now_iso(),
+            "durationMs": duration_ms,
+            "exitCode": rc,
+            "logPath": ".harness/logs/graphify-hook.log",
+        }
+
+        with self._lock:
+            job = self._graphify_queue.get(ws_key)
+            self._caches.setdefault(ws_key, {})["graphifyStatus"] = finished_status
+            if job is not None:
+                job["running"] = False
+                if job.get("rerunPending"):
+                    job["rerunPending"] = False
+                    job["queued"] = True
+                    job["dueAt"] = time.time() + self.graphify_debounce_sec
+                else:
+                    job["queued"] = False
+
+        try:
+            harness_core.atomic_write_json(harness_core.get_cache_dir(ws_path), "graphify-status.json", finished_status)
+        except OSError:
+            pass
+
+    def watcher_loop(self) -> None:
+        """Background loop performing TTL eviction, mtime polling, and graphify dispatch."""
+        while not self.stop_event.is_set():
+            now = time.time()
+            to_refresh: list[str] = []
+            due_graphify: list[tuple[str, str]] = []
+            evicted = False
+
+            with self._lock:
+                for ws_key in list(self._workspaces.keys()):
+                    ws_path = Path(ws_key)
+                    meta = self._workspaces[ws_key]
+                    if (
+                        (now - float(meta.get("lastSeenAt", 0))) > self.workspace_ttl_sec
+                        or not ws_path.is_dir()
+                        or harness_core.is_harness_ignored(ws_path)
+                    ):
+                        self._workspaces.pop(ws_key, None)
+                        self._caches.pop(ws_key, None)
+                        self._graphify_queue.pop(ws_key, None)
+                        self._dirty_workspaces.discard(ws_key)
+                        evicted = True
+                    else:
+                        to_refresh.append(ws_key)
+
+                if evicted:
+                    self._persist_registry_locked()
+
+                for ws_key, job in list(self._graphify_queue.items()):
+                    if job.get("queued") and not job.get("running") and float(job.get("dueAt", 0)) <= now:
+                        job["queued"] = False
+                        job["running"] = True
+                        due_graphify.append((ws_key, str(job.get("reason", "queued"))))
+
+            for ws_key, reason in due_graphify:
+                t = threading.Thread(
+                    target=self._run_graphify_job,
+                    args=(ws_key, reason),
+                    name=f"graphify-{os.path.basename(ws_key)}",
+                    daemon=True,
+                )
+                t.start()
+
+            # Prioritize explicitly dirty workspaces first
+            ordered_refresh = sorted(to_refresh, key=lambda k: (0 if k in self._dirty_workspaces else 1))
+            for ws_key in ordered_refresh:
+                if self.stop_event.is_set():
+                    break
+                try:
+                    self.refresh_workspace(Path(ws_key))
+                except Exception as exc:
+                    self.logger.log("WARN", f"Refresh error for {ws_key}: {exc}")
+
+            self.wake_event.wait(timeout=self.poll_interval_sec)
+            self.wake_event.clear()
+
+
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+    """Multi-threaded HTTP server listening on a private 0600 AF_UNIX socket."""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, server_address: str, handler_cls: type[http.server.BaseHTTPRequestHandler], state: HarnessDaemonState) -> None:
+        self.harness_state = state
+        super().__init__(server_address, handler_cls)
+
+    def server_bind(self) -> None:
+        super().server_bind()
+        os.chmod(self.server_address, 0o600)
+
+
+class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
+    """HTTP/JSON request handler implementing the daemon hook and event API."""
+
+    protocol_version = "HTTP/1.1"
+
+    def address_string(self) -> str:
+        # UnixStreamServer passes an empty string client_address; avoid IndexError in BaseHTTPRequestHandler.
+        return "unix-local"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        return
+
+    def _send_json(self, status_code: int, payload: Any) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_json_body(self) -> tuple[Optional[dict[str, Any]], int]:
+        try:
+            content_len = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            return None, 400
+        if content_len > MAX_REQUEST_BYTES:
+            return None, 413
+        raw = self.rfile.read(content_len) if content_len > 0 else b"{}"
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except Exception:
+            return None, 400
+        if not isinstance(parsed, dict):
+            return None, 400
+        return parsed, 200
+
+    def _extract_workspace(self, body: dict[str, Any]) -> str:
+        ws = body.get("workspace")
+        if isinstance(ws, str) and ws:
+            return ws
+        ws_paths = body.get("workspacePaths")
+        if isinstance(ws_paths, list) and ws_paths and isinstance(ws_paths[0], str):
+            return ws_paths[0]
+        return ""
+
+    def do_GET(self) -> None:
+        state: HarnessDaemonState = self.server.harness_state  # type: ignore[attr-defined]
+        if self.path == "/health":
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "pid": os.getpid(),
+                    "uptimeSec": round(time.time() - state.started_at, 2),
+                    "activeWorkspaces": state.active_workspace_count(),
+                    "queueDepth": state.queue_depth(),
+                },
+            )
+            return
+        self._send_json(404, {"error": "not_found"})
+
+    def do_POST(self) -> None:
+        state: HarnessDaemonState = self.server.harness_state  # type: ignore[attr-defined]
+        body, status_err = self._read_json_body()
+        if body is None:
+            self._send_json(status_err, {"error": "invalid_request"})
+            return
+
+        raw_ws = self._extract_workspace(body)
+        if not raw_ws:
+            self._send_json(400, {"error": "missing_workspace"})
+            return
+
+        if self.path == "/hook/session-start":
+            raw_hint = body.get("envKeyPresent")
+            env_hint = raw_hint if isinstance(raw_hint, bool) else None
+            ws_path, ignored = state.register_workspace(raw_ws, env_key_hint=env_hint, warm_now=False)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            if ignored:
+                self._send_json(200, {})
+                return
+            raw_missing = body.get("missingBins")
+            missing_bins = [str(b) for b in raw_missing] if isinstance(raw_missing, list) else None
+            caches = state.get_caches(ws_path)
+            resp = harness_core.build_session_start_payload(
+                ws_path,
+                body,
+                missing_bins=missing_bins,
+                health_cache=caches.get("health"),
+                tree_state=caches.get("treeState"),
+                graphify_status=caches.get("graphifyStatus"),
+                mobile_crashes=caches.get("mobileCrashes"),
+            )
+            state.mark_dirty(ws_path)
+            self._send_json(200, resp)
+            return
+
+        if self.path == "/hook/pre-command":
+            ws_path, ignored = state.register_workspace(raw_ws, warm_now=False)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            if ignored:
+                self._send_json(200, {"decision": "allow"})
+                return
+            caches = state.get_caches(ws_path)
+            resp = harness_core.evaluate_pre_command(
+                ws_path,
+                body,
+                spec_index=caches.get("specPackages"),
+                tree_state=caches.get("treeState"),
+                doc_cache=caches.get("docValidation"),
+            )
+            self._send_json(200, resp)
+            return
+
+        if self.path == "/hook/pre-edit":
+            ws_path, ignored = state.register_workspace(raw_ws, warm_now=False)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            if ignored:
+                self._send_json(200, {"decision": "allow"})
+                return
+            resp = harness_core.evaluate_pre_edit(ws_path, body)
+            if resp.get("decision") == "allow":
+                state.mark_dirty(ws_path)
+            self._send_json(200, resp)
+            return
+
+        if self.path == "/hook/post-command":
+            ws_path, ignored = state.register_workspace(raw_ws, warm_now=False)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            if ignored:
+                self._send_json(200, {})
+                return
+            resp = harness_core.evaluate_post_command(
+                ws_path,
+                body,
+                on_graphify_trigger=lambda ws, reason: state.enqueue_graphify(ws, reason),
+            )
+            state.mark_dirty(ws_path)
+            self._send_json(200, resp)
+            return
+
+        if self.path == "/event/graphify":
+            ws_path, ignored = state.register_workspace(raw_ws, warm_now=False)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            if ignored:
+                self._send_json(200, {"queued": False, "ignored": True})
+                return
+            reason = str(body.get("reason") or "manual_event")
+            state.enqueue_graphify(ws_path, reason)
+            self._send_json(202, {"queued": True, "state": "pending"})
+            return
+
+        if self.path == "/event/workspace-touch":
+            ws_path, ignored = state.register_workspace(raw_ws, warm_now=True)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            self._send_json(200, {"registered": not ignored, "ignored": ignored})
+            return
+
+        self._send_json(404, {"error": "not_found"})
+
+
+def run_daemon() -> int:
+    """Initialize environment security, acquire singleton lock, and run daemon server."""
+    raw_key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    startup_env_key_present = bool(raw_key) and not (raw_key.startswith("<") and raw_key.endswith(">"))
+    del raw_key
+    if "TYPESAFE_API_KEY" in os.environ:
+        os.environ["TYPESAFE_API_KEY"] = ""
+
+    enrich_startup_path()
+
+    data_dir = harness_core.default_data_dir()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    logger = DaemonLogger(data_dir / "daemon.log")
+
+    sock_path = harness_core.default_socket_path()
+    try:
+        validate_and_prepare_socket_dir(sock_path)
+    except Exception as exc:
+        logger.log("ERROR", f"Socket security validation failed: {exc}")
+        print(f"harness-daemon error: {exc}", file=sys.stderr)
+        return 1
+
+    stop_signal = threading.Event()
+
+    def _handle_sig(_signum: int, _frame: Any) -> None:
+        stop_signal.set()
+
+    signal.signal(signal.SIGTERM, _handle_sig)
+    signal.signal(signal.SIGINT, _handle_sig)
+
+    lock_path = data_dir / "daemon.lock"
+    lock_fd = open(lock_path, "a+", encoding="utf-8")
+    standby_interval = max(0.1, float(os.environ.get("HARNESS_DAEMON_STANDBY_INTERVAL_SEC", "5.0")))
+
+    # Passive standby loop when another instance holds the advisory lock prevents
+    # restart_policy: "always" respawn storms while preserving automatic failover.
+    acquired = False
+    while not stop_signal.is_set():
+        try:
+            fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except BlockingIOError:
+            alive, _ = harness_core.probe_daemon_health(sock_path)
+            if alive:
+                logger.log("INFO", "Another healthy harness-daemon holds lock; waiting in passive standby.")
+            stop_signal.wait(timeout=standby_interval)
+
+    if not acquired or stop_signal.is_set():
+        lock_fd.close()
+        return 0
+
+    # Stale socket recovery once advisory lock is held
+    if sock_path.exists() or sock_path.is_symlink():
+        if sock_path.is_symlink():
+            logger.log("ERROR", f"Refusing symlink socket at {sock_path}")
+            lock_fd.close()
+            return 1
+        alive, _ = harness_core.probe_daemon_health(sock_path)
+        if not alive:
+            try:
+                sock_path.unlink()
+                logger.log("INFO", f"Removed stale Unix socket at {sock_path}")
+            except OSError as exc:
+                logger.log("ERROR", f"Cannot unlink stale socket {sock_path}: {exc}")
+                lock_fd.close()
+                return 1
+
+    pid_path = sock_path.parent / "d.pid"
+    state = HarnessDaemonState(data_dir=data_dir, logger=logger, startup_env_key_present=startup_env_key_present)
+    server = ThreadingUnixHTTPServer(str(sock_path), DaemonRequestHandler, state)
+
+    try:
+        with open(pid_path, "w", encoding="utf-8") as pf:
+            pf.write(f"{os.getpid()}\n")
+        os.chmod(pid_path, 0o600)
+    except OSError:
+        pass
+
+    watcher_thread = threading.Thread(target=state.watcher_loop, name="harness-watcher", daemon=True)
+    server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25}, name="harness-http", daemon=True)
+    watcher_thread.start()
+    server_thread.start()
+    logger.log("INFO", f"Started harness-daemon pid={os.getpid()} sock={sock_path}")
+
+    while not stop_signal.is_set():
+        stop_signal.wait(timeout=0.5)
+
+    logger.log("INFO", "Shutting down harness-daemon gracefully.")
+    state.stop_event.set()
+    state.wake_event.set()
+    try:
+        server.shutdown()
+        server.server_close()
+    except Exception:
+        pass
+    watcher_thread.join(timeout=2.0)
+
+    for cleanup_path in (sock_path, pid_path):
+        try:
+            if cleanup_path.exists():
+                cleanup_path.unlink()
+        except OSError:
+            pass
+    try:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        lock_fd.close()
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run_daemon())

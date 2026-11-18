@@ -1,0 +1,7 @@
+{
+  "display_name": "Alps Harness Daemon",
+  "description": "Zero-latency pre-computation, async graphify queue, doctor/stamp/spec caching, and warm hook evaluation for alps-agy-harness.",
+  "command": "python3",
+  "args": ["daemon.py"],
+  "restart_policy": "always"
+}

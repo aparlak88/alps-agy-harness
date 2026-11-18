@@ -17,6 +17,7 @@ Büyük dil modelleri tek başlarına bırakıldığında kapsam kaymasına (*sc
 - **Gemini 4 & `Orchestrator` Duyarlı Model ve Efor Kilidi (`overwrite`):** Ana oturumun modelini (`HOOK_INPUT.modelName`: Carbon, Argon, Hydrogen, `Orchestrator`) algılayarak alt ajan katmanlarını (`inherit`, `pro` [Argon], `flash`, `flash_lite`) ve efor bütçelerini (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`, `MAX`) düşürme kaybı olmadan fiziksel olarak kilitler.
 - **Sessiz Başarı Kalkanı (`run-quiet.sh`):** Binlerce satırlık derleme ve test loglarını süzerek bağlam penceresini korur.
 - **Sıfır-Context Ön-Eleme (`jev`):** Geçmiş dersleri ve PR diff dosyalarını ana modelin context'ini kirletmeden sunucuda değerlendirir.
+- **Sıfır Gecikmeli Arka Plan Daemon'ı (`sidecars/harness-daemon/`, `v1.1.0`):** `graphify` güncellemelerini asenkron single-flight kuyruğuna alır; `harness-doctor`, `codeTreeSha` damgaları, spec paketleri, walkthrough doğrulaması ve iOS `.ips` crash raporlarını `.harness/cache/*.json` altında önceden hazırlar. Daemon kapalıysa tüm kancalar sessizce yerel fallback'e (`scripts/lib/harness_core.py`) düşer (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir).
 
 ---
 
@@ -206,6 +207,8 @@ flowchart TD
 | | `pre-subagent-guard.sh` | Gemini 4 & `Orchestrator` duyarlı alt ajan modeli (`inherit`/`pro`/`flash`/`flash_lite`) ve efor (`LOW`–`MAX`) `overwrite` kilidi. |
 | | `post-command-hooks.sh` | Başarılı PR sonrası denetim bayrağı ve `graphify` güncellemesi. |
 | | `stop-gate.sh` | `pr-auditor` çalıştırılmadan oturumun kapanmasını engeller. |
+| **Arka Plan Sidecar (`sidecars/`)** | `harness-daemon/sidecar.json` & `daemon.py` | Sıfır gecikmeli Unix socket kanca motoru, tekil kuyruklu asenkron `graphify`, doktor/damga/spec önbelleği ve iOS crash izleyici (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir). |
+| **Ortak Çekirdek (`scripts/lib/`)** | `harness_core.py` | `harness-daemon` ile tüm yerel fallback kanca ve teşhis betikleri arasında paylaşılan tek doğruluk kaynağı. |
 | **Yardımcı Betikler** | `run-quiet.sh` | Derleme/test loglarını sessize alır; tek satır özet ve log kaydı döner. |
 | | `mobile-logs.sh` | iOS Simulator `.ips` crash ve Android Emulator logcat süzgeci. |
 | | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası, `select-model` çözümleyicisi ve subagent dispatch yöneticisi. |
@@ -241,6 +244,7 @@ flowchart TD
 | **Outbox Pattern** | Veritabanı durum değişikliği ile buna bağlı olay bildirimlerinin aynı işlemde atomik olarak kaydedilip güvenle iletilmesi deseni. |
 | **PreToolUse & PostToolUse** | Antigravity'de bir aracın çalışmasından hemen önce (Pre) ve tamamlanmasından hemen sonra (Post) tetiklenen kancalar. |
 | **Sequence Diagram** | İstemci ile sunucu arasındaki mesajlaşma ve metot çağrı sırasını adım adım gösteren zaman eksenli UML diyagramı. |
+| **Sidecar (`harness-daemon`)** | Antigravity'nin ana ajandan bağımsız yönettiği, arka plan önbellekleme ve Unix domain socket üzerinden sıcak kanca değerlendirmesi sunan yardımcı süreç. |
 | **Subagent Dispatch** | Ana ajanın alt ajan çalıştırmadan önce işin karmaşıklığını puanlayıp uygun model ve efor profilini damgalaması süreci. |
 | **Ubiquitous Language** | Ekip, dokümanlar ve kaynak kod arasında terim karmaşasını önlemek için kullanılan ortak ve tekil alan dili sözlüğü. |
 | **Walkthrough** | Bir PR'ın mimari kararlarını, değişen katmanlarını ve doğrulama kanıtlarını görsel diyagramlarla anlatan rehber doküman. |
