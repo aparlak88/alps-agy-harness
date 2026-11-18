@@ -39,8 +39,10 @@ fi
 
 # Share boolean-only key presence hint (never the secret string itself)
 env_key_present=false
-if [ -n "${TYPESAFE_API_KEY:-}" ]; then
-  case "${TYPESAFE_API_KEY}" in
+trimmed_key="${TYPESAFE_API_KEY:-}"
+trimmed_key="${trimmed_key//[[:space:]]/}"
+if [ -n "$trimmed_key" ]; then
+  case "$trimmed_key" in
     \<*\>) ;;
     *) env_key_present=true ;;
   esac

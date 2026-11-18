@@ -132,18 +132,18 @@ Hem `daemon.py` tarafından doğrudan `import` edilen hem de fallback betikleri 
 | `parse_command_segments(cmd_line)` | `shlex` tabanlı alıntı duyarlı komut ayrıştırma ve `env`/`sudo`/`nohup`/`time` sarmalayıcı temizliği (`common.sh` ile birebir aynı davranış). |
 | `extract_install_packages(tokens)` | `npm`, `pnpm`, `yarn`, `dotnet`, `uv`, `cargo` paket kurulum hedefi ayıklama (`pre-command-guard.sh` Gate 3 mantığı). |
 | `build_spec_package_index(workspace)` | `docs/superpowers/specs/*.md` dosyalarının `## Global Constraints` bölümlerini `mtimeNs` + `size` metadata'sıyla indeksler. |
-| `check_package_in_spec_index(pkg, index)` | Token-sınır regex'i (`(?:^|[^A-Za-z0-9_./@-])...`) ile paket doğrulaması yapar. |
+| `_check_pkg_in_specs_with_index(workspace, pkg, spec_index)` | Token-sınır regex'i (`(?:^|[^A-Za-z0-9_./@-])...`) ile paket doğrulaması yapar. |
 | `has_glossary_section(text)` | Fenced code block dışındaki son `## ` başlığının boş olmayan `Teknik Terimler Sözlüğü` / `Technical Glossary` olduğunu doğrular. |
 | `validate_walkthrough(wt_text, diff_files)` | `>= 2` ` ```mermaid ` bloğu, şablon yer tutucu yasağı, `## Dosya Bazlı Değişiklik Analizi` ve her diff dosyası için `>= 25` karakterlik *Ne/Neden* açıklamasını doğrular. |
 | `compute_code_tree_sha(workspace)` | `docs/walkthroughs/*` ve `docs/parking-lot.md` hariç deterministik Git tree SHA üretir (`HEAD` yoksa `"UNBORN"`). |
 | `compute_tree_and_stamp_state(workspace)` | Aktif `HEAD` OID, `branch`, `slug`, `codeTreeSha`, `canon-pass.json`, `security-pass.json` ve `pr-audit-pending.json` tazelik özetini hesaplar. |
 | `parse_ios_crash_report(diag_dir, bundle_id)` | En güncel `.ips`/`.crash` dosyasından process, bundleID, exception, termination ve ilk 25 frame özetini çıkarır (`mobile-logs.sh` ile paylaşılır). |
 | `run_doctor_checks(...)` | `harness-doctor.sh` içindeki tüm CLI, plugin, subagent frontmatter, 8 MCP, sıfır-sızıntılı `TYPESAFE_API_KEY`, LSP/mobil ve `harness_daemon` kontrollerini çalıştırır. |
-| `evaluate_session_start(workspace, payload)` | Önbellekteki/taze doktor uyarılarını, bayat damga uyarılarını, `graphify` durumunu ve varsa taze mobil crash özetini oturum enjeksiyon metnine dönüştürür. |
-| `evaluate_pre_command(workspace, payload)` | 4 kapıyı (`mobile log stream`, `PR-only main/master + local merge`, `package install`, `5-point gh pr create`) yerel kurallarla birebir değerlendirir. |
+| `build_session_start_payload(workspace, payload, ...)` | Önbellekteki/taze doktor uyarılarını, bayat damga uyarılarını, `graphify` durumunu ve varsa taze mobil crash özetini oturum enjeksiyon metnine dönüştürür. |
+| `evaluate_pre_command(workspace, payload, spec_index, doc_cache)` | 4 kapıyı (`mobile log stream`, `PR-only main/master + local merge`, `package install`, `5-point gh pr create`) yerel kurallarla birebir değerlendirir. |
 | `evaluate_pre_edit(workspace, payload)` | 3 kuralı (`main/master lock`, `glossary gate`, `dangerous patterns & secret prevention`) birebir değerlendirir. |
 
-**Fallback CLI Arayüzü:** `python3 scripts/lib/harness_core.py <subcommand> ...` (`eval-pre-command`, `eval-pre-edit`, `eval-session-start`, `doctor`, `parse-ios-crash`, `validate-walkthrough`, `has-glossary`, `parse-segments`) şeklinde çağrıldığında `stdin` üzerinden hook JSON'unu okuyup kancanın beklediği JSON kararını (`emit_allow`/`emit_deny`/`emit_force_ask`/`injectSteps`) üretir.
+**Fallback CLI Arayüzü:** `python3 scripts/lib/harness_core.py <subcommand> ...` (`eval-pre-command`, `eval-pre-edit`, `eval-post-command`, `eval-session-start`, `doctor`, `parse-ios-crash`, `validate-walkthrough`, `parse-segments`) şeklinde çağrıldığında `stdin` üzerinden hook JSON'unu okuyup kancanın beklediği JSON kararını (`emit_allow`/`emit_deny`/`emit_force_ask`/`injectSteps`) üretir.
 
 ### 4.3. Çoklu Çalışma Alanı Kaydı, `.harness-ignore` ve Yaşam Döngüsü
 - **Kayıt Defteri (`workspaces.json`):** Daemon başlangıçta sabit bir workspace'e bağlı değildir. Kancalardan gelen her istek `workspace` yolunu normalize edip (`os.path.realpath`) `HARNESS_DAEMON_DATA_DIR/workspaces.json` içinde kaydeder veya `lastSeenAt` zaman damgasını günceller.
@@ -179,13 +179,13 @@ Tüm dosyalar hedef projenin `.harness/cache/` dizininde saklanır (`.gitignore`
    - **Güvenlik Kuralı:** `TYPESAFE_API_KEY` değeri asla okunup saklanmaz, yalnızca `"present"` / `"missing"` bilgisi tutulur.
 2. **`tree-state.json`**:
    - `{computedAt, headOid, branch, slug, codeTreeSha, canonStampValid, canonStampSha, securityStampValid, securityStampSha, prAuditPending}`
-   - **Kriptografik Tazelik Kuralı:** Tüketiciler `tree-state.json` içindeki `codeTreeSha` değerini yalnızca `headOid == git rev-parse HEAD` (veya `UNBORN` eşleşmesi) sağlanıyorsa geçerli kabul eder; aksi durumda anında `harness_code_tree_sha` ile yeniden hesaplar.
+   - **Kriptografik Tazelik Kuralı:** `session-start` ve UI bildirimleri `tree-state.json` içindeki bilgileri yalnızca `headOid == git rev-parse HEAD` (veya `UNBORN` eşleşmesi) sağlanıyorsa kullanır. PR açılışı güvenlik kapısı (`verify_pr_stamps`) ise disk önbelleği manipülasyonuna karşı **asla** yerel disk `tree-state.json` verisine güvenmez ve her zaman canlı `compute_code_tree_sha(workspace)` hesaplar.
 3. **`spec-packages.json`**:
-   - `{updatedAt, specs: {"docs/superpowers/specs/foo.md": {mtimeNs, size, packagesText, tokens: [...]}}}`
-   - `pre-command` Gate 3 paket kontrolünde her spec dosyasının güncel `os.stat().st_mtime_ns` ve `st_size` değeri önbellekle eşleşirse diskten tekrar okuma ve bölüm ayıklama atlanır.
+   - `{schemaVersion, updatedAt, specs: {"docs/superpowers/specs/foo.md": {mtimeNs, size, sectionText}}}`
+   - `pre-command` Gate 3 paket kontrolünde daemon içi bellek önbelleğindeki spec dosyasının `mtimeNs` ve `size` değeri güncel disk durumuyla eşleşirse tekrar diskten okuma ve bölüm ayıklama atlanır.
 4. **`doc-validation.json`**:
-   - `{updatedAt, docs: {"docs/walkthroughs/x.md": {mtimeNs, size, hasGlossary, walkthroughValidForDiffKey, walkthroughError}}}`
-   - `diffKey` olarak `<baseSha>..<headOid>` (kirli ağaçta kullanılmaz) tutulur; PR kapısı için önceden doğrulanmış durum sağlar.
+   - `{schemaVersion, updatedAt, docs: {"docs/walkthroughs/x.md": {mtimeNs, size, hasGlossary, diffKey, walkthroughValid, walkthroughError}}}`
+   - `diffKey` olarak `<baseSha>..<headOid>` (kirli ağaçta kullanılmaz) tutulur; PR kapısı için daemon RAM üzerinden doğrulanmış durum sağlar.
 5. **`graphify-status.json`**:
    - `{state: "idle"|"queued"|"running"|"succeeded"|"failed"|"missing", lastHeadSha, queuedAt, startedAt, finishedAt, durationMs, exitCode, logPath}`
    - Aynı workspace için aynı anda yalnızca 1 `graphify` alt süreci çalışır (*single-flight*); çalışırken yeni istek gelirse `rerunPending = true` işaretlenip mevcut işlem bitince bir kez daha çalıştırılır ve `3` sn debounce uygulanır.
@@ -216,9 +216,10 @@ Tüm dosyalar hedef projenin `.harness/cache/` dizininde saklanır (`.gitignore`
 - **IPC Ortam İzolasyonu (`[Builder Call]`):** Soket istemcileri `/hook/*` veya `/event/*` JSON yükleriyle `PATH`, `HARNESS_GRAPHIFY_BIN`, `HARNESS_GH_BIN`, `HARNESS_CONFIG_DIR` ya da `HARNESS_DIAG_REPORTS_DIR` gibi çalıştırılabilir ikili/yol geçersiz kılmaları gönderemez; daemon yalnızca kendi başlatma ortamını kullanır. İzole testler mock ikilileri doğrudan test daemon sürecinin kendi ortamına geçirir.
 - **Sıfır Gizli Anahtar Sızıntısı (`[Builder Call]`):** `daemon.py` başlangıçta `TYPESAFE_API_KEY` değişkeninin yalnızca boolean varlığını (`startup_env_key_present`) yakalayıp hemen `os.environ` içinden temizler; sonraki `300s` doktor yenilemeleri yalnızca bu başlangıç bayrağına, kancadan gelen boolean `envKeyPresent` ipucuna, `~/.config/typesafe/key` dosyasına ve `mcp_config.json` yapılandırmasına bakar. `health.json`, `daemon.log` ve HTTP yanıtlarına asla anahtar değeri değil yalnızca `"present"` / `"missing"` yazılır.
 - **Hata Kapalı (*Fail-Closed*) Fallback:** Daemon yanıtındaki her ağ, zaman aşımı, HTTP hata kodu veya JSON biçim bozukluğu doğrudan yerel deterministik doğrulamaya düşer; hiçbir koruma kapısı sessizce atlanmaz.
+- **Disk Önbelleği Zehirlenmesine Karşı Güven Sınırı:** Zorlayıcı karar yolları (`/hook/pre-command`, soğuk fallback `eval-pre-command` ve daemon içi önbellek tohumlaması) çalışma alanı içindeki `.harness/cache/*.json` dosyalarını diskten okuyup güvenmez; yalnızca daemon'ın kendi belleğinde hesapladığı önbellekler veya canlı Git/dosya kontrolleri esas alınır.
 
-### 5.2. Doğrulama ve Test Planı (`tests/test-sidecar-daemon.sh` + Mevcut 8 Test Paketi)
-Uygulama sonrasında mevcut 8 test paketi (`tests/run-all.sh`) korunarak yeni `tests/test-sidecar-daemon.sh` paketi eklenir ve 9 paketin tamamı (`bash tests/run-all.sh`) sıfır hata ile doğrulanır:
+### 5.2. Doğrulama ve Test Planı (`tests/test-sidecar-daemon.sh` — 12 Senaryo + Mevcut 8 Test Paketi)
+Uygulama sonrasında mevcut 8 test paketi (`tests/run-all.sh`) korunarak yeni `tests/test-sidecar-daemon.sh` paketi (12 senaryo) eklenir ve 9 paketin tamamı (`bash tests/run-all.sh`) sıfır hata ile doğrulanır:
 
 1. **Manifest ve Başlangıç:** `sidecars/harness-daemon/sidecar.json` alan doğrulaması (`snake_case`, `restart_policy: "always"`, geçerli script yolu), daemon açılışı, `GET /health` yanıtı, tekil örnek/bayat soket kurtarma ve `SIGTERM` temiz kapanış.
 2. **Daemon Açık / Kapalı Parite Testleri:** `session-start.sh`, `pre-edit-guard.sh`, `pre-command-guard.sh` ve `post-command-hooks.sh` betiklerinin aynı senaryolarda daemon açıkken ve `HARNESS_DISABLE_DAEMON=1` iken birebir aynı kararları (`allow`/`deny`/`force_ask`) ürettiğinin doğrulanması.
@@ -229,6 +230,7 @@ Uygulama sonrasında mevcut 8 test paketi (`tests/run-all.sh`) korunarak yeni `t
 7. **`.harness-ignore` & Çalışma Alanı TTL Eviction:** `.harness-ignore` bulunan çalışma alanının muaf kalması ve düşük TTL (`HARNESS_DAEMON_WORKSPACE_TTL_SEC=1`) ile kullanılmayan çalışma alanının kayıttan düşmesi.
 8. **Koşullu Mobil Crash İzleyici:** Sahte `.xcodeproj` + sahte `HARNESS_DIAG_REPORTS_DIR/*.ips` ile `mobile-crashes.json` oluşması; mobil olmayan çalışma alanında bu dosyanın hiç oluşturulmaması.
 9. **`harness-doctor.sh` Güvenlik & Daemon Kontrolü:** Gizli anahtar değerinin ne terminal çıktısına ne de `.harness/cache/health.json` dosyasına yazılmadığının kanıtlanması ve `harness_daemon` `OK`/`INFO`/`FAIL` durumları.
+10. **İstemci Soket Güvenliği & Bağlı Worktree İzleme:** İstemcilerin güvensiz izinli (`0755`) veya symlink soketi reddetmesi, sahte aynı-`headOid` `tree-state.json` zehirlenmesinin soğuk yedek ve daemon'da engellenmesi ve `git worktree add` ile bağlanan worktree'lerin değişimlerinin/asenkron `graphify` tetiklemelerinin izlenmesi.
 
 ---
 

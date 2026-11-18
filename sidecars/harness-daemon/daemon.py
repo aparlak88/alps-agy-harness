@@ -255,20 +255,25 @@ class HarnessDaemonState:
         with self._lock:
             return sum(1 for item in self._graphify_queue.values() if item.get("queued") or item.get("running"))
 
-    def get_caches(self, ws_path: Path) -> dict[str, Any]:
-        """Return shallow copy of in-memory caches for ``ws_path``, hydrating from disk if needed."""
+    def get_caches(self, ws_path: Path, allow_disk_hydration: bool = True) -> dict[str, Any]:
+        """Return shallow copy of in-memory caches for ``ws_path``, optionally hydrating missing keys."""
         ws_key = str(ws_path)
         with self._lock:
             entry = dict(self._caches.get(ws_key, {}))
-        if not entry:
-            entry = {
-                "health": harness_core.read_json_file(ws_path / ".harness" / "cache" / "health.json"),
-                "treeState": harness_core.read_json_file(ws_path / ".harness" / "cache" / "tree-state.json"),
-                "specPackages": harness_core.read_json_file(ws_path / ".harness" / "cache" / "spec-packages.json"),
-                "docValidation": harness_core.read_json_file(ws_path / ".harness" / "cache" / "doc-validation.json"),
-                "graphifyStatus": harness_core.read_json_file(ws_path / ".harness" / "cache" / "graphify-status.json"),
-                "mobileCrashes": harness_core.read_json_file(ws_path / ".harness" / "cache" / "mobile-crashes.json"),
-            }
+        if not allow_disk_hydration:
+            return entry
+        cache_files = {
+            "health": "health.json",
+            "treeState": "tree-state.json",
+            "specPackages": "spec-packages.json",
+            "docValidation": "doc-validation.json",
+            "graphifyStatus": "graphify-status.json",
+            "mobileCrashes": "mobile-crashes.json",
+        }
+        cache_dir = ws_path / ".harness" / "cache"
+        for key, filename in cache_files.items():
+            if entry.get(key) is None:
+                entry[key] = harness_core.read_json_file(cache_dir / filename)
         return entry
 
     def enqueue_graphify(self, ws_path: Path, reason: str) -> None:
@@ -316,27 +321,56 @@ class HarnessDaemonState:
             pass
         self.wake_event.set()
 
+    def _resolve_git_dirs(self, ws_path: Path) -> tuple[Optional[Path], Optional[Path]]:
+        """Resolve per-worktree git_dir and shared git_common_dir without spawning git."""
+        dot_git = ws_path / ".git"
+        if dot_git.is_dir():
+            return dot_git, dot_git
+        if dot_git.is_file():
+            try:
+                raw = dot_git.read_text(encoding="utf-8", errors="ignore")
+                for line in raw.splitlines():
+                    if line.startswith("gitdir:"):
+                        gd_raw = line.split(":", 1)[1].strip()
+                        git_dir = Path(gd_raw) if os.path.isabs(gd_raw) else (ws_path / gd_raw).resolve()
+                        if not git_dir.is_dir():
+                            return None, None
+                        common_file = git_dir / "commondir"
+                        if common_file.is_file():
+                            cd_raw = common_file.read_text(encoding="utf-8", errors="ignore").strip()
+                            common_dir = Path(cd_raw) if os.path.isabs(cd_raw) else (git_dir / cd_raw).resolve()
+                            return git_dir, common_dir
+                        return git_dir, git_dir
+            except OSError:
+                return None, None
+        return None, None
+
     def _signature_for_workspace(self, ws_path: Path, is_ios: bool) -> dict[str, Any]:
         """Compute lightweight mtime signature across watched workspace paths."""
-        git_dir = ws_path / ".git"
+        git_dir, common_dir = self._resolve_git_dirs(ws_path)
         git_mtimes: dict[str, int] = {}
-        for rel in ("HEAD", "packed-refs", "index"):
-            p = git_dir / rel
-            if p.is_file():
+        if git_dir is not None:
+            for rel, base_dir in (("HEAD", git_dir), ("index", git_dir), ("packed-refs", common_dir or git_dir)):
+                p = base_dir / rel
+                if p.is_file():
+                    try:
+                        git_mtimes[rel] = p.stat().st_mtime_ns
+                    except OSError:
+                        pass
+            head_file = git_dir / "HEAD"
+            if head_file.is_file():
                 try:
-                    git_mtimes[rel] = p.stat().st_mtime_ns
+                    head_txt = head_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    if head_txt.startswith("ref:"):
+                        ref_rel = head_txt.split(":", 1)[1].strip()
+                        ref_base = common_dir or git_dir
+                        ref_p = ref_base / ref_rel
+                        if not ref_p.is_file():
+                            ref_p = git_dir / ref_rel
+                        if ref_p.is_file():
+                            git_mtimes[ref_rel] = ref_p.stat().st_mtime_ns
                 except OSError:
                     pass
-        if (git_dir / "HEAD").is_file():
-            try:
-                head_txt = (git_dir / "HEAD").read_text(encoding="utf-8", errors="ignore").strip()
-                if head_txt.startswith("ref:"):
-                    ref_rel = head_txt.split(":", 1)[1].strip()
-                    ref_p = git_dir / ref_rel
-                    if ref_p.is_file():
-                        git_mtimes[ref_rel] = ref_p.stat().st_mtime_ns
-            except OSError:
-                pass
 
         slug = harness_core.get_branch_slug(ws_path)
         state_mtimes: dict[str, int] = {}
@@ -425,11 +459,10 @@ class HarnessDaemonState:
 
         now = time.time()
         if (now - last_mobile_check) >= 120.0 or "_hasIos" not in cache_entry:
-            has_ios, has_android = harness_core.detect_mobile_workspace(ws_path)
+            has_ios, _ = harness_core.detect_mobile_workspace(ws_path)
             with self._lock:
                 c = self._caches.setdefault(ws_key, {})
                 c["_hasIos"] = has_ios
-                c["_hasAndroid"] = has_android
                 c["_lastMobileDetect"] = now
         else:
             has_ios = bool(cache_entry.get("_hasIos"))
@@ -440,7 +473,7 @@ class HarnessDaemonState:
         # 1. Tree state & HEAD change detection
         tree_file_missing = not (cache_dir / "tree-state.json").is_file()
         if tree_file_missing or sig["git"] != prev_sig.get("git") or sig["state"] != prev_sig.get("state"):
-            prev_tree = cache_entry.get("treeState") or harness_core.read_json_file(cache_dir / "tree-state.json")
+            prev_tree = cache_entry.get("treeState")
             new_tree = harness_core.compute_tree_and_stamp_state(ws_path, existing_cache=prev_tree)
             harness_core.atomic_write_json(cache_dir, "tree-state.json", new_tree)
             with self._lock:
@@ -454,7 +487,7 @@ class HarnessDaemonState:
         # 2. Spec package index
         spec_file_missing = not (cache_dir / "spec-packages.json").is_file()
         if spec_file_missing or sig["specs"] != prev_sig.get("specs"):
-            prev_spec = cache_entry.get("specPackages") or harness_core.read_json_file(cache_dir / "spec-packages.json")
+            prev_spec = cache_entry.get("specPackages")
             new_spec = harness_core.build_spec_package_index(ws_path, existing_index=prev_spec)
             harness_core.atomic_write_json(cache_dir, "spec-packages.json", new_spec)
             with self._lock:
@@ -463,18 +496,18 @@ class HarnessDaemonState:
         # 3. Doc validation cache
         doc_file_missing = not (cache_dir / "doc-validation.json").is_file()
         if doc_file_missing or sig["docs"] != prev_sig.get("docs") or sig["git"] != prev_sig.get("git"):
-            prev_doc = cache_entry.get("docValidation") or harness_core.read_json_file(cache_dir / "doc-validation.json")
+            prev_doc = cache_entry.get("docValidation")
             new_doc = harness_core.build_doc_validation_cache(ws_path, existing_cache=prev_doc)
             harness_core.atomic_write_json(cache_dir, "doc-validation.json", new_doc)
             with self._lock:
                 self._caches.setdefault(ws_key, {})["docValidation"] = new_doc
 
         # 4. Doctor health cache (TTL + config mtimes; never writes secret values)
-        prev_health = cache_entry.get("health") or harness_core.read_json_file(cache_dir / "health.json")
+        prev_health = cache_entry.get("health")
         health_epoch = float(prev_health.get("epoch", 0)) if isinstance(prev_health, dict) else 0.0
         health_expired = (now - health_epoch) >= self.health_ttl_sec
         if force_health or prev_health is None or health_expired or sig["cfg"] != prev_sig.get("cfg"):
-            effective_env_key = self.startup_env_key_present or bool(env_hint)
+            effective_env_key = bool(env_hint) if env_hint is not None else self.startup_env_key_present
             doctor_res = harness_core.run_doctor_checks(
                 ws_path,
                 env_key_present=effective_env_key,
@@ -517,6 +550,7 @@ class HarnessDaemonState:
             self._dirty_workspaces.discard(ws_key)
 
     def _run_graphify_job(self, ws_key: str, reason: str) -> None:
+        """Execute a single-flight incremental graphify run and update ``graphify-status.json``."""
         ws_path = Path(ws_key)
         started_at = harness_core.utc_now_iso()
         t0 = time.monotonic()
@@ -646,11 +680,20 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
 
     protocol_version = "HTTP/1.1"
 
+    def setup(self) -> None:
+        """Bind a bounded per-connection socket timeout before parsing HTTP headers."""
+        super().setup()
+        try:
+            self.connection.settimeout(5.0)
+        except Exception:
+            pass
+
     def address_string(self) -> str:
-        # UnixStreamServer passes an empty string client_address; avoid IndexError in BaseHTTPRequestHandler.
+        """Return static local identifier because UnixStreamServer omits TCP client tuples."""
         return "unix-local"
 
     def log_message(self, format: str, *args: Any) -> None:
+        """Suppress noisy BaseHTTPRequestHandler stderr logging."""
         return
 
     def _send_json(self, status_code: int, payload: Any) -> None:
@@ -749,12 +792,11 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
             if ignored:
                 self._send_json(200, {"decision": "allow"})
                 return
-            caches = state.get_caches(ws_path)
+            caches = state.get_caches(ws_path, allow_disk_hydration=False)
             resp = harness_core.evaluate_pre_command(
                 ws_path,
                 body,
                 spec_index=caches.get("specPackages"),
-                tree_state=caches.get("treeState"),
                 doc_cache=caches.get("docValidation"),
             )
             self._send_json(200, resp)
@@ -892,14 +934,17 @@ def run_daemon() -> int:
             lock_fd.close()
             return 1
         alive, _ = harness_core.probe_daemon_health(sock_path)
-        if not alive:
-            try:
-                sock_path.unlink()
-                logger.log("INFO", f"Removed stale Unix socket at {sock_path}")
-            except OSError as exc:
-                logger.log("ERROR", f"Cannot unlink stale socket {sock_path}: {exc}")
-                lock_fd.close()
-                return 1
+        if alive:
+            logger.log("ERROR", f"Socket {sock_path} is already served by an active process after lock acquisition; exiting cleanly.")
+            lock_fd.close()
+            return 1
+        try:
+            sock_path.unlink()
+            logger.log("INFO", f"Removed stale Unix socket at {sock_path}")
+        except OSError as exc:
+            logger.log("ERROR", f"Cannot unlink stale socket {sock_path}: {exc}")
+            lock_fd.close()
+            return 1
 
     pid_path = sock_path.parent / "d.pid"
     state = HarnessDaemonState(data_dir=data_dir, logger=logger, startup_env_key_present=startup_env_key_present)

@@ -114,13 +114,19 @@ def is_harness_ignored(workspace: Path) -> bool:
 
 
 def _run_git(workspace: Path, args: list[str], stdin_data: Optional[str] = None) -> subprocess.CompletedProcess[str]:
-    """Run a git command scoped to ``workspace`` with text output."""
-    return subprocess.run(
-        ["git", "-C", str(workspace), *args],
-        input=stdin_data,
-        capture_output=True,
-        text=True,
-    )
+    """Run a bounded git command scoped to ``workspace`` with text output."""
+    cmd = ["git", "-C", str(workspace), *args]
+    timeout_sec = max(1, int(os.environ.get("HARNESS_GIT_TIMEOUT_SEC", "15")))
+    try:
+        return subprocess.run(
+            cmd,
+            input=stdin_data,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(args=cmd, returncode=124, stdout="", stderr="git timed out")
 
 
 def ensure_harness_git_exclude(workspace: Path) -> None:
@@ -449,18 +455,6 @@ def build_spec_package_index(workspace: Path, existing_index: Optional[dict[str,
         "updatedAt": utc_now_iso(),
         "specs": specs,
     }
-
-
-def check_package_in_spec_index(pkg: str, spec_index: dict[str, Any]) -> bool:
-    """Check token-boundary presence of ``pkg`` in any indexed ``## Global Constraints`` section."""
-    pat = re.compile(r"(?:^|[^A-Za-z0-9_./@-])" + re.escape(pkg) + r"(?:$|@[0-9^~>=<]|[^A-Za-z0-9_./@-])")
-    specs = spec_index.get("specs", {}) if isinstance(spec_index, dict) else {}
-    for entry in specs.values():
-        if isinstance(entry, dict):
-            section = entry.get("sectionText", "")
-            if section and pat.search(section):
-                return True
-    return False
 
 
 def has_glossary_section(text: str) -> bool:
@@ -844,20 +838,13 @@ def compute_tree_and_stamp_state(workspace: Path, existing_cache: Optional[dict[
     }
 
 
-def verify_pr_stamps(workspace: Path, cached_tree_state: Optional[dict[str, Any]] = None) -> tuple[bool, str]:
+def verify_pr_stamps(workspace: Path) -> tuple[bool, str]:
     """Verify canon-pass.json and security-pass.json against live HEAD codeTreeSha."""
     live_head = get_head_oid(workspace)
     if live_head == "UNBORN":
         return False, "Error: verify-pr-stamps failed: repository HEAD is UNBORN (no commits found)"
 
-    if (
-        isinstance(cached_tree_state, dict)
-        and cached_tree_state.get("headOid") == live_head
-        and cached_tree_state.get("codeTreeSha")
-    ):
-        current_sha = str(cached_tree_state["codeTreeSha"])
-    else:
-        current_sha = compute_code_tree_sha(workspace)
+    current_sha = compute_code_tree_sha(workspace)
 
     if current_sha == "UNBORN":
         return False, "Error: verify-pr-stamps failed: repository HEAD is UNBORN (no commits found)"
@@ -1101,7 +1088,6 @@ def evaluate_pre_command(
     workspace: Path,
     hook_input: dict[str, Any],
     spec_index: Optional[dict[str, Any]] = None,
-    tree_state: Optional[dict[str, Any]] = None,
     doc_cache: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Evaluate all 4 PreToolUse command gates deterministically."""
@@ -1378,7 +1364,7 @@ def evaluate_pre_command(
                                     "reason": f"PR creation blocked: documentation file '{f}' is missing a valid Technical Glossary / Teknik Terimler Sözlüğü section.",
                                 }
 
-                stamps_ok, verify_err = verify_pr_stamps(workspace, cached_tree_state=tree_state)
+                stamps_ok, verify_err = verify_pr_stamps(workspace)
                 if not stamps_ok:
                     return {
                         "decision": "deny",
@@ -1793,7 +1779,7 @@ def is_safe_socket_path(sock: Path) -> bool:
         return False
 
 
-def probe_daemon_health(sock_path: Optional[Path] = None, timeout_sec: float = 0.25) -> tuple[bool, Optional[dict[str, Any]]]:
+def probe_daemon_health(sock_path: Optional[Path] = None, timeout_sec: float = DEFAULT_DAEMON_TIMEOUT_SEC) -> tuple[bool, Optional[dict[str, Any]]]:
     """Query ``GET /health`` over the Unix domain socket if present, safe, and non-disabled."""
     if os.environ.get("HARNESS_DISABLE_DAEMON") == "1":
         return False, None
@@ -1881,22 +1867,29 @@ def run_doctor_checks(
             c.update(extra)
         checks.append(c)
 
+    def _safe_cmd_run(cmd: list[str], timeout_sec: float = 10.0) -> Optional[subprocess.CompletedProcess[str]]:
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+        except Exception:
+            return None
+
     # 1. CLI Tools & GitHub Auth
     if shutil.which("git"):
-        v = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout.strip()
-        add_check("git", "cli", "OK", v)
+        res = _safe_cmd_run(["git", "--version"])
+        add_check("git", "cli", "OK" if res else "FAIL", res.stdout.strip() if res else "git --version timed out")
     else:
         add_check("git", "cli", "FAIL", "git is not installed", "brew install git")
 
     if shutil.which("jq"):
-        v = subprocess.run(["jq", "--version"], capture_output=True, text=True).stdout.strip()
-        add_check("jq", "cli", "OK", f"jq {v}")
+        res = _safe_cmd_run(["jq", "--version"])
+        add_check("jq", "cli", "OK" if res else "FAIL", f"jq {res.stdout.strip()}" if res else "jq --version timed out")
     else:
         add_check("jq", "cli", "FAIL", "jq is not installed", "brew install jq")
 
     node_path = shutil.which("node")
     if node_path:
-        v = subprocess.run([node_path, "-v"], capture_output=True, text=True).stdout.strip()
+        res = _safe_cmd_run([node_path, "-v"])
+        v = res.stdout.strip() if res else ""
         try:
             major = int(v.lstrip("v").split(".")[0])
             if major >= 20:
@@ -1909,21 +1902,21 @@ def run_doctor_checks(
         add_check("node", "cli", "FAIL", "node is not installed", "brew install node")
 
     if shutil.which("python3"):
-        v = subprocess.run(["python3", "--version"], capture_output=True, text=True).stdout.strip()
-        add_check("python3", "cli", "OK", v)
+        res = _safe_cmd_run(["python3", "--version"])
+        add_check("python3", "cli", "OK" if res else "FAIL", res.stdout.strip() if res else "python3 --version timed out")
     else:
         add_check("python3", "cli", "FAIL", "python3 is not installed", "brew install python")
 
     if shutil.which("uv"):
-        v = subprocess.run(["uv", "--version"], capture_output=True, text=True).stdout.strip()
-        add_check("uv", "cli", "OK", v)
+        res = _safe_cmd_run(["uv", "--version"])
+        add_check("uv", "cli", "OK" if res else "FAIL", res.stdout.strip() if res else "uv --version timed out")
     else:
         add_check("uv", "cli", "FAIL", "uv is not installed", "curl -LsSf https://astral.sh/uv/install.sh | sh")
 
     gh_path = shutil.which(gh_cmd) or (gh_cmd if os.path.isabs(gh_cmd) and os.path.isfile(gh_cmd) else None)
     if gh_path:
-        res = subprocess.run([gh_path, "auth", "status"], capture_output=True, text=True)
-        if res.returncode == 0:
+        res = _safe_cmd_run([gh_path, "auth", "status"])
+        if res is not None and res.returncode == 0:
             add_check("gh_auth", "cli", "OK", "GitHub CLI authenticated")
         else:
             add_check("gh_auth", "cli", "FAIL", "GitHub CLI not authenticated", "gh auth login")
@@ -2463,12 +2456,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_wt.add_argument("--wt-file", default="")
     p_wt.add_argument("--diff-file", default="")
 
-    p_gl = sub.add_parser("has-glossary")
-
-    p_sha = sub.add_parser("code-tree-sha")
-    p_sha.add_argument("--workspace", default=".")
-    p_sha.add_argument("--ref", default="HEAD")
-
     for hook_sub in ("eval-pre-command", "eval-pre-edit", "eval-post-command", "eval-session-start"):
         ph = sub.add_parser(hook_sub)
         ph.add_argument("--workspace", default="")
@@ -2497,14 +2484,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 1
         return 0
 
-    if args.subcommand == "has-glossary":
-        text = sys.stdin.read()
-        return 0 if has_glossary_section(text) else 1
-
-    if args.subcommand == "code-tree-sha":
-        print(compute_code_tree_sha(Path(args.workspace), ref=args.ref))
-        return 0
-
     if args.subcommand == "eval-pre-edit":
         payload = _read_stdin_json()
         ws = _resolve_workspace_arg(args.workspace or None, payload)
@@ -2514,10 +2493,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.subcommand == "eval-pre-command":
         payload = _read_stdin_json()
         ws = _resolve_workspace_arg(args.workspace or None, payload)
-        spec_index = read_json_file(ws / ".harness" / "cache" / "spec-packages.json")
-        tree_state = read_json_file(ws / ".harness" / "cache" / "tree-state.json")
-        doc_cache = read_json_file(ws / ".harness" / "cache" / "doc-validation.json")
-        print(json.dumps(evaluate_pre_command(ws, payload, spec_index=spec_index, tree_state=tree_state, doc_cache=doc_cache)))
+        print(json.dumps(evaluate_pre_command(ws, payload)))
         return 0
 
     if args.subcommand == "eval-post-command":

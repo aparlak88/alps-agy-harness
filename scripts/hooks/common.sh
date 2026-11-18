@@ -28,7 +28,7 @@ harness_is_safe_daemon_socket() {
   [ -n "$sock_dir" ] || return 1
   [ ! -L "$sock_dir" ] && [ -d "$sock_dir" ] && [ -O "$sock_dir" ] || return 1
   local dir_mode
-  dir_mode="$(stat -f '%Lp' "$sock_dir" 2>/dev/null || stat -c '%a' "$sock_dir" 2>/dev/null || true)"
+  dir_mode="$(stat -c '%a' "$sock_dir" 2>/dev/null || stat -f '%Lp' "$sock_dir" 2>/dev/null || true)"
   [[ "$dir_mode" =~ ^[0-7]+$ ]] || return 1
   [ "$(( 8#$dir_mode & 8#077 ))" -eq 0 ] || return 1
   [ ! -L "$sock" ] && [ -S "$sock" ] && [ -O "$sock" ] || return 1

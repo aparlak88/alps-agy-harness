@@ -423,16 +423,45 @@ EOF
   git -C "$repo" add docs/walkthroughs/2026-11-19-stamps.md
   git -C "$repo" commit -m "docs: add walkthrough" --quiet
 
-  local old_sha
+  local latest_head old_sha
+  latest_head=$(git -C "$repo" rev-parse HEAD)
+  _wait_for_file_jq "$tree_cache" ".headOid == \"$latest_head\"" 50 || {
+    echo "tree-state.json did not advance to walkthrough commit HEAD" >&2
+    return 1
+  }
   old_sha=$(jq -r '.canonStampSha' "$tree_cache")
-  jq -c --arg sha "$old_sha" '.codeTreeSha = $sha | .canonStampValid = true | .securityStampValid = true' "$tree_cache" > "$tree_cache.tmp"
+  jq -c --arg head "$latest_head" --arg sha "$old_sha" \
+    '.headOid = $head | .codeTreeSha = $sha | .canonStampValid = true | .securityStampValid = true' \
+    "$tree_cache" > "$tree_cache.tmp"
   mv "$tree_cache.tmp" "$tree_cache"
 
-  local pr_out
+  local pr_out pr_cold_out
   pr_out=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}}' \
     | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
-  assert_json_field "$pr_out" ".decision" "deny" "Stale tree-state cache must never allow gh pr create"
-  assert_contains "$(printf '%s' "$pr_out" | jq -r '.reason')" "PR stamps verification failed" "PR deny reason must reach stamp verification"
+  assert_json_field "$pr_out" ".decision" "deny" "Forged same-headOid tree-state cache must never allow gh pr create under daemon"
+  assert_contains "$(printf '%s' "$pr_out" | jq -r '.reason')" "PR stamps verification failed" "PR deny reason must reach stamp verification (daemon)"
+
+  pr_cold_out=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}}' \
+    | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
+  assert_json_field "$pr_cold_out" ".decision" "deny" "Forged same-headOid tree-state cache must never allow gh pr create under cold fallback"
+  assert_contains "$(printf '%s' "$pr_cold_out" | jq -r '.reason')" "PR stamps verification failed" "PR deny reason must reach stamp verification (cold)"
+
+  "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$repo" --verdict PASS >/dev/null
+  "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$repo" --verdict PASS --critical 0 --important 0 >/dev/null
+  _wait_for_file_jq "$repo/.harness/cache/doc-validation.json" \
+    '.docs["docs/walkthroughs/2026-11-19-stamps.md"].walkthroughValid == true' 50 || {
+    echo "doc-validation.json did not cache walkthroughValid == true" >&2
+    return 1
+  }
+  _wait_for_file_jq "$tree_cache" '.canonStampValid == true and .securityStampValid == true' 50 || {
+    echo "tree-state.json did not refresh after re-stamping" >&2
+    return 1
+  }
+
+  local pr_allow_out
+  pr_allow_out=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}}' \
+    | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
+  assert_json_field "$pr_allow_out" ".decision" "allow" "Valid stamps + cached walkthroughValid must allow gh pr create"
 }
 
 test_spec_package_index_and_doc_validation_cache() {
@@ -719,6 +748,72 @@ while True:
 
   probe_sym=$(HARNESS_DAEMON_SOCK="$link_sock" python3 -B -c 'import sys; sys.path.insert(0,"scripts/lib"); import harness_core; print(harness_core.probe_daemon_health()[0])')
   assert_eq "False" "$probe_sym" "probe_daemon_health must refuse symlink socket"
+}
+
+test_linked_git_worktree_tracking() {
+  trap _td_cleanup EXIT INT TERM
+  local repo wt_parent wt_dir sock_dir data_dir sock_path dpid
+  repo=$(make_temp_repo)
+  wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/hd-wt12.XXXXXX")
+  sock_dir=$(mktemp -d "/tmp/hd-t12.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d12.XXXXXX")
+  _TD_DIRS+=("$wt_parent" "$sock_dir" "$data_dir")
+  wt_dir="$wt_parent/wt"
+  sock_path="$sock_dir/d.sock"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" worktree add "$wt_dir" -b "feat/wt-track" --quiet
+
+  mkdir -p "$wt_dir/graphify-out"
+  local call_log="$wt_dir/.mock-graphify-wt.log"
+  local mock_graphify="$wt_parent/mock-graphify.sh"
+  cat << EOF > "$mock_graphify"
+#!/usr/bin/env bash
+echo "RUN:\$*" >> "$call_log"
+EOF
+  chmod +x "$mock_graphify"
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  HARNESS_GRAPHIFY_DEBOUNCE_SEC="0.15" \
+  HARNESS_GRAPHIFY_BIN="$mock_graphify" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
+
+  curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST \
+    --data-binary "$(jq -nc --arg ws "$wt_dir" '{workspace: $ws}')" \
+    "http://localhost/event/workspace-touch" >/dev/null
+
+  local wt_tree="$wt_dir/.harness/cache/tree-state.json"
+  _wait_for_file_jq "$wt_tree" '.branch == "feat/wt-track"' 50 || {
+    echo "Linked worktree tree-state.json missing branch feat/wt-track" >&2
+    return 1
+  }
+
+  echo "export const wt = 1;" > "$wt_dir/wt.ts"
+  git -C "$wt_dir" add wt.ts
+  git -C "$wt_dir" commit -m "feat: commit in linked worktree" --quiet
+
+  local new_wt_head
+  new_wt_head=$(git -C "$wt_dir" rev-parse HEAD)
+  _wait_for_file_jq "$wt_tree" ".headOid == \"$new_wt_head\"" 50 || {
+    echo "Linked worktree tree-state.json did not refresh headOid after commit" >&2
+    return 1
+  }
+  _wait_for_file_jq "$wt_dir/.harness/cache/graphify-status.json" '.state == "succeeded"' 60 || {
+    echo "Linked worktree commit did not trigger async graphify run" >&2
+    return 1
+  }
+
+  local run_count
+  run_count=$(grep -c '^RUN:' "$call_log" 2>/dev/null || true)
+  [ "$run_count" -ge 1 ] || { echo "Expected mock graphify to run in linked worktree" >&2; return 1; }
 }
 
 run_tests "$@"

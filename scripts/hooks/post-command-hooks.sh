@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Alps AGY Harness - PostToolUse Command Automation (post-command-hooks.sh)
-# Enqueues async graphify updates via harness-daemon (returning {} immediately) or runs synchronous fallback.
+# Marks pr-audit-pending.json on gh pr create and enqueues async graphify updates via harness-daemon (or runs sync fallback).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
