@@ -300,25 +300,11 @@ cmd_context7() {
     exit 1
   fi
 
-  local state_dir ts existing json_payload
-  state_dir="$(harness_state_dir "$WORKSPACE")"
-  ts="$(utc_now)"
-  existing='{"packages":{}}'
-  if [ -f "$state_dir/context7-verified.json" ]; then
-    if jq -e 'type == "object" and (.packages | type == "object")' "$state_dir/context7-verified.json" >/dev/null 2>&1; then
-      existing="$(cat "$state_dir/context7-verified.json")"
-    fi
-  fi
-
-  json_payload="$(jq -nc \
-    --argjson base "$existing" \
-    --arg pkg "$pkg" \
-    --arg ver "$ver" \
-    --arg src "$src" \
-    --arg ts "$ts" \
-    '$base | .packages = ((.packages // {}) + {($pkg): {version: $ver, source: $src, timestamp: $ts}})')"
-
-  atomic_write_json "$state_dir" "context7-verified.json" "$json_payload"
+  python3 -B "$(harness_core_python)" context7-register \
+    --workspace "$WORKSPACE" \
+    --package "$pkg" \
+    --version "$ver" \
+    --source "$src"
 }
 
 cmd_dispatch() {
@@ -404,36 +390,13 @@ cmd_dispatch() {
 
   model="$(harness_resolve_subagent_model "$parent_model" "$tier" "" "false")"
 
-  local state_dir ts existing json_payload
-  state_dir="$(harness_state_dir "$WORKSPACE")"
-  ts="$(utc_now)"
-  existing='{"entries":{}}'
-  if [ -f "$state_dir/subagent-dispatch.json" ]; then
-    if jq -e 'type == "object" and (.entries | type == "object")' "$state_dir/subagent-dispatch.json" >/dev/null 2>&1; then
-      existing="$(cat "$state_dir/subagent-dispatch.json")"
-    fi
-  fi
-
-  json_payload="$(jq -nc \
-    --argjson base "$existing" \
-    --arg role "$role" \
-    --arg typeName "$type_name" \
-    --arg tier "$tier" \
-    --arg model "$model" \
-    --arg effort "$effort" \
-    --arg ts "$ts" \
-    '$base | .entries = ((.entries // {}) + {
-      ($role): {
-        typeName: $typeName,
-        tier: $tier,
-        model: $model,
-        effortProfile: $effort,
-        consumed: false,
-        timestamp: $ts
-      }
-    })')"
-
-  atomic_write_json "$state_dir" "subagent-dispatch.json" "$json_payload"
+  python3 -B "$(harness_core_python)" dispatch-register \
+    --workspace "$WORKSPACE" \
+    --role "$role" \
+    --type "$type_name" \
+    --tier "$tier" \
+    --model "$model" \
+    --effort "$effort"
 }
 
 cmd_select_model() {
@@ -583,9 +546,7 @@ cmd_clear_pr_audit() {
     echo "Error: unexpected arguments for clear-pr-audit: $*" >&2
     exit 1
   fi
-  local state_dir
-  state_dir="$(harness_state_dir "$WORKSPACE")"
-  rm -f "$state_dir/pr-audit-pending.json"
+  python3 -B "$(harness_core_python)" clear-pr-audit --workspace "$WORKSPACE"
 }
 
 case "$SUBCMD" in

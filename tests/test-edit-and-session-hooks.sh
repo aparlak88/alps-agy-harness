@@ -7,6 +7,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-helpers.sh"
 
 SESSION_START="$REPO_ROOT/scripts/hooks/session-start.sh"
 PRE_EDIT_GUARD="$REPO_ROOT/scripts/hooks/pre-edit-guard.sh"
+PRE_SUBAGENT_GUARD="$REPO_ROOT/scripts/hooks/pre-subagent-guard.sh"
+STAMP_GATE="$REPO_ROOT/scripts/stamp-gate.sh"
 
 test_session_start_injects_status_and_respects_harness_ignore() {
   [ -x "$SESSION_START" ] || { echo "session-start.sh missing or not executable: $SESSION_START" >&2; return 1; }
@@ -422,6 +424,130 @@ test_external_path_and_superpowers_and_harness_bypass() {
   local out_ignored
   out_ignored=$(printf '%s' "$p_ignored" | "$PRE_EDIT_GUARD")
   assert_json_field "$out_ignored" ".decision" "allow" "When .harness-ignore is present, all writes must be allowed"
+}
+
+test_large_utf8_multiline_payload_completes_under_2s_on_bin_bash() {
+  local repo
+  repo=$(make_temp_repo)
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/utf8-perf" --quiet
+
+  "$STAMP_GATE" dispatch --role "Big UTF-8 Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
+
+  python3 -B - "$repo" "$PRE_EDIT_GUARD" "$PRE_SUBAGENT_GUARD" <<'PY'
+import json
+import os
+import subprocess
+import sys
+import time
+
+repo, pre_edit, pre_subagent = sys.argv[1], sys.argv[2], sys.argv[3]
+chunk = "Türkçe ğüşıöçĞÜŞİÖÇ 🚀 çok satırlı içerik   \t\n  const val = 42;\n"
+big_text = chunk * 1800
+assert len(big_text.encode("utf-8")) >= 120 * 1024
+
+env = dict(os.environ)
+env["HARNESS_DISABLE_DAEMON"] = "1"
+env["HARNESS_AUTO_START_DAEMON"] = "0"
+
+# 1. >= 120 KB UTF-8 write_file payload through /bin/bash
+edit_payload = json.dumps(
+    {
+        "workspacePaths": [repo],
+        "toolCall": {
+            "name": "write_file",
+            "args": {"Path": os.path.join(repo, "src/BigModule.ts"), "Content": big_text},
+        },
+    },
+    ensure_ascii=False,
+)
+t0 = time.monotonic()
+p1 = subprocess.run(["/bin/bash", pre_edit], input=edit_payload, text=True, capture_output=True, env=env, timeout=5)
+dt1 = time.monotonic() - t0
+assert p1.returncode == 0, f"pre-edit failed: {p1.stderr}"
+assert dt1 < 2.0, f"pre-edit took too long on /bin/bash: {dt1:.3f}s"
+assert json.loads(p1.stdout).get("decision") == "allow", p1.stdout
+
+# 2. >= 120 KB UTF-8 invoke_subagent payload through /bin/bash
+sub_payload = json.dumps(
+    {
+        "workspacePaths": [repo],
+        "toolCall": {
+            "name": "invoke_subagent",
+            "args": {"TypeName": "self", "Role": "Big UTF-8 Worker", "Prompt": big_text},
+        },
+    },
+    ensure_ascii=False,
+)
+t1 = time.monotonic()
+p2 = subprocess.run(["/bin/bash", pre_subagent], input=sub_payload, text=True, capture_output=True, env=env, timeout=5)
+dt2 = time.monotonic() - t1
+assert p2.returncode == 0, f"pre-subagent failed: {p2.stderr}"
+assert dt2 < 2.0, f"pre-subagent took too long on /bin/bash: {dt2:.3f}s"
+parsed = json.loads(p2.stdout)
+assert parsed.get("decision") == "allow", parsed
+ow = parsed.get("overwrite") or {}
+assert ow.get("Model") == "flash", ow
+assert ow.get("Prompt", "").startswith("[EFFORT_PROFILE: MEDIUM"), ow.get("Prompt", "")[:80]
+assert ow.get("Prompt", "").endswith(chunk), "UTF-8 multiline suffix truncated"
+PY
+}
+
+test_sibling_git_worktree_pre_edit_enforces_rules_while_unrelated_external_allows() {
+  local main_repo wt_parent wt_feat other_repo
+  main_repo=$(make_temp_repo)
+  echo "init" > "$main_repo/README.md"
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+
+  wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/harness-wt-edit.XXXXXX")
+  echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"
+  wt_feat="$wt_parent/kedo-admin"
+  git -C "$main_repo" worktree add "$wt_feat" -b "feat/admin" --quiet
+
+  other_repo=$(make_temp_repo)
+  echo "other" > "$other_repo/README.md"
+  git -C "$other_repo" add README.md
+  git -C "$other_repo" commit -m "chore: other init" --quiet
+  git -C "$other_repo" checkout -b "feat/other" --quiet
+
+  # 1. Sibling worktree doc without glossary -> deny (even though workspacePaths[0] is main_repo on main)
+  local p_wt_doc out_wt_doc
+  p_wt_doc=$(jq -nc --arg ws "$main_repo" --arg path "$wt_feat/docs/plan.md" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "# Admin Plan\n\nNo glossary."}}}')
+  out_wt_doc=$(printf '%s' "$p_wt_doc" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_wt_doc" ".decision" "deny" "Sibling worktree doc without glossary must be denied"
+  assert_contains "$(printf '%s' "$out_wt_doc" | jq -r '.reason')" "Glossary"
+
+  # 2. Sibling worktree dangerous eval() in non-existent src/ -> deny
+  local p_wt_eval out_wt_eval
+  p_wt_eval=$(jq -nc --arg ws "$main_repo" --arg path "$wt_feat/src/eval.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const bad = (s: string) => eval(s);"}}}')
+  out_wt_eval=$(printf '%s' "$p_wt_eval" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_wt_eval" ".decision" "deny" "Sibling worktree eval() must be denied"
+
+  # 3. Sibling worktree clean code on feat/admin -> allow (not blocked by main_repo main lock)
+  local p_wt_clean out_wt_clean
+  p_wt_clean=$(jq -nc --arg ws "$main_repo" --arg path "$wt_feat/src/clean.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const ok = 1;"}}}')
+  out_wt_clean=$(printf '%s' "$p_wt_clean" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_wt_clean" ".decision" "allow" "Clean code in sibling feature worktree must be allowed"
+
+  # 4. Write directly in main_repo on main -> deny
+  local p_main_src out_main_src
+  p_main_src=$(jq -nc --arg ws "$main_repo" --arg path "$main_repo/src/bad.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const x = 1;"}}}')
+  out_main_src=$(printf '%s' "$p_main_src" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_main_src" ".decision" "deny" "Direct write to main_repo must stay locked"
+
+  # 5. Unrelated external git repo -> allow (external path behavior preserved)
+  local p_ext out_ext
+  p_ext=$(jq -nc --arg ws "$main_repo" --arg path "$other_repo/src/eval.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const bad = eval(\"1\");"}}}')
+  out_ext=$(printf '%s' "$p_ext" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_ext" ".decision" "allow" "Unrelated external git repo must preserve external allow behavior"
 }
 
 run_tests

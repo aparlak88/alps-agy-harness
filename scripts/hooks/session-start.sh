@@ -14,15 +14,7 @@ if harness_is_ignored "$WORKSPACE_ROOT"; then
   exit 0
 fi
 
-if [ "${HARNESS_AUTO_START_DAEMON:-0}" = "1" ] && [ "${HARNESS_DISABLE_DAEMON:-0}" != "1" ]; then
-  sock_path="$(harness_daemon_socket_path)"
-  if ! harness_is_safe_daemon_socket "$sock_path"; then
-    daemon_py="$_HARNESS_PLUGIN_ROOT/sidecars/harness-daemon/daemon.py"
-    if [ -f "$daemon_py" ]; then
-      nohup python3 -B "$daemon_py" >/dev/null 2>&1 &
-    fi
-  fi
-fi
+harness_ensure_daemon >/dev/null 2>&1 || true
 
 # Evaluate client-side PATH bins locally for strict test/env parity
 missing_bins=()
@@ -39,8 +31,7 @@ fi
 
 # Share boolean-only key presence hint (never the secret string itself)
 env_key_present=false
-trimmed_key="${TYPESAFE_API_KEY:-}"
-trimmed_key="${trimmed_key//[[:space:]]/}"
+trimmed_key="$(printf '%s' "${TYPESAFE_API_KEY:-}" | LC_ALL=C tr -d '[:space:]')"
 if [ -n "$trimmed_key" ]; then
   case "$trimmed_key" in
     \<*\>) ;;
@@ -48,12 +39,13 @@ if [ -n "$trimmed_key" ]; then
   esac
 fi
 
-req_payload="$(jq -nc \
-  --argjson orig "$HOOK_INPUT" \
+req_payload="$(printf '%s\n' "$HOOK_INPUT" | jq -c \
   --arg ws "$WORKSPACE_ROOT" \
   --argjson missing "$missing_bins_json" \
   --argjson ekp "$env_key_present" \
-  '($orig | if type == "object" then . else {} end) + {workspace: $ws, missingBins: $missing, envKeyPresent: $ekp}' 2>/dev/null || printf '{}')"
+  '(if type == "object" then . else {} end) + {workspace: $ws, missingBins: $missing, envKeyPresent: $ekp}' 2>/dev/null \
+  || jq -nc --arg ws "$WORKSPACE_ROOT" --argjson missing "$missing_bins_json" --argjson ekp "$env_key_present" \
+     '{workspace: $ws, missingBins: $missing, envKeyPresent: $ekp}')"
 
 if daemon_resp="$(harness_daemon_call "/hook/session-start" "$req_payload")" && \
    printf '%s' "$daemon_resp" | jq -e 'type == "object" and (.injectSteps | type == "array") and ((.injectSteps[0].systemMessage.systemMessage // "") | length > 0)' >/dev/null 2>&1; then

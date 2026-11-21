@@ -17,7 +17,8 @@ Büyük dil modelleri tek başlarına bırakıldığında kapsam kaymasına (*sc
 - **Gemini 4 & `Orchestrator` Duyarlı Model ve Efor Kilidi (`overwrite`):** Ana oturumun modelini (`HOOK_INPUT.modelName`: Carbon, Argon, Hydrogen, `Orchestrator`) algılayarak alt ajan katmanlarını (`inherit`, `pro` [Argon], `flash`, `flash_lite`) ve efor bütçelerini (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`, `MAX`) düşürme kaybı olmadan fiziksel olarak kilitler.
 - **Sessiz Başarı Kalkanı (`run-quiet.sh`):** Binlerce satırlık derleme ve test loglarını süzerek bağlam penceresini korur.
 - **Sıfır-Context Ön-Eleme (`jev`):** Geçmiş dersleri ve PR diff dosyalarını ana modelin context'ini kirletmeden sunucuda değerlendirir.
-- **Sıfır Gecikmeli Arka Plan Daemon'ı (`sidecars/harness-daemon/`, `v1.1.0`):** `graphify` güncellemelerini asenkron single-flight kuyruğuna alır; `harness-doctor`, `codeTreeSha` damgaları, spec paketleri, walkthrough doğrulaması ve iOS `.ips` crash raporlarını `.harness/cache/*.json` altında önceden hazırlar. Daemon kapalıysa tüm kancalar sessizce yerel fallback'e (`scripts/lib/harness_core.py`) düşer (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir).
+- **Sıfır Gecikmeli Arka Plan Daemon'ı (`sidecars/harness-daemon/`, `v1.1.0`):** `graphify` güncellemelerini asenkron single-flight kuyruğuna alır; `harness-doctor`, `codeTreeSha` damgaları, spec paketleri, walkthrough doğrulaması ve iOS `.ips` crash raporlarını `.harness/cache/*.json` altında önceden hazırlar. Hem global hem proje bazlı (`.agents/plugins/`) kurulumlarda `HARNESS_AUTO_START_DAEMON=1` varsayılanıyla soket yokken kancalar daemon'ı arka planda (stdio/pipe ayrık, `daemon.lock` tekilliğiyle) otomatik başlatır; daemon kapalıysa tüm kancalar sessizce yerel fallback'e (`scripts/lib/harness_core.py`) düşer (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir).
+- **Paralel Git Worktree & İzole Oturum Desteği:** Ana çalışma alanı `main` dalındayken kardeş Git worktree'lerde (`cd <worktree>`, `git -C <worktree>`, harici dosya yolu) çalışan paralel oturumlar otomatik olarak etkin worktree köküne ve dalına çözümlenir; `subagent-dispatch.json` yazma/tüketim işlemleri `fcntl.flock` ile kilitlenir, `stop-gate.sh` ise `conversationId` ayrımıyla yalnızca PR açan oturumu durdurur. `.gitignore` kapsamındaki yerel `docs/walkthroughs/*.md` dosyaları da `Ne`/`Neden` ve sözlük doğrulamasından geçirilerek desteklenir.
 
 ---
 
@@ -62,6 +63,9 @@ Takım manifestosu (`.agents/plugins.json`):
   ]
 }
 ```
+
+> [!NOTE]
+> Proje bazlı (`.agents/plugins/`) kurulumlarda IDE yerleşik sidecar yöneticisi daemon'ı otomatik başlatmasa bile, `session-start.sh` ve kanca istemcileri (`HARNESS_AUTO_START_DAEMON=1` varsayılanıyla) `sidecars/harness-daemon/daemon.py` sürecini stdin/stdout/stderr'den tamamen ayrık biçimde (`daemon.lock` tekilliği korunarak) otomatik başlatır. Devre dışı bırakmak için `HARNESS_DISABLE_DAEMON=1` ayarlayın.
 
 ---
 
@@ -201,13 +205,13 @@ flowchart TD
 
 | Kategori | Bileşen | Açıklama |
 | :--- | :--- | :--- |
-| **Kancalar (`hooks.json`)** | `session-start.sh` | Oturum başında dal, aktif model ailesi (`modelName`), kanon ve araç durumunu enjekte eder. |
-| | `pre-edit-guard.sh` | `main` dalı kod kilidi, doküman sonu sözlük kapısı ve güvenlik süzgeci. |
-| | `pre-command-guard.sh` | Paket kurulum doğrulaması, logcat koruması ve sert PR açma kapısı. |
-| | `pre-subagent-guard.sh` | Gemini 4 & `Orchestrator` duyarlı alt ajan modeli (`inherit`/`pro`/`flash`/`flash_lite`) ve efor (`LOW`–`MAX`) `overwrite` kilidi. |
-| | `post-command-hooks.sh` | Başarılı PR sonrası denetim bayrağı ve `graphify` güncellemesi. |
-| | `stop-gate.sh` | `pr-auditor` çalıştırılmadan oturumun kapanmasını engeller. |
-| **Arka Plan Sidecar (`sidecars/`)** | `harness-daemon/sidecar.json` & `daemon.py` | Sıfır gecikmeli Unix socket kanca motoru, tekil kuyruklu asenkron `graphify`, doktor/damga/spec önbelleği ve iOS crash izleyici (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir). |
+| **Kancalar (`hooks.json`)** | `session-start.sh` | Oturum başında dal, aktif model ailesi (`modelName`), kanon ve araç durumunu enjekte eder; soket yoksa `harness-daemon`'ı arka planda başlatır. |
+| | `pre-edit-guard.sh` | `main` dalı kod kilidi, kardeş worktree çözümlemesi, doküman sonu sözlük kapısı ve güvenlik süzgeci. |
+| | `pre-command-guard.sh` | `cd`/`git -C` worktree çözümlemesi, paket kurulum doğrulaması, logcat koruması ve `.gitignore` uyumlu sert PR açma kapısı. |
+| | `pre-subagent-guard.sh` | Gemini 4 & `Orchestrator` duyarlı alt ajan modeli/efor `overwrite` kilidi, `flock`-atomik ve kardeş worktree taramalı `subagent-dispatch.json` tüketimi. |
+| | `post-command-hooks.sh` | Başarılı PR sonrası etkin worktree + `conversationId` kayıtlı denetim bayrağı ve asenkron `graphify` güncellemesi. |
+| | `stop-gate.sh` | `conversationId` izolasyonuyla yalnızca PR açan oturumda `pr-auditor` çalıştırılmadan çıkışı engeller. |
+| **Arka Plan Sidecar (`sidecars/`)** | `harness-daemon/sidecar.json` & `daemon.py` | Sıfır gecikmeli Unix socket kanca motoru (`HARNESS_AUTO_START_DAEMON=1` otomatik başlatma), tekil kuyruklu asenkron `graphify`, doktor/damga/spec önbelleği ve iOS crash izleyici (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir). |
 | **Ortak Çekirdek (`scripts/lib/`)** | `harness_core.py` | `harness-daemon` ile tüm yerel fallback kanca ve teşhis betikleri arasında paylaşılan tek doğruluk kaynağı. |
 | **Yardımcı Betikler** | `run-quiet.sh` | Derleme/test loglarını sessize alır; tek satır özet ve log kaydı döner. |
 | | `mobile-logs.sh` | iOS Simulator `.ips` crash ve Android Emulator logcat süzgeci. |

@@ -14,10 +14,9 @@ if harness_is_ignored "$WORKSPACE_ROOT"; then
   exit 0
 fi
 
-req_payload="$(jq -nc \
-  --argjson orig "$HOOK_INPUT" \
+req_payload="$(printf '%s\n' "$HOOK_INPUT" | jq -c \
   --arg ws "$WORKSPACE_ROOT" \
-  '($orig | if type == "object" then . else {} end) + {workspace: $ws}' 2>/dev/null || true)"
+  '(if type == "object" then . else {} end) + {workspace: $ws}' 2>/dev/null || true)"
 
 if [ -n "$req_payload" ] && \
    daemon_resp="$(harness_daemon_call "/hook/pre-edit" "$req_payload")" && \

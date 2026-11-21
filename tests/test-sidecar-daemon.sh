@@ -737,7 +737,7 @@ while True:
   assert_json_field "$out_perm" ".decision" "deny" "Hook must refuse 0755 socket dir and fail closed to local deny"
 
   local probe_perm
-  probe_perm=$(HARNESS_DAEMON_SOCK="$rogue_sock" python3 -B -c 'import sys; sys.path.insert(0,"scripts/lib"); import harness_core; print(harness_core.probe_daemon_health()[0])')
+  probe_perm=$(HARNESS_DAEMON_SOCK="$rogue_sock" python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.probe_daemon_health()[0])' "$REPO_ROOT/scripts/lib")
   assert_eq "False" "$probe_perm" "probe_daemon_health must refuse 0755 socket dir"
 
   # 2. Symlink socket inside 0700 dir -> client hook and probe_daemon_health must refuse
@@ -748,7 +748,7 @@ while True:
   out_sym=$(printf '%s' "$p_edit_main" | HARNESS_DAEMON_SOCK="$link_sock" "$PRE_EDIT_GUARD")
   assert_json_field "$out_sym" ".decision" "deny" "Hook must refuse symlink socket and fail closed to local deny"
 
-  probe_sym=$(HARNESS_DAEMON_SOCK="$link_sock" python3 -B -c 'import sys; sys.path.insert(0,"scripts/lib"); import harness_core; print(harness_core.probe_daemon_health()[0])')
+  probe_sym=$(HARNESS_DAEMON_SOCK="$link_sock" python3 -B -c 'import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.probe_daemon_health()[0])' "$REPO_ROOT/scripts/lib")
   assert_eq "False" "$probe_sym" "probe_daemon_health must refuse symlink socket"
 }
 
@@ -870,6 +870,219 @@ test_pre_edit_symlink_parent_traversal_blocked() {
 
   out_feat_off=$(printf '%s' "$p_rel" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
   assert_json_field "$out_feat_off" ".decision" "deny" "Rule 3 dangerous pattern/key must not be bypassed via symlink+.. on feature branch (cold fallback)"
+}
+
+test_workspace_plugin_auto_start_daemon_and_fd_isolation() {
+  trap _td_cleanup EXIT INT TERM
+  local repo sock_dir data_dir sock_path dpid
+  repo=$(make_temp_repo)
+  sock_dir=$(mktemp -d "/tmp/hd-t14.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d14.XXXXXX")
+  _TD_DIRS+=("$sock_dir" "$data_dir")
+  sock_path="$sock_dir/d.sock"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+
+  local p_start t_ms start_out
+  p_start=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}')
+
+  # Run session-start inside $() with HARNESS_AUTO_START_DAEMON=1; verify detached FDs don't hang pipe
+  local res_file="$repo/.autostart-out.json"
+  t_ms=$(HARNESS_AUTO_START_DAEMON=1 \
+    HARNESS_DAEMON_SOCK="$sock_path" \
+    HARNESS_DAEMON_DATA_DIR="$data_dir" \
+    HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B -c 'import subprocess, sys, time
+t0 = time.monotonic()
+proc = subprocess.run([sys.argv[1]], input=sys.argv[2], text=True, capture_output=True, timeout=5)
+dt = int((time.monotonic() - t0) * 1000)
+if proc.returncode != 0:
+    sys.stderr.write(proc.stderr)
+    sys.exit(1)
+open(sys.argv[3], "w", encoding="utf-8").write(proc.stdout)
+print(dt)
+' "$SESSION_START" "$p_start" "$res_file") || { echo "session-start auto-start failed" >&2; return 1; }
+
+  start_out=$(cat "$res_file")
+  assert_contains "$(printf '%s' "$start_out" | jq -r '.injectSteps[0].systemMessage.systemMessage')" "Active Git Branch: main"
+
+  if [ "$t_ms" -ge 2000 ]; then
+    echo "session-start with daemon auto-start took ${t_ms}ms (possible FD pipe block)" >&2
+    return 1
+  fi
+
+  [ -S "$sock_path" ] || { echo "Auto-started daemon socket missing: $sock_path" >&2; return 1; }
+  local health_json
+  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
+  assert_json_field "$health_json" ".status" "ok"
+  dpid=$(printf '%s' "$health_json" | jq -r '.pid')
+  _TD_PIDS+=("$dpid")
+
+  # Concurrent hook calls must preserve singleton PID without spawning standby duplicates
+  local p_edit
+  p_edit=$(jq -nc --arg ws "$repo" --arg path "$repo/src/Bad.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const x = 1;"}}}')
+  local c_pids=()
+  for _ in 1 2 3 4; do
+    (printf '%s' "$p_edit" | HARNESS_AUTO_START_DAEMON=1 HARNESS_DAEMON_SOCK="$sock_path" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" "$PRE_EDIT_GUARD" >/dev/null) &
+    c_pids+=("$!")
+  done
+  for cp in "${c_pids[@]}"; do
+    wait "$cp"
+  done
+
+  local health_after
+  health_after=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
+  assert_json_field "$health_after" ".pid" "$dpid" "Singleton daemon PID must remain unchanged across concurrent calls"
+
+  # HARNESS_DISABLE_DAEMON=1 must never auto-start even when HARNESS_AUTO_START_DAEMON=1
+  local sock_disabled="$sock_dir/disabled.sock"
+  local out_disabled
+  out_disabled=$(printf '%s' "$p_start" | HARNESS_AUTO_START_DAEMON=1 HARNESS_DISABLE_DAEMON=1 HARNESS_DAEMON_SOCK="$sock_disabled" HARNESS_DAEMON_DATA_DIR="$data_dir" "$SESSION_START")
+  assert_contains "$(printf '%s' "$out_disabled" | jq -r '.injectSteps[0].systemMessage.systemMessage')" "Active Git Branch: main"
+  [ ! -S "$sock_disabled" ] || { echo "HARNESS_DISABLE_DAEMON=1 must never start daemon" >&2; return 1; }
+}
+
+test_parallel_worktrees_warm_daemon_vs_cold_parity() {
+  trap _td_cleanup EXIT INT TERM
+  local main_repo wt_parent wt_backend wt_admin sock_dir data_dir sock_path dpid
+  main_repo=$(make_temp_repo)
+  wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/hd-wtp15.XXXXXX")
+  sock_dir=$(mktemp -d "/tmp/hd-t15.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d15.XXXXXX")
+  _TD_DIRS+=("$wt_parent" "$sock_dir" "$data_dir")
+  sock_path="$sock_dir/d.sock"
+  wt_backend="$wt_parent/kedo-backend"
+  wt_admin="$wt_parent/kedo-admin"
+
+  cat << 'EOF' > "$main_repo/.gitignore"
+docs/walkthroughs/*
+EOF
+  cat << 'EOF' > "$main_repo/README.md"
+# Kedo
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Kedo | Çoklu worktree test projesi |
+EOF
+  git -C "$main_repo" add .gitignore README.md
+  git -C "$main_repo" commit -m "chore: init with gitignored walkthroughs" --quiet
+
+  git -C "$main_repo" worktree add "$wt_backend" -b "feat/backend" --quiet
+  git -C "$main_repo" worktree add "$wt_admin" -b "feat/admin" --quiet
+
+  mkdir -p "$wt_admin/src" "$wt_admin/docs/walkthroughs"
+  echo "export const Admin = true;" > "$wt_admin/src/AdminPage.ts"
+  git -C "$wt_admin" add src/AdminPage.ts
+  git -C "$wt_admin" commit -m "feat: add admin page" --quiet
+
+  cat << 'EOF' > "$wt_admin/docs/walkthroughs/2026-11-21-admin.md"
+# Admin PR Rehberi
+
+```mermaid
+flowchart LR
+  AdminPage --> AppRouter
+```
+
+```mermaid
+sequenceDiagram
+  User->>AdminPage: open()
+  AdminPage-->>User: ready
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/AdminPage.ts` — [ÜRETİLDİ] (`Presentation`)
+- **Ne Değişti / Ne Üretildi?:** Yönetici paneli başlangıç bayrağını dışa aktaran `AdminPage.ts` modülü ve `Admin` sabiti eklendi.
+- **Neden Değişti / Neden Üretildi?:** Çoklu worktree PR kapısında `.gitignore` kapsamındaki yerel walkthrough doğrulamasını kanıtlamak için üretildi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| AdminPage | Yönetici paneli kök modülü |
+EOF
+
+  "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$wt_admin" --verdict PASS --allow-file "src/AdminPage.ts" >/dev/null
+  "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$wt_admin" --verdict PASS --critical 0 --important 0 >/dev/null
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
+
+  # 1. Sibling pre-edit parity + auto-registration in daemon
+  local p_wt_clean p_wt_bad out_clean_on out_clean_off out_bad_on out_bad_off
+  p_wt_clean=$(jq -nc --arg ws "$main_repo" --arg path "$wt_backend/src/Service.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const svc = 1;"}}}')
+  p_wt_bad=$(jq -nc --arg ws "$main_repo" --arg path "$wt_backend/src/Bad.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const bad = eval(\"x\");"}}}')
+
+  out_clean_on=$(printf '%s' "$p_wt_clean" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  out_clean_off=$(printf '%s' "$p_wt_clean" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_clean_on" ".decision" "allow"
+  assert_json_field "$out_clean_off" ".decision" "allow"
+
+  out_bad_on=$(printf '%s' "$p_wt_bad" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  out_bad_off=$(printf '%s' "$p_wt_bad" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_bad_on" ".decision" "deny"
+  assert_json_field "$out_bad_off" ".decision" "deny"
+
+  local active_cnt
+  active_cnt=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.activeWorkspaces')
+  [ "$active_cnt" -ge 2 ] || { echo "Expected sibling worktree auto-registered in daemon (activeWorkspaces=$active_cnt)" >&2; return 1; }
+
+  # 2. Cross-worktree cd && gh pr create with gitignored local walkthrough (daemon ON vs OFF)
+  local p_admin_pr p_main_pr out_pr_on out_pr_off out_main_pr_on out_main_pr_off
+  p_admin_pr=$(jq -nc --arg ws "$main_repo" --arg cmd "cd \"$wt_admin\" && gh pr create --fill" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+  p_main_pr=$(jq -nc --arg ws "$main_repo" --arg cmd "cd \"$main_repo\" && gh pr create --fill" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+
+  out_pr_on=$(printf '%s' "$p_admin_pr" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
+  out_pr_off=$(printf '%s' "$p_admin_pr" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_on" ".decision" "allow" "Daemon must allow cd <wt_admin> && gh pr create with gitignored walkthrough"
+  assert_json_field "$out_pr_off" ".decision" "allow" "Cold must allow cd <wt_admin> && gh pr create with gitignored walkthrough"
+
+  out_main_pr_on=$(printf '%s' "$p_main_pr" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
+  out_main_pr_off=$(printf '%s' "$p_main_pr" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_main_pr_on" ".decision" "deny"
+  assert_json_field "$out_main_pr_off" ".decision" "deny"
+
+  # 3. post-command writes pr-audit-pending.json into wt_admin with conversationId
+  local p_post_pr pending_admin
+  p_post_pr=$(jq -nc --arg ws "$main_repo" --arg cmd "cd \"$wt_admin\" && gh pr create --fill" \
+    '{workspacePaths: [$ws], conversationId: "conv-admin", toolCall: {name: "run_command", args: {CommandLine: $cmd}}, toolOutput: {output: "https://github.com/org/kedo/pull/101"}}')
+  printf '%s' "$p_post_pr" | HARNESS_DAEMON_SOCK="$sock_path" "$POST_COMMAND_HOOKS" >/dev/null
+  pending_admin="$wt_admin/.harness/state/feat-admin/pr-audit-pending.json"
+  [ -f "$pending_admin" ] || { echo "Expected pr-audit-pending.json in $pending_admin" >&2; return 1; }
+  [ ! -f "$main_repo/.harness/state/main/pr-audit-pending.json" ] || { echo "main_repo must not receive wt_admin pending flag" >&2; return 1; }
+  assert_json_field "$pending_admin" ".conversationId" "conv-admin"
+
+  # 4. stop-gate parity across daemon ON and cold OFF with conversationId isolation
+  local STOP_GATE="$REPO_ROOT/scripts/hooks/stop-gate.sh"
+  local stop_other_on stop_other_off stop_admin_on stop_admin_off
+  stop_other_on=$(jq -nc --arg ws "$main_repo" '{workspacePaths: [$ws], conversationId: "conv-backend", terminationReason: "NO_TOOL_CALL"}' \
+    | HARNESS_DAEMON_SOCK="$sock_path" "$STOP_GATE" | jq -c .)
+  stop_other_off=$(jq -nc --arg ws "$main_repo" '{workspacePaths: [$ws], conversationId: "conv-ios", terminationReason: "NO_TOOL_CALL"}' \
+    | HARNESS_DISABLE_DAEMON="1" "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$stop_other_on" "Other conversation must not be blocked under daemon"
+  assert_eq "{}" "$stop_other_off" "Other conversation must not be blocked under cold fallback"
+
+  stop_admin_on=$(jq -nc --arg ws "$main_repo" '{workspacePaths: [$ws], conversationId: "conv-admin", terminationReason: "NO_TOOL_CALL"}' \
+    | HARNESS_DAEMON_SOCK="$sock_path" "$STOP_GATE")
+  assert_json_field "$stop_admin_on" ".decision" "continue" "Matching conversationId must block once under daemon"
+  stop_admin_off=$(jq -nc --arg ws "$main_repo" '{workspacePaths: [$ws], conversationId: "conv-admin", terminationReason: "NO_TOOL_CALL"}' \
+    | HARNESS_DISABLE_DAEMON="1" "$STOP_GATE")
+  assert_json_field "$stop_admin_off" ".decision" "continue" "Matching conversationId must block second time under cold fallback"
 }
 
 run_tests "$@"
