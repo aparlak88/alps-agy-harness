@@ -14,6 +14,8 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import contextlib
+import fcntl
 import glob
 import http.client
 import json
@@ -29,7 +31,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[2]
 CACHE_SCHEMA_VERSION = 1
@@ -106,6 +108,144 @@ def read_json_file(path: Path) -> Optional[dict[str, Any]]:
         return parsed if isinstance(parsed, dict) else None
     except Exception:
         return None
+
+
+@contextlib.contextmanager
+def locked_state_file(state_dir: Path, lock_name: str) -> Iterator[None]:
+    """Acquire an exclusive ``fcntl.flock`` advisory lock on ``state_dir/.<lock_name>.lock``."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / f".{lock_name}.lock"
+    fh = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        fh.close()
+
+
+def _nearest_existing_dir(path: Path) -> Optional[Path]:
+    """Walk upward from ``path`` until an existing directory is located."""
+    try:
+        cur = Path(os.path.expanduser(str(path)))
+    except Exception:
+        return None
+    while True:
+        try:
+            if cur.is_dir():
+                return cur
+        except OSError:
+            pass
+        parent = cur.parent
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def _has_git_marker_in_ancestors(start_dir: Path) -> bool:
+    """Return True if ``start_dir`` or an ancestor contains a ``.git`` file or directory."""
+    try:
+        cur = Path(os.path.realpath(str(start_dir)))
+    except OSError:
+        cur = start_dir
+    while True:
+        try:
+            if (cur / ".git").exists():
+                return True
+        except OSError:
+            pass
+        parent = cur.parent
+        if parent == cur:
+            return False
+        cur = parent
+
+
+def get_git_repo_identity(path: Path) -> tuple[Optional[Path], Optional[Path]]:
+    """Resolve ``(worktree_toplevel, git_common_dir)`` for ``path``, or ``(None, None)`` outside git."""
+    existing = _nearest_existing_dir(path)
+    if existing is None or not _has_git_marker_in_ancestors(existing):
+        return None, None
+    try:
+        real_existing = Path(os.path.realpath(str(existing)))
+    except OSError:
+        real_existing = existing
+    res = _run_git(real_existing, ["rev-parse", "--show-toplevel", "--git-common-dir"])
+    if res.returncode != 0:
+        return None, None
+    lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None, None
+    raw_top, raw_common = lines[0], lines[1]
+    top_abs = raw_top if os.path.isabs(raw_top) else os.path.join(str(real_existing), raw_top)
+    common_abs = raw_common if os.path.isabs(raw_common) else os.path.join(str(real_existing), raw_common)
+    try:
+        return Path(os.path.realpath(top_abs)), Path(os.path.realpath(common_abs))
+    except OSError:
+        return Path(os.path.normpath(top_abs)), Path(os.path.normpath(common_abs))
+
+
+def resolve_linked_worktree(
+    base_workspace: Path,
+    target_path: Path,
+    base_common_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the worktree root if ``target_path`` shares ``base_workspace``'s ``git-common-dir``."""
+    if base_common_dir is None:
+        _, base_common_dir = get_git_repo_identity(base_workspace)
+    if base_common_dir is None:
+        return None
+    target_top, target_common = get_git_repo_identity(target_path)
+    if target_top is not None and target_common == base_common_dir:
+        return target_top
+    return None
+
+
+def list_linked_worktrees(workspace: Path) -> list[dict[str, str]]:
+    """Return active non-bare git worktrees sharing ``workspace``'s repository."""
+    res = _run_git(workspace, ["worktree", "list", "--porcelain"])
+    if res.returncode != 0:
+        return []
+
+    worktrees: list[dict[str, str]] = []
+    cur_raw = ""
+    cur_branch = "HEAD"
+    cur_bare = False
+
+    def flush_entry() -> None:
+        if not cur_raw or cur_bare:
+            return
+        wt_dir = Path(cur_raw)
+        if not wt_dir.is_dir():
+            return
+        try:
+            real_wt = os.path.realpath(cur_raw)
+        except OSError:
+            real_wt = cur_raw
+        worktrees.append({"path": real_wt, "rawPath": cur_raw, "branch": cur_branch})
+
+    for raw_line in res.stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush_entry()
+            cur_raw = ""
+            cur_branch = "HEAD"
+            cur_bare = False
+            continue
+        if line.startswith("worktree "):
+            cur_raw = line[len("worktree ") :].strip()
+        elif line.startswith("branch "):
+            b_ref = line[len("branch ") :].strip()
+            cur_branch = b_ref[len("refs/heads/") :] if b_ref.startswith("refs/heads/") else (b_ref or "HEAD")
+        elif line == "detached":
+            cur_branch = "HEAD"
+        elif line == "bare":
+            cur_bare = True
+
+    flush_entry()
+    return worktrees
 
 
 def is_harness_ignored(workspace: Path) -> bool:
@@ -229,12 +369,12 @@ def compute_code_tree_sha(workspace: Path, ref: str = "HEAD") -> str:
     return hash_res.stdout.strip() if hash_res.returncode == 0 else "UNBORN"
 
 
-def parse_command_segments(cmd_line: str) -> list[list[str]]:
-    """Split a shell command string into argv token segments respecting quotes and wrappers."""
+def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
+    """Split a shell command into ``(segment_text, delimiter)`` pairs respecting quotes."""
     if not cmd_line:
         return []
 
-    segments: list[str] = []
+    segments: list[tuple[str, str]] = []
     current: list[str] = []
     in_single = False
     in_double = False
@@ -268,15 +408,13 @@ def parse_command_segments(cmd_line: str) -> list[list[str]]:
         if not in_single and not in_double:
             if c in ("&", "|") and i + 1 < n and cmd_line[i + 1] == c:
                 seg = "".join(current).strip()
-                if seg:
-                    segments.append(seg)
+                segments.append((seg, c + c))
                 current = []
                 i += 2
                 continue
             if c in (";", "\n", "|", "&", "(", ")"):
                 seg = "".join(current).strip()
-                if seg:
-                    segments.append(seg)
+                segments.append((seg, c))
                 current = []
                 i += 1
                 continue
@@ -285,50 +423,126 @@ def parse_command_segments(cmd_line: str) -> list[list[str]]:
 
     tail = "".join(current).strip()
     if tail:
-        segments.append(tail)
+        segments.append((tail, ""))
+    return segments
 
-    result: list[list[str]] = []
-    for seg in segments:
-        try:
-            tokens = shlex.split(seg)
-        except Exception:
-            tokens = seg.split()
-        if not tokens:
+
+def _strip_segment_wrappers(seg: str) -> list[str]:
+    """Tokenize a single shell segment and strip env/sudo/builtin/time wrappers."""
+    if not seg:
+        return []
+    try:
+        tokens = shlex.split(seg)
+    except Exception:
+        tokens = seg.split()
+    if not tokens:
+        return []
+
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if "=" in tok and tok.split("=", 1)[0].isidentifier():
+            idx += 1
             continue
-
-        idx = 0
-        while idx < len(tokens):
-            tok = tokens[idx]
-            if "=" in tok and tok.split("=", 1)[0].isidentifier():
-                idx += 1
-                continue
-            if tok == "sudo":
-                idx += 1
-                while idx < len(tokens) and tokens[idx].startswith("-"):
-                    if tokens[idx] in ("-u", "-g", "-h", "-p", "-U"):
+        if tok == "sudo":
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                if tokens[idx] in ("-u", "-g", "-h", "-p", "-U"):
+                    idx += 2
+                else:
+                    idx += 1
+            continue
+        if tok == "env":
+            idx += 1
+            while idx < len(tokens):
+                if tokens[idx].startswith("-"):
+                    if tokens[idx] in ("-u", "-C", "-S"):
                         idx += 2
                     else:
                         idx += 1
-                continue
-            if tok == "env":
-                idx += 1
-                while idx < len(tokens):
-                    if tokens[idx].startswith("-"):
-                        idx += 1
-                    elif "=" in tokens[idx] and tokens[idx].split("=", 1)[0].isidentifier():
-                        idx += 1
-                    else:
-                        break
-                continue
-            if tok in ("nohup", "time", "builtin", "command"):
-                idx += 1
-                continue
-            break
+                elif "=" in tokens[idx] and tokens[idx].split("=", 1)[0].isidentifier():
+                    idx += 1
+                else:
+                    break
+            continue
+        if tok in ("nohup", "time", "builtin", "command"):
+            idx += 1
+            continue
+        break
 
-        cleaned = tokens[idx:]
+    return tokens[idx:]
+
+
+def parse_command_segments(cmd_line: str) -> list[list[str]]:
+    """Split a shell command string into argv token segments respecting quotes and wrappers."""
+    result: list[list[str]] = []
+    for seg, _ in _tokenize_raw_segments(cmd_line):
+        cleaned = _strip_segment_wrappers(seg)
         if cleaned:
             result.append(cleaned)
     return result
+
+
+def _resolve_dir_arg(base: Path, raw_dir: str) -> Path:
+    """Resolve a path argument relative to ``base`` normalizing ``..`` and symlinks."""
+    expanded = os.path.expanduser(raw_dir)
+    joined = expanded if os.path.isabs(expanded) else os.path.join(str(base), expanded)
+    norm = os.path.normpath(joined)
+    try:
+        return Path(os.path.realpath(norm)) if os.path.exists(norm) else Path(norm)
+    except OSError:
+        return Path(norm)
+
+
+def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path]:
+    """Compute next ``(current_cwd, prev_cwd)`` after a ``cd`` command segment."""
+    idx = 1
+    saw_double_dash = False
+    target = ""
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if not saw_double_dash and tok == "--":
+            saw_double_dash = True
+            idx += 1
+            continue
+        if not saw_double_dash and tok in ("-P", "-L", "-e", "-@"):
+            idx += 1
+            continue
+        target = tok
+        break
+
+    if not target or target == "~":
+        nxt = Path.home()
+    elif target == "-":
+        nxt = prev_cwd
+    else:
+        nxt = _resolve_dir_arg(current_cwd, target)
+    return nxt, current_cwd
+
+
+def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tuple[list[str], Path]]:
+    """Parse command segments while tracking left-to-right ``cd`` and subshell ``(...)`` state."""
+    try:
+        current_cwd = Path(os.path.realpath(str(initial_cwd)))
+    except OSError:
+        current_cwd = initial_cwd
+    prev_cwd = current_cwd
+    cwd_stack: list[tuple[Path, Path]] = []
+    out: list[tuple[list[str], Path]] = []
+
+    for raw_seg, delim in _tokenize_raw_segments(cmd_line):
+        cleaned = _strip_segment_wrappers(raw_seg)
+        if cleaned:
+            out.append((cleaned, current_cwd))
+            if cleaned[0] == "cd" and delim not in ("|", "&"):
+                current_cwd, prev_cwd = _apply_cd_segment(cleaned, current_cwd, prev_cwd)
+
+        if delim == "(":
+            cwd_stack.append((current_cwd, prev_cwd))
+        elif delim == ")" and cwd_stack:
+            current_cwd, prev_cwd = cwd_stack.pop()
+
+    return out
 
 
 def extract_install_packages(tokens: list[str]) -> list[str]:
@@ -841,6 +1055,7 @@ def compute_tree_and_stamp_state(workspace: Path, existing_cache: Optional[dict[
         "securityStampValid": sec_status == "fresh",
         "securityStampSha": sec_sha,
         "prAuditPending": isinstance(pending_data, dict),
+        "prAuditConversationId": str(pending_data.get("conversationId") or "") if isinstance(pending_data, dict) else "",
     }
 
 
@@ -960,8 +1175,12 @@ def _resolve_rel_path(workspace: Path, raw_path: str) -> tuple[str, bool]:
     return rel_path, False
 
 
-def evaluate_pre_edit(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate write_file / edit_file PreToolUse rules deterministically."""
+def evaluate_pre_edit(
+    workspace: Path,
+    hook_input: dict[str, Any],
+    on_worktree_resolved: Optional[Callable[[Path], None]] = None,
+) -> dict[str, Any]:
+    """Evaluate write_file / edit_file PreToolUse rules deterministically across linked worktrees."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
 
@@ -973,16 +1192,37 @@ def evaluate_pre_edit(workspace: Path, hook_input: dict[str, Any]) -> dict[str, 
     if tool_name not in ("write_file", "edit_file") or not file_path:
         return {"decision": "allow"}
 
+    effective_ws = workspace
     rel_path, is_external = _resolve_rel_path(workspace, file_path)
     if is_external:
-        return {"decision": "allow"}
+        expanded = os.path.expanduser(file_path)
+        try:
+            real_ws_str = os.path.realpath(str(workspace))
+        except OSError:
+            real_ws_str = os.path.normpath(str(workspace))
+        candidate = expanded if os.path.isabs(expanded) else os.path.join(real_ws_str, expanded)
+        try:
+            real_candidate = Path(os.path.realpath(candidate))
+        except OSError:
+            return {"decision": "allow"}
+
+        linked_wt = resolve_linked_worktree(workspace, real_candidate)
+        if linked_wt is None or is_harness_ignored(linked_wt):
+            return {"decision": "allow"}
+
+        rel_path, is_external = _resolve_rel_path(linked_wt, str(real_candidate))
+        if is_external or not rel_path:
+            return {"decision": "allow"}
+        effective_ws = linked_wt
+        if on_worktree_resolved is not None:
+            on_worktree_resolved(effective_ws)
 
     if rel_path == ".superpowers" or rel_path.startswith(".superpowers/") or rel_path == ".harness" or rel_path.startswith(".harness/"):
         return {"decision": "allow"}
 
     # Rule 1: main/master lock when HEAD exists
-    branch = get_branch_name(workspace)
-    if branch in ("main", "master") and get_head_oid(workspace) != "UNBORN":
+    branch = get_branch_name(effective_ws)
+    if branch in ("main", "master") and get_head_oid(effective_ws) != "UNBORN":
         if not (rel_path.startswith("docs/superpowers/specs/") or rel_path.startswith("docs/canon/")):
             return {
                 "decision": "deny",
@@ -1032,20 +1272,197 @@ def evaluate_pre_edit(workspace: Path, hook_input: dict[str, Any]) -> dict[str, 
     return {"decision": "allow"}
 
 
-def _extract_git_subcommand(seg: list[str]) -> str:
-    """Extract the git subcommand skipping global options taking arguments."""
-    skip_next = False
-    for tok in seg[1:]:
-        if skip_next:
-            skip_next = False
+def _parse_git_invocation(seg: list[str], seg_cwd: Path) -> tuple[str, Path, int]:
+    """Return ``(git_subcommand, effective_target_dir, subcommand_index)`` honoring ``-C`` and ``--work-tree``."""
+    target = seg_cwd
+    i = 1
+    n = len(seg)
+    while i < n:
+        tok = seg[i]
+        if tok == "-C":
+            if i + 1 < n:
+                target = _resolve_dir_arg(target, seg[i + 1])
+                i += 2
+                continue
+            break
+        if tok.startswith("-C") and len(tok) > 2:
+            target = _resolve_dir_arg(target, tok[2:])
+            i += 1
             continue
-        if tok in ("-C", "-c", "--git-dir", "--work-tree"):
-            skip_next = True
+        if tok == "--work-tree":
+            if i + 1 < n:
+                target = _resolve_dir_arg(target, seg[i + 1])
+                i += 2
+                continue
+            break
+        if tok.startswith("--work-tree="):
+            target = _resolve_dir_arg(target, tok[len("--work-tree=") :])
+            i += 1
+            continue
+        if tok in ("-c", "--git-dir", "--namespace", "--super-prefix", "--config-env"):
+            i += 2
+            continue
+        if tok.startswith(("--git-dir=", "--namespace=", "--super-prefix=", "--config-env=")):
+            i += 1
             continue
         if tok.startswith("-"):
+            i += 1
             continue
-        return tok
-    return ""
+        return tok, target, i
+    return "", target, -1
+
+
+def _extract_git_subcommand(seg: list[str]) -> str:
+    """Extract the git subcommand skipping global options taking arguments."""
+    return _parse_git_invocation(seg, Path.cwd())[0]
+
+
+def _extract_pkg_target_dir(seg: list[str], seg_cwd: Path) -> Path:
+    """Resolve explicit package-manager directory flags (e.g. ``npm --prefix``) against ``seg_cwd``."""
+    if not seg:
+        return seg_cwd
+    exe = os.path.basename(seg[0])
+    i = 1
+    n = len(seg)
+    while i < n:
+        tok = seg[i]
+        if exe == "npm":
+            if tok == "--prefix" and i + 1 < n:
+                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+            if tok.startswith("--prefix="):
+                return _resolve_dir_arg(seg_cwd, tok[len("--prefix=") :])
+        elif exe == "pnpm":
+            if tok in ("--dir", "-C") and i + 1 < n:
+                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+            if tok.startswith("--dir="):
+                return _resolve_dir_arg(seg_cwd, tok[len("--dir=") :])
+        elif exe == "yarn":
+            if tok == "--cwd" and i + 1 < n:
+                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+            if tok.startswith("--cwd="):
+                return _resolve_dir_arg(seg_cwd, tok[len("--cwd=") :])
+        elif exe == "uv":
+            if tok in ("--directory", "--project") and i + 1 < n:
+                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+            if tok.startswith("--directory="):
+                return _resolve_dir_arg(seg_cwd, tok[len("--directory=") :])
+            if tok.startswith("--project="):
+                return _resolve_dir_arg(seg_cwd, tok[len("--project=") :])
+        elif exe == "cargo":
+            if tok == "--manifest-path" and i + 1 < n:
+                return _resolve_dir_arg(seg_cwd, seg[i + 1]).parent
+            if tok.startswith("--manifest-path="):
+                return _resolve_dir_arg(seg_cwd, tok[len("--manifest-path=") :]).parent
+        i += 1
+    return seg_cwd
+
+
+def _resolve_segment_workspace(
+    base_workspace: Path,
+    base_common_dir: Optional[Path],
+    target_dir: Path,
+    memo: dict[str, Path],
+) -> Path:
+    """Resolve the active git worktree root for ``target_dir``, falling back to ``base_workspace``."""
+    key = str(target_dir)
+    if key in memo:
+        return memo[key]
+    linked = resolve_linked_worktree(base_workspace, target_dir, base_common_dir=base_common_dir)
+    resolved = linked if linked is not None else base_workspace
+    memo[key] = resolved
+    return resolved
+
+
+def _find_valid_gitignored_walkthrough(
+    check_ws: Path,
+    search_roots: list[Path],
+    scope_diff: list[str],
+    cached_docs: Optional[dict[str, Any]] = None,
+    diff_key: str = "",
+) -> tuple[bool, bool, str]:
+    """Check local ``docs/walkthroughs/*.md`` newest-first when ``docs/walkthroughs/*`` is gitignored.
+
+    Returns ``(found_valid, has_any_local, first_error)``.
+    """
+    ig_res = _run_git(check_ws, ["check-ignore", "-q", "docs/walkthroughs/_probe.md"])
+    if ig_res.returncode != 0:
+        return False, False, ""
+
+    candidates: list[tuple[int, str, Path]] = []
+    seen_real: set[str] = set()
+    for root in search_roots:
+        wt_dir = root / "docs" / "walkthroughs"
+        if not wt_dir.is_dir():
+            continue
+        for p in wt_dir.glob("*.md"):
+            if p.name == "_probe.md" or not p.is_file():
+                continue
+            try:
+                rp = os.path.realpath(str(p))
+            except OSError:
+                rp = str(p)
+            if rp in seen_real:
+                continue
+            seen_real.add(rp)
+            try:
+                st = p.stat()
+                candidates.append((st.st_mtime_ns, p.name, p))
+            except OSError:
+                continue
+
+    if not candidates:
+        return False, False, ""
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    c_docs = cached_docs if isinstance(cached_docs, dict) else {}
+    first_err = ""
+
+    for mtime_ns, fname, wt_path in candidates:
+        rel = f"docs/walkthroughs/{fname}"
+        c_entry = c_docs.get(rel)
+        wt_ok: Optional[bool] = None
+        wt_err = ""
+        gloss_ok: Optional[bool] = None
+
+        try:
+            st = wt_path.stat()
+            if (
+                isinstance(c_entry, dict)
+                and c_entry.get("mtimeNs") == st.st_mtime_ns
+                and c_entry.get("size") == st.st_size
+                and diff_key
+                and c_entry.get("diffKey") == diff_key
+                and "hasGlossary" in c_entry
+            ):
+                wt_ok = bool(c_entry.get("walkthroughValid"))
+                wt_err = str(c_entry.get("walkthroughError") or "")
+                gloss_ok = bool(c_entry["hasGlossary"])
+        except OSError:
+            pass
+
+        if wt_ok is None or gloss_ok is None:
+            try:
+                content = wt_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                if not first_err:
+                    first_err = "Unable to read local walkthrough file."
+                continue
+            wt_ok, wt_err = validate_walkthrough(content, scope_diff)
+            gloss_ok = has_glossary_section(content)
+
+        if not wt_ok:
+            if not first_err and wt_err:
+                first_err = wt_err
+            continue
+        if not gloss_ok:
+            if not first_err:
+                first_err = (
+                    f"documentation file '{rel}' is missing a valid Technical Glossary / Teknik Terimler Sözlüğü section."
+                )
+            continue
+        return True, True, ""
+
+    return False, True, first_err
 
 
 def _check_pkg_in_specs_with_index(workspace: Path, pkg: str, spec_index: Optional[dict[str, Any]] = None) -> bool:
@@ -1081,8 +1498,9 @@ def evaluate_pre_command(
     hook_input: dict[str, Any],
     spec_index: Optional[dict[str, Any]] = None,
     doc_cache: Optional[dict[str, Any]] = None,
+    worktree_cache_getter: Optional[Callable[[Path], dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    """Evaluate all 4 PreToolUse command gates deterministically."""
+    """Evaluate all 4 PreToolUse command gates deterministically across worktree contexts."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
 
@@ -1095,16 +1513,52 @@ def evaluate_pre_command(
     if not cmd_line:
         return {"decision": "allow"}
 
-    segments = parse_command_segments(cmd_line)
-    if not segments:
+    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, workspace)
+    if not segments_with_cwd:
         return {"decision": "allow"}
 
-    active_branch = get_branch_name(workspace)
-    rem_res = _run_git(workspace, ["remote"])
-    remotes = rem_res.stdout.strip() if rem_res.returncode == 0 else ""
-    state_dir = get_state_dir(workspace)
+    try:
+        real_base_ws = Path(os.path.realpath(str(workspace)))
+    except OSError:
+        real_base_ws = workspace
+    _, base_common_dir = get_git_repo_identity(workspace)
+    ws_resolve_memo: dict[str, Path] = {}
+    ws_ctx_memo: dict[str, dict[str, Any]] = {}
 
-    for seg in segments:
+    def get_ws_ctx(seg_ws: Path) -> dict[str, Any]:
+        key = str(seg_ws)
+        if key in ws_ctx_memo:
+            return ws_ctx_memo[key]
+        try:
+            is_base = Path(os.path.realpath(str(seg_ws))) == real_base_ws
+        except OSError:
+            is_base = seg_ws == workspace
+
+        if is_base:
+            s_idx = spec_index
+            d_cache = doc_cache
+        elif worktree_cache_getter is not None:
+            wt_caches = worktree_cache_getter(seg_ws) or {}
+            s_idx = wt_caches.get("specPackages")
+            d_cache = wt_caches.get("docValidation")
+        else:
+            s_idx = None
+            d_cache = None
+
+        rem_res = _run_git(seg_ws, ["remote"])
+        ctx = {
+            "ignored": (not is_base) and is_harness_ignored(seg_ws),
+            "branch": get_branch_name(seg_ws),
+            "remRes": rem_res,
+            "remotes": rem_res.stdout.strip() if rem_res.returncode == 0 else "",
+            "stateDir": get_state_dir(seg_ws),
+            "specIndex": s_idx,
+            "docCache": d_cache,
+        }
+        ws_ctx_memo[key] = ctx
+        return ctx
+
+    for seg, seg_cwd in segments_with_cwd:
         if not seg:
             continue
         exe_base = os.path.basename(seg[0])
@@ -1130,11 +1584,18 @@ def evaluate_pre_command(
 
         # Gate 2: PR-only main/master guard
         if exe_base == "git":
-            git_subcmd = _extract_git_subcommand(seg)
+            git_subcmd, git_target_dir, subcmd_idx = _parse_git_invocation(seg, seg_cwd)
+            seg_ws = _resolve_segment_workspace(workspace, base_common_dir, git_target_dir, ws_resolve_memo)
+            ctx = get_ws_ctx(seg_ws)
+            if ctx["ignored"]:
+                continue
+            active_branch = ctx["branch"]
+            rem_res = ctx["remRes"]
+            remotes = ctx["remotes"]
+
             if git_subcmd == "push":
-                push_idx = seg.index("push") if "push" in seg else -1
-                if push_idx >= 0:
-                    pos = [t for t in seg[push_idx + 1 :] if not t.startswith("-")]
+                if subcmd_idx >= 0:
+                    pos = [t for t in seg[subcmd_idx + 1 :] if not t.startswith("-")]
                     targets_main = "ok"
                     if len(pos) == 0:
                         targets_main = "bare"
@@ -1179,14 +1640,13 @@ def evaluate_pre_command(
                             "decision": "deny",
                             "reason": "Direct git merge into main/master is blocked when a remote is configured. Pull requests are required.",
                         }
-                    merge_idx = seg.index("merge") if "merge" in seg else -1
-                    pos = [t for t in seg[merge_idx + 1 :] if not t.startswith("-")] if merge_idx >= 0 else []
+                    pos = [t for t in seg[subcmd_idx + 1 :] if not t.startswith("-")] if subcmd_idx >= 0 else []
                     target_branch = pos[0] if pos else ""
                     if target_branch:
-                        mb_res = _run_git(workspace, ["merge-base", "HEAD", target_branch])
+                        mb_res = _run_git(seg_ws, ["merge-base", "HEAD", target_branch])
                         merge_base = mb_res.stdout.strip() if mb_res.returncode == 0 else "HEAD"
-                        diff_res = _run_git(workspace, ["diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}..{target_branch}"])
-                        all_res = _run_git(workspace, ["diff", "--name-only", f"{merge_base}..{target_branch}"])
+                        diff_res = _run_git(seg_ws, ["diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}..{target_branch}"])
+                        all_res = _run_git(seg_ws, ["diff", "--name-only", f"{merge_base}..{target_branch}"])
                         if diff_res.returncode != 0 or all_res.returncode != 0:
                             return {
                                 "decision": "deny",
@@ -1195,19 +1655,42 @@ def evaluate_pre_command(
                         diff_files = [l for l in diff_res.stdout.splitlines() if l.strip()]
                         all_merge_diff = [l for l in all_res.stdout.splitlines() if l.strip()]
 
+                        wt_for_branch: Optional[Path] = None
+                        for wt_info in list_linked_worktrees(seg_ws):
+                            if wt_info.get("branch") == target_branch:
+                                wt_for_branch = Path(wt_info["path"])
+                                break
+
                         walkthrough_found = False
                         has_any_wt = False
                         wt_err = ""
                         for f in diff_files:
                             if f.startswith("docs/walkthroughs/") and f.endswith(".md"):
                                 has_any_wt = True
-                                show_res = _run_git(workspace, ["show", f"{target_branch}:{f}"])
+                                show_res = _run_git(seg_ws, ["show", f"{target_branch}:{f}"])
                                 wt_content = show_res.stdout if show_res.returncode == 0 else ""
                                 ok, err = validate_walkthrough(wt_content, all_merge_diff)
                                 if ok:
                                     walkthrough_found = True
                                     break
                                 wt_err = err
+                        if not walkthrough_found:
+                            check_ws = wt_for_branch or seg_ws
+                            search_roots = (
+                                [wt_for_branch, seg_ws]
+                                if (wt_for_branch is not None and wt_for_branch != seg_ws)
+                                else [seg_ws]
+                            )
+                            local_ok, local_has_any, local_err = _find_valid_gitignored_walkthrough(
+                                check_ws, search_roots, all_merge_diff
+                            )
+                            if local_ok:
+                                walkthrough_found = True
+                            elif local_has_any:
+                                has_any_wt = True
+                                if local_err:
+                                    wt_err = local_err
+
                         if not walkthrough_found:
                             if not has_any_wt:
                                 return {
@@ -1220,7 +1703,7 @@ def evaluate_pre_command(
                             if f in ("docs/canon/glossary.md", "docs/parking-lot.md"):
                                 continue
                             if f == "README.md" or (f.startswith("docs/") and f.endswith(".md")):
-                                show_doc = _run_git(workspace, ["show", f"{target_branch}:{f}"])
+                                show_doc = _run_git(seg_ws, ["show", f"{target_branch}:{f}"])
                                 doc_content = show_doc.stdout if show_doc.returncode == 0 else ""
                                 if not has_glossary_section(doc_content):
                                     return {
@@ -1229,8 +1712,15 @@ def evaluate_pre_command(
                                     }
 
                         target_slug = slugify_branch(target_branch)
-                        target_state_dir = workspace / ".harness" / "state" / target_slug
-                        target_tree_sha = compute_code_tree_sha(workspace, target_branch)
+                        target_state_dir = seg_ws / ".harness" / "state" / target_slug
+                        if (
+                            (not (target_state_dir / "canon-pass.json").is_file() or not (target_state_dir / "security-pass.json").is_file())
+                            and wt_for_branch is not None
+                        ):
+                            wt_state_dir = wt_for_branch / ".harness" / "state" / target_slug
+                            if (wt_state_dir / "canon-pass.json").is_file() and (wt_state_dir / "security-pass.json").is_file():
+                                target_state_dir = wt_state_dir
+                        target_tree_sha = compute_code_tree_sha(seg_ws, target_branch)
 
                         canon_path = target_state_dir / "canon-pass.json"
                         sec_path = target_state_dir / "security-pass.json"
@@ -1256,31 +1746,43 @@ def evaluate_pre_command(
         # Gate 3: Package install verification
         pkgs = extract_install_packages(seg)
         if pkgs:
-            verified_data = read_json_file(state_dir / "context7-verified.json") or {}
-            verified_pkgs = verified_data.get("packages") if isinstance(verified_data.get("packages"), dict) else {}
-            unverified: list[str] = []
-            for pkg in pkgs:
-                if verified_pkgs.get(pkg) is not None:
-                    continue
-                if _check_pkg_in_specs_with_index(workspace, pkg, spec_index=spec_index):
-                    continue
-                unverified.append(pkg)
-            if unverified:
-                return {
-                    "decision": "deny",
-                    "reason": (
-                        f"Package install blocked: unverified package(s): {' '.join(unverified)}. "
-                        "Verify versions using dependency-versions / context7 before installing. "
-                        "Run: stamp-gate.sh context7 --package <pkg> --version <ver> --source <locked|greenfield-latest>"
-                    ),
-                }
+            pkg_target_dir = _extract_pkg_target_dir(seg, seg_cwd)
+            seg_ws = _resolve_segment_workspace(workspace, base_common_dir, pkg_target_dir, ws_resolve_memo)
+            ctx = get_ws_ctx(seg_ws)
+            if not ctx["ignored"]:
+                verified_data = read_json_file(ctx["stateDir"] / "context7-verified.json") or {}
+                verified_pkgs = verified_data.get("packages") if isinstance(verified_data.get("packages"), dict) else {}
+                unverified: list[str] = []
+                for pkg in pkgs:
+                    if verified_pkgs.get(pkg) is not None:
+                        continue
+                    if _check_pkg_in_specs_with_index(seg_ws, pkg, spec_index=ctx["specIndex"]):
+                        continue
+                    unverified.append(pkg)
+                if unverified:
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            f"Package install blocked: unverified package(s): {' '.join(unverified)}. "
+                            "Verify versions using dependency-versions / context7 before installing. "
+                            "Run: stamp-gate.sh context7 --package <pkg> --version <ver> --source <locked|greenfield-latest>"
+                        ),
+                    }
 
         # Gate 4: 5-point hard PR gate (gh pr create)
         if exe_base == "gh":
             pr_idx = seg.index("pr") if "pr" in seg else None
             create_idx = seg.index("create") if "create" in seg else None
             if pr_idx is not None and create_idx is not None and create_idx == pr_idx + 1:
-                base = _resolve_base_branch(workspace)
+                seg_ws = _resolve_segment_workspace(workspace, base_common_dir, seg_cwd, ws_resolve_memo)
+                ctx = get_ws_ctx(seg_ws)
+                if ctx["ignored"]:
+                    continue
+                active_branch = ctx["branch"]
+                state_dir = ctx["stateDir"]
+                seg_doc_cache = ctx["docCache"]
+
+                base = _resolve_base_branch(seg_ws)
                 if not base:
                     return {
                         "decision": "deny",
@@ -1291,7 +1793,7 @@ def evaluate_pre_command(
                         "decision": "deny",
                         "reason": "PR creation blocked: pull requests cannot be opened from main/master branch",
                     }
-                st_res = _run_git(workspace, ["status", "--porcelain"])
+                st_res = _run_git(seg_ws, ["status", "--porcelain"])
                 if st_res.returncode != 0:
                     return {
                         "decision": "deny",
@@ -1303,11 +1805,11 @@ def evaluate_pre_command(
                         "reason": "PR creation blocked: working tree is dirty. Commit or stash all changes before creating PR.",
                     }
 
-                mb_res = _run_git(workspace, ["merge-base", base, "HEAD"])
+                mb_res = _run_git(seg_ws, ["merge-base", base, "HEAD"])
                 merge_base = mb_res.stdout.strip() if mb_res.returncode == 0 else base
-                diff_key = f"{merge_base}..{get_head_oid(workspace)}"
-                diff_res = _run_git(workspace, ["diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}..HEAD"])
-                all_res = _run_git(workspace, ["diff", "--name-only", f"{merge_base}..HEAD"])
+                diff_key = f"{merge_base}..{get_head_oid(seg_ws)}"
+                diff_res = _run_git(seg_ws, ["diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}..HEAD"])
+                all_res = _run_git(seg_ws, ["diff", "--name-only", f"{merge_base}..HEAD"])
                 if diff_res.returncode != 0 or all_res.returncode != 0:
                     return {
                         "decision": "deny",
@@ -1319,12 +1821,12 @@ def evaluate_pre_command(
                 walkthrough_found = False
                 has_any_wt = False
                 wt_err = ""
-                cached_docs = doc_cache.get("docs", {}) if isinstance(doc_cache, dict) else {}
+                cached_docs = seg_doc_cache.get("docs", {}) if isinstance(seg_doc_cache, dict) else {}
 
                 for f in diff_files:
                     if f.startswith("docs/walkthroughs/") and f.endswith(".md"):
                         has_any_wt = True
-                        wt_path = workspace / f
+                        wt_path = seg_ws / f
                         if wt_path.is_file():
                             try:
                                 fst = wt_path.stat()
@@ -1349,6 +1851,17 @@ def evaluate_pre_command(
                             wt_err = err
 
                 if not walkthrough_found:
+                    local_ok, local_has_any, local_err = _find_valid_gitignored_walkthrough(
+                        seg_ws, [seg_ws], all_diff, cached_docs=cached_docs, diff_key=diff_key
+                    )
+                    if local_ok:
+                        walkthrough_found = True
+                    elif local_has_any:
+                        has_any_wt = True
+                        if local_err:
+                            wt_err = local_err
+
+                if not walkthrough_found:
                     if not has_any_wt:
                         return {
                             "decision": "deny",
@@ -1360,7 +1873,7 @@ def evaluate_pre_command(
                     if f in ("docs/canon/glossary.md", "docs/parking-lot.md"):
                         continue
                     if f == "README.md" or (f.startswith("docs/") and f.endswith(".md")):
-                        doc_path = workspace / f
+                        doc_path = seg_ws / f
                         if doc_path.is_file():
                             try:
                                 fst = doc_path.stat()
@@ -1384,7 +1897,7 @@ def evaluate_pre_command(
                                     "reason": f"PR creation blocked: documentation file '{f}' is missing a valid Technical Glossary / Teknik Terimler Sözlüğü section.",
                                 }
 
-                stamps_ok, verify_err = verify_pr_stamps(workspace)
+                stamps_ok, verify_err = verify_pr_stamps(seg_ws)
                 if not stamps_ok:
                     return {
                         "decision": "deny",
@@ -1395,7 +1908,7 @@ def evaluate_pre_command(
                 allowed_files = canon_data.get("allowedFiles")
                 if isinstance(allowed_files, list) and len(allowed_files) > 0:
                     allowed_set = set(str(x) for x in allowed_files)
-                    base_diff_res = _run_git(workspace, ["diff", "--name-only", f"{base}..HEAD"])
+                    base_diff_res = _run_git(seg_ws, ["diff", "--name-only", f"{base}..HEAD"])
                     if base_diff_res.returncode != 0:
                         return {
                             "decision": "deny",
@@ -1452,6 +1965,7 @@ def evaluate_post_command(
     workspace: Path,
     hook_input: dict[str, Any],
     on_graphify_trigger: Optional[Callable[[Path, str], None]] = None,
+    on_worktree_touched: Optional[Callable[[Path], None]] = None,
 ) -> dict[str, Any]:
     """Handle PostToolUse automation: set pr-audit-pending and trigger/queue graphify updates."""
     if is_harness_ignored(workspace):
@@ -1474,14 +1988,16 @@ def evaluate_post_command(
     if not cmd_line:
         return {}
 
-    segments = parse_command_segments(cmd_line)
-    if not segments:
+    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, workspace)
+    if not segments_with_cwd:
         return {}
 
-    active_branch = get_branch_name(workspace)
+    _, base_common_dir = get_git_repo_identity(workspace)
+    ws_resolve_memo: dict[str, Path] = {}
+    conv_id = str(hook_input.get("conversationId") or "").strip()
     trigger_fn = on_graphify_trigger or (lambda ws, _reason: run_sync_graphify(ws))
 
-    for seg in segments:
+    for seg, seg_cwd in segments_with_cwd:
         if not seg:
             continue
         exe_base = os.path.basename(seg[0])
@@ -1490,35 +2006,554 @@ def evaluate_post_command(
             pr_idx = seg.index("pr") if "pr" in seg else None
             create_idx = seg.index("create") if "create" in seg else None
             if pr_idx is not None and create_idx is not None and create_idx == pr_idx + 1:
-                tool_output = hook_input.get("toolOutput")
-                if isinstance(tool_output, dict):
-                    if "output" in tool_output and tool_output["output"] is not None:
-                        raw_out = str(tool_output["output"])
+                seg_ws = _resolve_segment_workspace(workspace, base_common_dir, seg_cwd, ws_resolve_memo)
+                if not (seg_ws != workspace and is_harness_ignored(seg_ws)):
+                    tool_output = hook_input.get("toolOutput")
+                    if isinstance(tool_output, dict):
+                        if "output" in tool_output and tool_output["output"] is not None:
+                            raw_out = str(tool_output["output"])
+                        else:
+                            raw_out = json.dumps(tool_output)
+                    elif tool_output is not None:
+                        raw_out = str(tool_output)
                     else:
-                        raw_out = json.dumps(tool_output)
-                elif tool_output is not None:
-                    raw_out = str(tool_output)
-                else:
-                    raw_out = str(hook_input.get("output") or "")
-                m_url = re.search(r"https?://[^ ]+/pull/[0-9]+", raw_out)
-                pr_url = m_url.group(0) if m_url else raw_out.replace("\n", "").rstrip()
-                state_dir = get_state_dir(workspace)
-                atomic_write_json(
-                    state_dir,
-                    "pr-audit-pending.json",
-                    {"prUrl": pr_url, "stopRetries": 0, "auditDispatched": False},
-                )
+                        raw_out = str(hook_input.get("output") or "")
+                    m_url = re.search(r"https?://[^ ]+/pull/[0-9]+", raw_out)
+                    pr_url = m_url.group(0) if m_url else raw_out.replace("\n", "").rstrip()
+                    state_dir = get_state_dir(seg_ws)
+                    pending_payload: dict[str, Any] = {
+                        "prUrl": pr_url,
+                        "stopRetries": 0,
+                        "auditDispatched": False,
+                    }
+                    if conv_id:
+                        pending_payload["conversationId"] = conv_id
+                    with locked_state_file(state_dir, "pr-audit-pending"):
+                        atomic_write_json(state_dir, "pr-audit-pending.json", pending_payload)
+                    if on_worktree_touched is not None:
+                        on_worktree_touched(seg_ws)
 
             merge_idx = seg.index("merge") if "merge" in seg else None
             if pr_idx is not None and merge_idx is not None and merge_idx == pr_idx + 1:
-                trigger_fn(workspace, "gh_pr_merge")
+                seg_ws = _resolve_segment_workspace(workspace, base_common_dir, seg_cwd, ws_resolve_memo)
+                if not (seg_ws != workspace and is_harness_ignored(seg_ws)):
+                    trigger_fn(seg_ws, "gh_pr_merge")
 
         elif exe_base == "git":
-            git_subcmd = _extract_git_subcommand(seg)
-            if active_branch in ("main", "master") and git_subcmd in ("merge", "pull"):
-                trigger_fn(workspace, f"git_{git_subcmd}")
+            git_subcmd, git_target_dir, _ = _parse_git_invocation(seg, seg_cwd)
+            if git_subcmd in ("merge", "pull"):
+                seg_ws = _resolve_segment_workspace(workspace, base_common_dir, git_target_dir, ws_resolve_memo)
+                if not (seg_ws != workspace and is_harness_ignored(seg_ws)):
+                    if get_branch_name(seg_ws) in ("main", "master"):
+                        trigger_fn(seg_ws, f"git_{git_subcmd}")
 
     return {}
+
+
+EFFORT_PROFILE_HEADERS = {
+    "LOW": "[EFFORT_PROFILE: LOW — Hedef odaklı çalış; en fazla 3 okuma turu yap, spekülatif dallanma yapma, yanıtı kısa tut.]",
+    "MEDIUM": "[EFFORT_PROFILE: MEDIUM — Standart TDD döngüsü uygula; yalnız görev kapsamındaki dosyaları ve doğrudan bağımlılıklarını incele.]",
+    "HIGH": "[EFFORT_PROFILE: HIGH — Katman sınırlarını, LSP tanılamalarını ve kenar durumları çapraz doğrula; her iddiayı dosya/satır kanıtına bağla.]",
+    "XHIGH": "[EFFORT_PROFILE: XHIGH — Derin çok adımlı muhakeme uygula; katman sözleşmelerini, tip güvenliğini ve tüm hata/kenar yollarını uçtan uca doğrula.]",
+    "MAX": "[EFFORT_PROFILE: MAX — Sıfır varsayım; tüm bağımlılık zincirini, karşı-örnekleri ve güvenlik/kanon değişmezlerini satır satır kanıtla.]",
+}
+TIER_DEFAULT_EFFORT = {
+    "trivial_lookup": "LOW",
+    "bounded_execution": "MEDIUM",
+    "multi_module_integration": "HIGH",
+    "critical_architecture_or_audit": "MAX",
+}
+SELF_PR_AUDIT_RE = re.compile(
+    r"(pr[-_\s]*audit|post[-_\s]*pr|review[-_\s]*pr|pr[-_\s]*review|pr[-_\s]*denet|pull[-_\s]*request[-_\s]*(?:audit|review))"
+)
+PROMPT_ABS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.-])(/[^\s\"'`<>()\[\],;]+)")
+
+
+def is_valid_effort_profile(effort: str) -> bool:
+    """Return True if ``effort`` is one of LOW|MEDIUM|HIGH|XHIGH|MAX."""
+    return effort in EFFORT_PROFILE_HEADERS
+
+
+def default_effort_for_tier(tier: str) -> Optional[str]:
+    """Return default EFFORT_PROFILE for a dispatch complexity tier."""
+    return TIER_DEFAULT_EFFORT.get(tier)
+
+
+def resolve_subagent_model(
+    parent_model: str,
+    tier: str,
+    caller_model: str = "",
+    floor_upgraded: bool = False,
+) -> str:
+    """Resolve parent-aware Antigravity ``invoke_subagent`` Model tier."""
+    family = classify_parent_model(parent_model)
+    if tier == "trivial_lookup":
+        return "flash_lite"
+    if tier == "bounded_execution":
+        if family in ("orchestrator", "hydrogen", "argon_low"):
+            return "inherit"
+        if family in ("carbon", "argon", "claude"):
+            return "pro"
+        return "flash"
+    if tier == "multi_module_integration":
+        if family in ("orchestrator", "argon", "claude", "custom"):
+            return "inherit"
+        if family == "carbon":
+            return "inherit" if caller_model == "inherit" else "pro"
+        if family in ("argon_low", "hydrogen", "flash"):
+            return "pro"
+        return "pro" if floor_upgraded else "inherit"
+    if tier == "critical_architecture_or_audit":
+        if family in ("orchestrator", "carbon", "argon", "claude", "custom"):
+            return "inherit"
+        return "pro"
+    raise ValueError(f"Unknown subagent dispatch tier: {tier}")
+
+
+def dispatch_register(
+    workspace: Path,
+    role: str,
+    type_name: str,
+    tier: str,
+    model: str,
+    effort: str,
+    timestamp: Optional[str] = None,
+) -> None:
+    """Atomically register a subagent dispatch entry in ``subagent-dispatch.json`` under ``flock``."""
+    state_dir = get_state_dir(workspace)
+    ts = timestamp or utc_now_iso()
+    with locked_state_file(state_dir, "subagent-dispatch"):
+        dispatch_path = state_dir / "subagent-dispatch.json"
+        existing = read_json_file(dispatch_path)
+        if not isinstance(existing, dict) or not isinstance(existing.get("entries"), dict):
+            existing = {"entries": {}}
+        entries = dict(existing["entries"])
+        entries[role] = {
+            "typeName": type_name,
+            "tier": tier,
+            "model": model,
+            "effortProfile": effort,
+            "consumed": False,
+            "timestamp": ts,
+        }
+        existing["entries"] = entries
+        atomic_write_json(state_dir, "subagent-dispatch.json", existing)
+
+
+def context7_register(
+    workspace: Path,
+    pkg: str,
+    ver: str,
+    src: str,
+    timestamp: Optional[str] = None,
+) -> None:
+    """Atomically register a verified Context7 package entry under ``flock``."""
+    state_dir = get_state_dir(workspace)
+    ts = timestamp or utc_now_iso()
+    with locked_state_file(state_dir, "context7-verified"):
+        c7_path = state_dir / "context7-verified.json"
+        existing = read_json_file(c7_path)
+        if not isinstance(existing, dict) or not isinstance(existing.get("packages"), dict):
+            existing = {"packages": {}}
+        pkgs = dict(existing["packages"])
+        pkgs[pkg] = {"version": ver, "source": src, "timestamp": ts}
+        existing["packages"] = pkgs
+        atomic_write_json(state_dir, "context7-verified.json", existing)
+
+
+def _ordered_candidate_worktrees(workspace: Path, prompt_text: str = "") -> list[Path]:
+    """Return ``[workspace]`` followed by prompt-mentioned siblings and remaining linked worktrees."""
+    try:
+        real_ws = Path(os.path.realpath(str(workspace)))
+    except OSError:
+        real_ws = workspace
+    real_ws_str = str(real_ws)
+
+    siblings: list[tuple[Path, str, str]] = []
+    seen_real: set[str] = {real_ws_str}
+    for wt in list_linked_worktrees(workspace):
+        wt_real = wt.get("path") or ""
+        wt_raw = wt.get("rawPath") or wt_real
+        if not wt_real or wt_real in seen_real:
+            continue
+        wt_path = Path(wt_real)
+        if not wt_path.is_dir() or is_harness_ignored(wt_path):
+            continue
+        seen_real.add(wt_real)
+        siblings.append((wt_path, wt_real, wt_raw))
+
+    if not siblings:
+        return [real_ws]
+
+    mentioned_rank: dict[str, tuple[int, int]] = {}
+    if prompt_text:
+        for idx, (wt_path, wt_real, wt_raw) in enumerate(siblings):
+            best_pos: Optional[int] = None
+            for cand in dict.fromkeys((wt_real, wt_raw)):
+                if not cand:
+                    continue
+                m = re.search(re.escape(cand) + r"(?=/|[^A-Za-z0-9_.-]|$)", prompt_text)
+                if m is not None and (best_pos is None or m.start() < best_pos):
+                    best_pos = m.start()
+            if best_pos is not None:
+                mentioned_rank[wt_real] = (best_pos, -len(wt_real))
+
+        for m in PROMPT_ABS_PATH_RE.finditer(prompt_text):
+            raw_tok = m.group(1)
+            tok_pos = m.start(1)
+            cand_dir = _nearest_existing_dir(Path(raw_tok))
+            if cand_dir is None:
+                continue
+            try:
+                real_tok = os.path.realpath(str(cand_dir))
+            except OSError:
+                real_tok = str(cand_dir)
+            for wt_path, wt_real, _ in siblings:
+                if real_tok == wt_real or real_tok.startswith(wt_real + "/"):
+                    prev = mentioned_rank.get(wt_real)
+                    cand_rank = (tok_pos, -len(wt_real))
+                    if prev is None or cand_rank < prev:
+                        mentioned_rank[wt_real] = cand_rank
+
+    mentioned = [wt for wt, wt_real, _ in siblings if wt_real in mentioned_rank]
+    mentioned.sort(key=lambda p: mentioned_rank[str(p)])
+    unmentioned = [wt for wt, wt_real, _ in siblings if wt_real not in mentioned_rank]
+    return [real_ws, *mentioned, *unmentioned]
+
+
+def _conversation_matches(record: dict[str, Any], current_conv_id: str) -> tuple[bool, bool]:
+    """Return ``(is_compatible, is_exact_match)`` comparing optional ``conversationId`` fields."""
+    rec_conv = str(record.get("conversationId") or "").strip()
+    cur_conv = current_conv_id.strip()
+    if rec_conv and cur_conv:
+        matched = rec_conv == cur_conv
+        return matched, matched
+    return True, False
+
+
+def _existing_state_dir(wt: Path) -> Optional[Path]:
+    """Return ``wt/.harness/state/<slug>`` only if it already exists on disk."""
+    state_dir = wt / ".harness" / "state" / get_branch_slug(wt)
+    return state_dir if state_dir.is_dir() else None
+
+
+def mark_pr_audit_dispatched(
+    workspace: Path,
+    hook_input: dict[str, Any],
+    preferred_ws: Optional[Path] = None,
+) -> None:
+    """Atomically set ``auditDispatched = True`` on matching ``pr-audit-pending.json``."""
+    args = (hook_input.get("toolCall") or {}).get("args") if isinstance(hook_input.get("toolCall"), dict) else {}
+    prompt_text = str(args.get("Prompt") or "") if isinstance(args, dict) else ""
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
+
+    ordered: list[Path] = []
+    seen: set[str] = set()
+    if preferred_ws is not None:
+        try:
+            real_pref = Path(os.path.realpath(str(preferred_ws)))
+        except OSError:
+            real_pref = preferred_ws
+        ordered.append(real_pref)
+        seen.add(str(real_pref))
+    for wt in _ordered_candidate_worktrees(workspace, prompt_text):
+        key = str(wt)
+        if key not in seen:
+            seen.add(key)
+            ordered.append(wt)
+
+    passes = (True, False) if cur_conv else (False,)
+    for require_exact in passes:
+        for wt in ordered:
+            state_dir = _existing_state_dir(wt)
+            if state_dir is None:
+                continue
+            pending_file = state_dir / "pr-audit-pending.json"
+            if not pending_file.is_file():
+                continue
+            with locked_state_file(state_dir, "pr-audit-pending"):
+                data = read_json_file(pending_file)
+                if not isinstance(data, dict) or bool(data.get("auditDispatched", False)) is True:
+                    continue
+                matches, exact = _conversation_matches(data, cur_conv)
+                if not matches:
+                    continue
+                if require_exact and not exact:
+                    continue
+                data["auditDispatched"] = True
+                atomic_write_json(state_dir, "pr-audit-pending.json", data)
+                return
+
+
+def _try_consume_optional_dispatch(
+    candidates: list[Path],
+    role: str,
+) -> tuple[Optional[dict[str, Any]], Optional[Path]]:
+    """Consume an unconsumed ``role`` entry across candidate worktrees if present."""
+    if not role:
+        return None, None
+    for wt in candidates:
+        state_dir = _existing_state_dir(wt)
+        if state_dir is None:
+            continue
+        dispatch_file = state_dir / "subagent-dispatch.json"
+        if not dispatch_file.is_file():
+            continue
+        with locked_state_file(state_dir, "subagent-dispatch"):
+            data = read_json_file(dispatch_file)
+            if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+                continue
+            entry = data["entries"].get(role)
+            if not isinstance(entry, dict) or entry.get("consumed") is not False:
+                continue
+            entry["consumed"] = True
+            atomic_write_json(state_dir, "subagent-dispatch.json", data)
+            return dict(entry), wt
+    return None, None
+
+
+def _build_subagent_overwrite(model: str, effort: str, orig_prompt: str) -> dict[str, Any]:
+    """Construct ``invoke_subagent`` PreToolUse allow+overwrite response preserving prompt bytes."""
+    header = EFFORT_PROFILE_HEADERS[effort]
+    new_prompt = orig_prompt if orig_prompt.startswith("[EFFORT_PROFILE:") else f"{header}\n\n{orig_prompt}"
+    return {"decision": "allow", "overwrite": {"Model": model, "Prompt": new_prompt}}
+
+
+def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate ``invoke_subagent`` PreToolUse guard with atomic locking and worktree discovery."""
+    if is_harness_ignored(workspace):
+        return {"decision": "allow"}
+    if not isinstance(hook_input, dict):
+        return {"decision": "allow"}
+
+    tool_call = hook_input.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return {"decision": "allow"}
+    tool_name = str(tool_call.get("name") or "")
+    if tool_name and tool_name != "invoke_subagent":
+        return {"decision": "allow"}
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        return {"decision": "allow"}
+
+    parent_model = str(hook_input.get("modelName") or "")
+    type_name = str(args.get("TypeName") or "")
+    role = str(args.get("Role") or "")
+    caller_model = str(args.get("Model") or "")
+    orig_prompt = str(args.get("Prompt") or "")
+
+    if type_name == "image-generator":
+        return {"decision": "allow"}
+
+    if type_name == "browser":
+        if not caller_model.strip():
+            return {"decision": "allow", "overwrite": {"Model": "flash"}}
+        return {"decision": "allow"}
+
+    if type_name == "security-reviewer":
+        candidates = _ordered_candidate_worktrees(workspace, orig_prompt) if role else []
+        _try_consume_optional_dispatch(candidates, role)
+        sec_model = resolve_subagent_model(parent_model, "critical_architecture_or_audit", caller_model, False)
+        return _build_subagent_overwrite(sec_model, "MAX", orig_prompt)
+
+    if type_name == "pr-auditor":
+        pr_effort = "HIGH"
+        matched_ws: Optional[Path] = None
+        if role:
+            candidates = _ordered_candidate_worktrees(workspace, orig_prompt)
+            entry, matched_ws = _try_consume_optional_dispatch(candidates, role)
+            if entry is not None:
+                reg_effort = str(entry.get("effortProfile") or "")
+                if reg_effort in ("MAX", "XHIGH"):
+                    pr_effort = reg_effort
+        pr_model = resolve_subagent_model(parent_model, "critical_architecture_or_audit", caller_model, False)
+        mark_pr_audit_dispatched(workspace, hook_input, preferred_ws=matched_ws)
+        return _build_subagent_overwrite(pr_model, pr_effort, orig_prompt)
+
+    if not role:
+        return {
+            "decision": "deny",
+            "reason": (
+                f"Alt ajan çağrısı reddedildi ('{type_name}'): Role alanı boş olamaz. "
+                f"Önce görev karmaşıklığını jev_classify / jev_score ile sınıflandırın ve "
+                f"'scripts/stamp-gate.sh dispatch --role <Role> --type \"{type_name}\" --tier <katman>' komutunu çalıştırın."
+            ),
+        }
+
+    candidates = _ordered_candidate_worktrees(workspace, orig_prompt)
+    matched_entry: Optional[dict[str, Any]] = None
+    matched_ws = None
+    mismatch_type = ""
+    invalid_entry = False
+    saw_consumed = False
+
+    for wt in candidates:
+        state_dir = _existing_state_dir(wt)
+        if state_dir is None:
+            continue
+        dispatch_file = state_dir / "subagent-dispatch.json"
+        if not dispatch_file.is_file():
+            continue
+        with locked_state_file(state_dir, "subagent-dispatch"):
+            data = read_json_file(dispatch_file)
+            if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+                continue
+            entry = data["entries"].get(role)
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("consumed") is not False:
+                saw_consumed = True
+                continue
+            entry_type = str(entry.get("typeName") or "")
+            if entry_type and entry_type != type_name:
+                if not mismatch_type:
+                    mismatch_type = entry_type
+                continue
+            model = str(entry.get("model") or "")
+            effort = str(entry.get("effortProfile") or "")
+            if not model or not is_valid_effort_profile(effort):
+                invalid_entry = True
+                continue
+            entry["consumed"] = True
+            atomic_write_json(state_dir, "subagent-dispatch.json", data)
+            matched_entry = dict(entry)
+            matched_ws = wt
+            break
+
+    if matched_entry is None:
+        if mismatch_type:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"Alt ajan çağrısı reddedildi: '{role}' kaydı '{mismatch_type}' tipi için oluşturulmuş, "
+                    f"ancak '{type_name}' çağrıldı. jev_classify / jev_score sonrası "
+                    f"'scripts/stamp-gate.sh dispatch --role \"{role}\" --type \"{type_name}\" --tier <katman>' komutunu çalıştırın."
+                ),
+            }
+        if invalid_entry:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"Alt ajan çağrısı reddedildi ('{type_name}' / Role: '{role}'): "
+                    "subagent-dispatch.json kaydı geçersiz model veya effortProfile içeriyor. "
+                    f"'scripts/stamp-gate.sh dispatch --role \"{role}\" --type \"{type_name}\" --tier <katman>' ile kaydı yenileyin."
+                ),
+            }
+        if saw_consumed:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"Alt ajan çağrısı reddedildi ('{type_name}' / Role: '{role}'): "
+                    f"subagent-dispatch.json içindeki '{role}' kaydı zaten tüketildi (consumed == true). "
+                    f"Yeni çağrı için jev_classify / jev_score sonrası "
+                    f"'scripts/stamp-gate.sh dispatch --role \"{role}\" --type \"{type_name}\" --tier <katman>' komutunu çalıştırın."
+                ),
+            }
+        return {
+            "decision": "deny",
+            "reason": (
+                f"Alt ajan çağrısı reddedildi ('{type_name}' / Role: '{role}'): "
+                "subagent-dispatch.json içinde kayıt bulunamadı. Önce görev karmaşıklığını jev_classify / jev_score "
+                f"ile sınıflandırın ve 'scripts/stamp-gate.sh dispatch --role \"{role}\" --type \"{type_name}\" --tier <katman>' komutunu çalıştırın."
+            ),
+        }
+
+    if type_name == "self" and SELF_PR_AUDIT_RE.search(role.lower()):
+        mark_pr_audit_dispatched(workspace, hook_input, preferred_ws=matched_ws)
+
+    entry_tier = str(matched_entry.get("tier") or "")
+    model = str(matched_entry.get("model") or "")
+    effort = str(matched_entry.get("effortProfile") or "")
+
+    effective_tier = entry_tier
+    tier_floor_upgraded = False
+    if type_name == "canon-auditor":
+        if entry_tier in ("trivial_lookup", "bounded_execution"):
+            effective_tier = "multi_module_integration"
+            tier_floor_upgraded = True
+        if effort in ("LOW", "MEDIUM"):
+            effort = "HIGH"
+
+    parent_family = classify_parent_model(parent_model)
+    if parent_family != "unset" and effective_tier:
+        model = resolve_subagent_model(parent_model, effective_tier, caller_model, tier_floor_upgraded)
+    elif tier_floor_upgraded:
+        model = "pro"
+
+    return _build_subagent_overwrite(model, effort, orig_prompt)
+
+
+def evaluate_stop_gate(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate Stop hook gate scoped by worktree and optional ``conversationId``."""
+    if is_harness_ignored(workspace):
+        return {}
+    if not isinstance(hook_input, dict):
+        return {}
+    if str(hook_input.get("terminationReason") or "") != "NO_TOOL_CALL":
+        return {}
+
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
+    candidates = _ordered_candidate_worktrees(workspace)
+    passes = (True, False) if cur_conv else (False,)
+    saw_exact_match = False
+
+    for require_exact in passes:
+        if not require_exact and saw_exact_match:
+            break
+        for wt in candidates:
+            state_dir = _existing_state_dir(wt)
+            if state_dir is None:
+                continue
+            pending_file = state_dir / "pr-audit-pending.json"
+            if not pending_file.is_file():
+                continue
+            with locked_state_file(state_dir, "pr-audit-pending"):
+                data = read_json_file(pending_file)
+                if not isinstance(data, dict):
+                    continue
+                matches, exact = _conversation_matches(data, cur_conv)
+                if not matches:
+                    continue
+                if exact:
+                    saw_exact_match = True
+                if require_exact and not exact:
+                    continue
+                if bool(data.get("auditDispatched", False)) is True:
+                    continue
+                raw_retries = data.get("stopRetries", 0)
+                if type(raw_retries) is not int or raw_retries < 0 or raw_retries >= 2:
+                    continue
+                data["stopRetries"] = raw_retries + 1
+                atomic_write_json(state_dir, "pr-audit-pending.json", data)
+                return {
+                    "decision": "continue",
+                    "reason": "PR açıldı; oturumu kapatmadan önce review-pr skill'ini kullanarak pr-auditor değerlendirmesini çalıştır.",
+                }
+    return {}
+
+
+def clear_pr_audit(workspace: Path) -> None:
+    """Clear ``pr-audit-pending.json`` in ``workspace`` or a dispatched sibling worktree."""
+    state_dir = get_state_dir(workspace)
+    pending_file = state_dir / "pr-audit-pending.json"
+    if pending_file.is_file():
+        with locked_state_file(state_dir, "pr-audit-pending"):
+            if pending_file.is_file():
+                pending_file.unlink()
+        return
+
+    for wt in _ordered_candidate_worktrees(workspace)[1:]:
+        wt_state_dir = _existing_state_dir(wt)
+        if wt_state_dir is None:
+            continue
+        wt_pending = wt_state_dir / "pr-audit-pending.json"
+        if not wt_pending.is_file():
+            continue
+        with locked_state_file(wt_state_dir, "pr-audit-pending"):
+            data = read_json_file(wt_pending)
+            if isinstance(data, dict) and bool(data.get("auditDispatched", False)) is True:
+                wt_pending.unlink()
+                return
 
 
 def detect_mobile_workspace(workspace: Path) -> tuple[bool, bool]:
@@ -2414,7 +3449,10 @@ def build_session_start_payload(
                 f"[DAEMON STAMP NOTICE] Stale PR stamp(s) for current HEAD ({', '.join(stale_stamps)}). Re-run pre-pr-readiness audits before gh pr create."
             )
         if tree_state.get("prAuditPending"):
-            lines.append("[DAEMON PR NOTICE] Post-PR audit is still pending (pr-audit-pending.json active); run review-pr.")
+            cur_conv = str(hook_input.get("conversationId") or "").strip()
+            pending_conv = str(tree_state.get("prAuditConversationId") or "").strip()
+            if not cur_conv or not pending_conv or cur_conv == pending_conv:
+                lines.append("[DAEMON PR NOTICE] Post-PR audit is still pending (pr-audit-pending.json active); run review-pr.")
 
     if isinstance(graphify_status, dict):
         g_state = str(graphify_status.get("state") or "")
@@ -2481,9 +3519,33 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_wt.add_argument("--wt-file", default="")
     p_wt.add_argument("--diff-file", default="")
 
-    for hook_sub in ("eval-pre-command", "eval-pre-edit", "eval-post-command", "eval-session-start"):
+    for hook_sub in (
+        "eval-pre-command",
+        "eval-pre-edit",
+        "eval-post-command",
+        "eval-session-start",
+        "eval-pre-subagent",
+        "eval-stop-gate",
+    ):
         ph = sub.add_parser(hook_sub)
         ph.add_argument("--workspace", default="")
+
+    p_disp = sub.add_parser("dispatch-register")
+    p_disp.add_argument("--workspace", default=".")
+    p_disp.add_argument("--role", required=True)
+    p_disp.add_argument("--type", required=True, dest="type_name")
+    p_disp.add_argument("--tier", required=True)
+    p_disp.add_argument("--model", required=True)
+    p_disp.add_argument("--effort", required=True)
+
+    p_c7 = sub.add_parser("context7-register")
+    p_c7.add_argument("--workspace", default=".")
+    p_c7.add_argument("--package", required=True)
+    p_c7.add_argument("--version", required=True)
+    p_c7.add_argument("--source", required=True)
+
+    p_clear_pr = sub.add_parser("clear-pr-audit")
+    p_clear_pr.add_argument("--workspace", default=".")
 
     p_doc = sub.add_parser("doctor")
     p_doc.add_argument("--workspace", default=".")
@@ -2531,6 +3593,42 @@ def main(argv: Optional[list[str]] = None) -> int:
         payload = _read_stdin_json()
         ws = _resolve_workspace_arg(args.workspace or None, payload)
         print(json.dumps(build_session_start_payload(ws, payload)))
+        return 0
+
+    if args.subcommand == "eval-pre-subagent":
+        payload = _read_stdin_json()
+        ws = _resolve_workspace_arg(args.workspace or None, payload)
+        print(json.dumps(evaluate_pre_subagent(ws, payload), ensure_ascii=False))
+        return 0
+
+    if args.subcommand == "eval-stop-gate":
+        payload = _read_stdin_json()
+        ws = _resolve_workspace_arg(args.workspace or None, payload)
+        print(json.dumps(evaluate_stop_gate(ws, payload), ensure_ascii=False))
+        return 0
+
+    if args.subcommand == "dispatch-register":
+        dispatch_register(
+            Path(args.workspace),
+            role=args.role,
+            type_name=args.type_name,
+            tier=args.tier,
+            model=args.model,
+            effort=args.effort,
+        )
+        return 0
+
+    if args.subcommand == "context7-register":
+        context7_register(
+            Path(args.workspace),
+            pkg=args.package,
+            ver=args.version,
+            src=args.source,
+        )
+        return 0
+
+    if args.subcommand == "clear-pr-audit":
+        clear_pr_audit(Path(args.workspace))
         return 0
 
     if args.subcommand == "doctor":

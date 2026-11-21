@@ -579,4 +579,55 @@ test_verify_pr_stamps_missing_and_fail_verdicts() {
   "$STAMP_GATE" verify-pr-stamps --workspace "$repo"
 }
 
+test_harness_read_stdin_whitespace_and_large_utf8_on_bin_bash() {
+  [ -x "$COMMON_SH" ] || { echo "common.sh missing or not executable" >&2; return 1; }
+
+  local repo
+  repo=$(make_temp_repo)
+
+  python3 -B - "$COMMON_SH" "$repo" <<'PY'
+import json
+import subprocess
+import sys
+import time
+
+common_sh, repo = sys.argv[1], sys.argv[2]
+
+# 1. >= 120 KB whitespace-only payload on /bin/bash -> HOOK_INPUT == "{}" in < 2s
+ws_only = ("   \t \n\r  " * 16000)
+assert len(ws_only.encode("utf-8")) >= 120 * 1024
+t0 = time.monotonic()
+p1 = subprocess.run(
+    ["/bin/bash", "-c", 'source "$1"; harness_read_stdin; printf "%s" "$HOOK_INPUT"', "_", common_sh],
+    input=ws_only,
+    text=True,
+    capture_output=True,
+    timeout=5,
+)
+dt1 = time.monotonic() - t0
+assert p1.returncode == 0, p1.stderr
+assert dt1 < 2.0, f"whitespace harness_read_stdin too slow: {dt1:.3f}s"
+assert p1.stdout == "{}", f"Expected '{{}}', got {p1.stdout!r}"
+
+# 2. >= 120 KB UTF-8 + multiline JSON payload on /bin/bash -> < 2s
+big_utf8 = ("Türkçe ğüşıöçĞÜŞİÖÇ 🚀 çok satırlı JSON   \n\t " * 2400)
+payload = json.dumps({"workspacePaths": [repo], "Content": big_utf8}, ensure_ascii=False)
+assert len(payload.encode("utf-8")) >= 120 * 1024
+t1 = time.monotonic()
+p2 = subprocess.run(
+    ["/bin/bash", "-c", 'source "$1"; harness_read_stdin; printf "%s\\n%s" "$WORKSPACE_ROOT" "${#HOOK_INPUT}"', "_", common_sh],
+    input=payload,
+    text=True,
+    capture_output=True,
+    timeout=5,
+)
+dt2 = time.monotonic() - t1
+assert p2.returncode == 0, p2.stderr
+assert dt2 < 2.0, f"UTF-8 harness_read_stdin too slow: {dt2:.3f}s"
+lines = p2.stdout.splitlines()
+assert lines[0] == repo, lines
+assert int(lines[1]) == len(payload), (lines[1], len(payload))
+PY
+}
+
 run_tests "$@"

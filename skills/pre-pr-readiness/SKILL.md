@@ -51,11 +51,12 @@ Okuyucunun IDE'yi açmadan tüm işi, mimari kararları ve her bir dosyadaki de�
    - **Kapsam Dışı ve Sözlük:** `docs/parking-lot.md` notlarını ekleyin ve dokümanı eksiksiz `## Teknik Terimler Sözlüğü` tablosuyla bitirin.
 4. **Fiziksel Hook Kuralını Unutmayın:**
    `pre-command-guard.sh`, `git diff --name-only <base>..HEAD` içindeki tek bir dosyanın bile `## Dosya Bazlı Değişiklik Analizi` altında yer almaması veya `Ne` / `Neden` açıklamalarının yüzeysel bırakılması durumunda `gh pr create` ve yerel `git merge` komutlarını `deny` ile fiziksel olarak reddeder!
-5. **Rehberi Commit Edin:**
+5. **Rehberi Commit Edin (veya `.gitignore` İstisnası):**
    ```bash
    git add docs/walkthroughs/
    git commit -m "docs: add comprehensive PR engineering walkthrough"
    ```
+   - Eğer hedef depoda `docs/walkthroughs/*` bilerek `.gitignore` altındaysa (`git check-ignore -q docs/walkthroughs/_probe.md` `0` dönüyorsa), `git add -f` yapmanıza gerek yoktur; `pre-command-guard.sh` yerel `<worktree>/docs/walkthroughs/*.md` dosyalarını en yeniden eskiye (`mtime`) tarayarak aynı `Ne`/`Neden` kapsam ve `## Teknik Terimler Sözlüğü` doğrulamasını uygular.
 
 > [!NOTE]
 > `codeTreeSha` hesabı `docs/walkthroughs/` ve `docs/parking-lot.md` dosyalarını otomatik olarak dışarıda bırakır; böylece walkthrough commit edildikten veya güncellendikten sonra denetim damgaları bozulmaz.

@@ -52,7 +52,7 @@ Geliştirici ortamını test etmek için çalışma alanı kökünde `harness-do
    - Kurulum modu (Global veya Proje Bazlı).
    - `.gitignore` veya `.git/info/exclude` içinde `.harness/` kaydı.
    - `docs/canon/{glossary,flows,lessons}.md` ve `graphify-out/graph.json` mevcudiyeti.
-   - `harness_daemon`: `sidecars/harness-daemon/sidecar.json` manifesto bütünlüğü ve canlı Unix socket `/health` durumu (`[OK]` çalışıyor, `[INFO]` yedek soğuk fallback aktif).
+   - `harness_daemon`: `sidecars/harness-daemon/sidecar.json` manifesto bütünlüğü ve canlı Unix socket `/health` durumu (`[OK]` çalışıyor, `[INFO]` yedek soğuk fallback aktif). Proje bazlı `.agents/plugins/` kurulumlarında kancalar (`HARNESS_AUTO_START_DAEMON=1`) soket yokken daemon'ı arka planda otomatik başlatır.
 
 ---
 

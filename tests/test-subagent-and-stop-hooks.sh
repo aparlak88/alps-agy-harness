@@ -901,4 +901,169 @@ test_stop_gate_allows_async_wait_when_pr_auditor_dispatched() {
   [ ! -f "$pending_file" ] || { echo "clear-pr-audit must remove pr-audit-pending.json" >&2; return 1; }
 }
 
+test_parallel_subagent_dispatch_locking_and_sibling_worktree_discovery() {
+  local main_repo wt_parent wt_backend wt_ios
+  main_repo=$(make_temp_repo)
+  echo "init" > "$main_repo/README.md"
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+
+  # 1. Parallel dispatch registration under flock: 8 concurrent workers must leave all 8 entries intact
+  local dpids=()
+  for i in 1 2 3 4 5 6 7 8; do
+    "$STAMP_GATE" dispatch --role "Worker $i" --type "self" --tier "bounded_execution" --workspace "$main_repo" &
+    dpids+=("$!")
+  done
+  for p in "${dpids[@]}"; do
+    wait "$p"
+  done
+
+  local dispatch_file="$main_repo/.harness/state/main/subagent-dispatch.json"
+  local entry_count
+  entry_count=$(jq -r '.entries | keys | length' "$dispatch_file")
+  assert_eq "8" "$entry_count" "All 8 concurrent dispatch registrations must survive without lost updates"
+
+  # 2. Parallel consumption + duplicate race: 8 unique + 2 duplicates -> exactly 8 allow and 2 deny
+  local out_dir
+  out_dir=$(mktemp -d "${TMPDIR:-/tmp}/harness-sub-race.XXXXXX")
+  echo "$out_dir" >> "$_HARNESS_TEMP_TRACKER"
+  local cpids=()
+  for i in 1 2 3 4 5 6 7 8; do
+    (
+      jq -nc --arg ws "$main_repo" --arg role "Worker $i" \
+        '{workspacePaths: [$ws], toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: $role, Prompt: "Run task."}}}' \
+        | "$PRE_SUBAGENT_GUARD" > "$out_dir/w-$i.json"
+    ) &
+    cpids+=("$!")
+  done
+  for d in 1 2; do
+    (
+      jq -nc --arg ws "$main_repo" \
+        '{workspacePaths: [$ws], toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Worker 1", Prompt: "Duplicate task."}}}' \
+        | "$PRE_SUBAGENT_GUARD" > "$out_dir/dup-$d.json"
+    ) &
+    cpids+=("$!")
+  done
+  for p in "${cpids[@]}"; do
+    wait "$p"
+  done
+
+  local allow_cnt=0 deny_cnt=0 f dec
+  for f in "$out_dir"/*.json; do
+    dec=$(jq -r '.decision' "$f")
+    if [ "$dec" = "allow" ]; then
+      allow_cnt=$((allow_cnt + 1))
+    elif [ "$dec" = "deny" ]; then
+      deny_cnt=$((deny_cnt + 1))
+    fi
+  done
+  assert_eq "8" "$allow_cnt" "Exactly 8 parallel unique invocations must be allowed"
+  assert_eq "2" "$deny_cnt" "Exactly 2 duplicate invocations for Worker 1 must be denied"
+  jq -e 'type == "object" and ((.entries | to_entries | all(.value.consumed == true)))' "$dispatch_file" >/dev/null || {
+    echo "subagent-dispatch.json corrupted or unconsumed entries remain" >&2
+    return 1
+  }
+
+  # 3. Sibling worktree discovery: Prompt-mentioned worktree first, then git worktree list fallback
+  wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/harness-wt-sub.XXXXXX")
+  echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"
+  wt_backend="$wt_parent/kedo-backend"
+  wt_ios="$wt_parent/kedo-ios"
+  git -C "$main_repo" worktree add "$wt_backend" -b "feat/backend" --quiet
+  git -C "$main_repo" worktree add "$wt_ios" -b "feat/ios" --quiet
+
+  "$STAMP_GATE" dispatch --role "Shared Implementer" --type "self" --tier "multi_module_integration" --workspace "$wt_backend"
+  "$STAMP_GATE" dispatch --role "Shared Implementer" --type "self" --tier "trivial_lookup" --workspace "$wt_ios"
+
+  local p_wt_prompt out_wt_prompt
+  p_wt_prompt=$(jq -nc --arg ws "$main_repo" --arg prompt "Implement controller in $wt_backend/src/Api.cs" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Shared Implementer", Prompt: $prompt}}
+  }')
+  out_wt_prompt=$(printf '%s\n' "$p_wt_prompt" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wt_prompt" ".decision" "allow"
+  assert_json_field "$out_wt_prompt" ".overwrite.Model" "inherit" "Prompt mentioning wt_backend must consume wt_backend entry first"
+  assert_json_field "$wt_backend/.harness/state/feat-backend/subagent-dispatch.json" '.entries["Shared Implementer"].consumed' "true"
+  assert_json_field "$wt_ios/.harness/state/feat-ios/subagent-dispatch.json" '.entries["Shared Implementer"].consumed' "false"
+
+  local p_wt_fallback out_wt_fallback
+  p_wt_fallback=$(jq -nc --arg ws "$main_repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Shared Implementer", Prompt: "Lookup iOS target."}}
+  }')
+  out_wt_fallback=$(printf '%s\n' "$p_wt_fallback" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wt_fallback" ".decision" "allow"
+  assert_json_field "$out_wt_fallback" ".overwrite.Model" "flash_lite" "Without prompt path, worktree list discovery must consume wt_ios entry"
+  assert_json_field "$wt_ios/.harness/state/feat-ios/subagent-dispatch.json" '.entries["Shared Implementer"].consumed' "true"
+}
+
+test_conversation_id_isolated_pr_audit_and_stop_gate() {
+  local main_repo wt_parent wt_backend
+  main_repo=$(make_temp_repo)
+  echo "init" > "$main_repo/README.md"
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+
+  wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/harness-wt-stop.XXXXXX")
+  echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"
+  wt_backend="$wt_parent/kedo-backend"
+  git -C "$main_repo" worktree add "$wt_backend" -b "feat/backend" --quiet
+
+  # 1. post-command on cd <wt_backend> && gh pr create saves pr-audit-pending.json in wt_backend with conversationId
+  local p_post_pr pending_be
+  p_post_pr=$(jq -nc --arg ws "$main_repo" --arg cmd "cd \"$wt_backend\" && gh pr create --fill" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-backend",
+    toolCall: {name: "run_command", args: {CommandLine: $cmd}},
+    toolOutput: {output: "https://github.com/org/kedo/pull/88"}
+  }')
+  printf '%s\n' "$p_post_pr" | "$POST_COMMAND_HOOKS" >/dev/null
+  pending_be="$wt_backend/.harness/state/feat-backend/pr-audit-pending.json"
+  [ -f "$pending_be" ] || { echo "Expected pr-audit-pending.json in wt_backend" >&2; return 1; }
+  assert_json_field "$pending_be" ".conversationId" "conv-backend"
+
+  # 2. Parallel sibling conversations are NOT blocked
+  local cid out_other
+  for cid in conv-admin conv-ios conv-android; do
+    out_other=$(jq -nc --arg ws "$main_repo" --arg cid "$cid" \
+      '{workspacePaths: [$ws], conversationId: $cid, terminationReason: "NO_TOOL_CALL"}' | "$STOP_GATE" | jq -c .)
+    assert_eq "{}" "$out_other" "Unrelated conversation '$cid' must not be blocked"
+  done
+  assert_json_field "$pending_be" ".stopRetries" "0"
+
+  # 3. Matching conversationId IS blocked
+  local out_match
+  out_match=$(jq -nc --arg ws "$main_repo" \
+    '{workspacePaths: [$ws], conversationId: "conv-backend", terminationReason: "NO_TOOL_CALL"}' | "$STOP_GATE")
+  assert_json_field "$out_match" ".decision" "continue"
+  assert_json_field "$pending_be" ".stopRetries" "1"
+
+  # 4. pr-auditor from a different conversation must not clear conv-backend's flag; matching conv-backend must set auditDispatched=true
+  local p_other_auditor p_match_auditor
+  p_other_auditor=$(jq -nc --arg ws "$main_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-other",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "pr-auditor", Role: "Other PR Audit", Prompt: "Audit other."}}
+  }')
+  printf '%s\n' "$p_other_auditor" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$pending_be" ".auditDispatched" "false" "Other conversation pr-auditor must not flip conv-backend auditDispatched"
+
+  p_match_auditor=$(jq -nc --arg ws "$main_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-backend",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "pr-auditor", Role: "Backend PR Audit", Prompt: "Audit PR #88."}}
+  }')
+  printf '%s\n' "$p_match_auditor" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$pending_be" ".auditDispatched" "true"
+
+  local out_after_dispatch
+  out_after_dispatch=$(jq -nc --arg ws "$main_repo" \
+    '{workspacePaths: [$ws], conversationId: "conv-backend", terminationReason: "NO_TOOL_CALL"}' | "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$out_after_dispatch" "stop-gate must allow async wait after matching pr-auditor dispatch"
+
+  # 5. clear-pr-audit clears dispatched sibling pending file cleanly
+  "$STAMP_GATE" clear-pr-audit --workspace "$main_repo"
+  [ ! -f "$pending_be" ] || { echo "clear-pr-audit must remove dispatched sibling pr-audit-pending.json" >&2; return 1; }
+}
+
 run_tests

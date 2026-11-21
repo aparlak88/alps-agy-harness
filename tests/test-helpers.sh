@@ -5,6 +5,7 @@ set -euo pipefail
 # Dynamic REPO_ROOT resolution (tests/ -> repo root)
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 export REPO_ROOT
+export HARNESS_AUTO_START_DAEMON="${HARNESS_AUTO_START_DAEMON:-0}"
 
 _cleanup_harness_temp_dirs() {
   if [ -n "${_HARNESS_TEMP_TRACKER:-}" ] && [ -f "$_HARNESS_TEMP_TRACKER" ]; then

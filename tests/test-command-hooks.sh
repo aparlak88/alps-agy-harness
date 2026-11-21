@@ -827,4 +827,161 @@ EOF
   [ ! -f "$mock_log" ] || { echo "Ignored workspace must not invoke graphify" >&2; return 1; }
 }
 
+test_cross_worktree_cd_and_git_C_resolution() {
+  local main_repo wt_parent wt_admin
+  main_repo=$(make_temp_repo)
+  echo "init" > "$main_repo/README.md"
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+  git -C "$main_repo" remote add origin "https://github.com/example/kedo.git"
+
+  wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/harness-wt-cmd.XXXXXX")
+  echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"
+  wt_admin="$wt_parent/kedo-admin"
+  git -C "$main_repo" worktree add "$wt_admin" -b "feat/admin" --quiet
+
+  # 1. cd <wt_admin> && npm install uses wt_admin context7 state, not main_repo
+  local p_pkg_wt p_pkg_main out_pkg_deny out_pkg_allow out_pkg_main
+  p_pkg_wt=$(jq -nc --arg ws "$main_repo" --arg cmd "cd \"$wt_admin\" && npm install left-pad" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+  p_pkg_main=$(jq -nc --arg ws "$main_repo" --arg cmd "cd \"$main_repo\" && npm install left-pad" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+
+  out_pkg_deny=$(printf '%s' "$p_pkg_wt" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pkg_deny" ".decision" "deny" "Unverified package install in sibling worktree must be denied"
+
+  "$STAMP_GATE" context7 --workspace "$wt_admin" --package "left-pad" --version "1.3.0" --source "locked"
+  out_pkg_allow=$(printf '%s' "$p_pkg_wt" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pkg_allow" ".decision" "allow" "Package verified in wt_admin must allow cd <wt_admin> && npm install"
+
+  out_pkg_main=$(printf '%s' "$p_pkg_main" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pkg_main" ".decision" "deny" "main_repo without context7 stamp must still deny npm install"
+
+  # 2. git -C <wt_admin> push & cd <wt_admin> && git push vs git -C <main_repo> push & subshell CWD isolation
+  local out_push_wt out_cd_push_wt out_push_main out_subshell_push
+  out_push_wt=$(jq -nc --arg ws "$main_repo" --arg cmd "git -C \"$wt_admin\" push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_push_wt" ".decision" "allow" "git -C <wt_admin> push on feat/admin must be allowed"
+
+  out_cd_push_wt=$(jq -nc --arg ws "$main_repo" --arg cmd "cd \"$wt_admin\" && git push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_cd_push_wt" ".decision" "allow" "cd <wt_admin> && git push on feat/admin must be allowed"
+
+  out_push_main=$(jq -nc --arg ws "$main_repo" --arg cmd "git -C \"$main_repo\" push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_push_main" ".decision" "deny" "git -C <main_repo> push on main must be denied"
+
+  out_subshell_push=$(jq -nc --arg ws "$main_repo" --arg cmd "(cd \"$wt_admin\" && echo ok) && git push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_subshell_push" ".decision" "deny" "Subshell cd must not leak CWD to subsequent git push on main"
+}
+
+test_gitignored_local_walkthrough_pr_and_local_merge_gates() {
+  local repo
+  repo=$(make_temp_repo)
+  cat << 'EOF' > "$repo/.gitignore"
+docs/walkthroughs/*
+EOF
+  cat << 'EOF' > "$repo/README.md"
+# Kedo
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Walkthrough | PR mühendislik rehberi |
+EOF
+  git -C "$repo" add .gitignore README.md
+  git -C "$repo" commit -m "chore: init with gitignored walkthroughs" --quiet
+
+  git -C "$repo" checkout -b "feat/gitignore-wt" --quiet
+  mkdir -p "$repo/src"
+  echo "export const feature = true;" > "$repo/src/Feature.ts"
+  git -C "$repo" add src/Feature.ts
+  git -C "$repo" commit -m "feat: add Feature.ts" --quiet
+
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Feature.ts"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  local p_pr_create
+  p_pr_create=$(jq -nc --arg ws "$repo" --arg cmd "gh pr create --fill" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+
+  # 1. No local walkthrough yet -> deny
+  local out_missing
+  out_missing=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_missing" ".decision" "deny" "Missing gitignored local walkthrough must deny"
+  assert_contains "$(printf '%s' "$out_missing" | jq -r '.reason')" "walkthrough"
+
+  # 2. Older invalid walkthrough (only 1 mermaid) -> deny with mermaid error
+  mkdir -p "$repo/docs/walkthroughs"
+  cat << 'EOF' > "$repo/docs/walkthroughs/01-old.md"
+# Old Walkthrough
+
+```mermaid
+flowchart LR
+  A --> B
+```
+EOF
+  local out_old_bad
+  out_old_bad=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_old_bad" ".decision" "deny" "Invalid local gitignored walkthrough must deny"
+  assert_contains "$(printf '%s' "$out_old_bad" | jq -r '.reason')" "Mermaid"
+
+  # 3. Newer walkthrough (mtime strictly newer) with 2 mermaids + full Ne/Neden BUT missing glossary -> deny mentioning glossary
+  cat << 'EOF' > "$repo/docs/walkthroughs/02-new.md"
+# Yeni Walkthrough
+
+```mermaid
+flowchart LR
+  Feature["src/Feature.ts"] --> Core
+```
+
+```mermaid
+sequenceDiagram
+  App->>Feature: read()
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/Feature.ts` — [ÜRETİLDİ] (`Domain`)
+- **Ne Değişti / Ne Üretildi?:** Özellik bayrağını sunan `Feature.ts` modülü ve `feature` sabiti üretildi.
+- **Neden Değişti / Neden Üretildi?:** `.gitignore` kapsamındaki yerel walkthrough doğrulama testini çalıştırmak için üretildi.
+EOF
+  python3 -c '
+import os, time, sys
+old_p, new_p = sys.argv[1], sys.argv[2]
+now = time.time()
+os.utime(old_p, (now - 20, now - 20))
+os.utime(new_p, (now, now))
+' "$repo/docs/walkthroughs/01-old.md" "$repo/docs/walkthroughs/02-new.md"
+
+  local out_no_glossary
+  out_no_glossary=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_no_glossary" ".decision" "deny" "Gitignored walkthrough without glossary must deny"
+  assert_contains "$(printf '%s' "$out_no_glossary" | jq -r '.reason')" "Glossary"
+
+  # 4. Add glossary to newer walkthrough (keep 01-old.md invalid!) -> gh pr create AND local git merge must allow!
+  cat << 'EOF' >> "$repo/docs/walkthroughs/02-new.md"
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Feature | Özellik bayrağı modülü |
+EOF
+  python3 -c 'import os, time, sys; now=time.time(); os.utime(sys.argv[1], (now-20, now-20)); os.utime(sys.argv[2], (now+2, now+2))' \
+    "$repo/docs/walkthroughs/01-old.md" "$repo/docs/walkthroughs/02-new.md"
+
+  local out_pr_ok
+  out_pr_ok=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_ok" ".decision" "allow" "Newest valid gitignored walkthrough must allow gh pr create"
+
+  git -C "$repo" checkout main --quiet
+  local out_merge_ok
+  out_merge_ok=$(jq -nc --arg ws "$repo" --arg cmd "git merge feat/gitignore-wt" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_ok" ".decision" "allow" "Valid gitignored walkthrough must also allow local git merge"
+}
+
 run_tests

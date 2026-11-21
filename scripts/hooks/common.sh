@@ -39,8 +39,56 @@ harness_is_safe_daemon_socket() {
   return 0
 }
 
+# Ensure the background harness-daemon is running when auto-start is enabled.
+# Returns 0 if a safe, healthy socket is ready; 1 otherwise.
+harness_ensure_daemon() {
+  if [ "${HARNESS_DISABLE_DAEMON:-0}" = "1" ] || [ "${HARNESS_AUTO_START_DAEMON:-1}" != "1" ]; then
+    return 1
+  fi
+  local sock="${1:-$(harness_daemon_socket_path)}"
+  local mode="${2:-normal}"
+
+  if [ "$mode" != "recover" ] && harness_is_safe_daemon_socket "$sock"; then
+    return 0
+  fi
+
+  [ -n "$sock" ] && [ ! -L "$sock" ] || return 1
+  if [ -e "$sock" ] && [ ! -O "$sock" ]; then
+    return 1
+  fi
+
+  local sock_dir
+  sock_dir="$(dirname "$sock")"
+  [ -n "$sock_dir" ] && [ ! -L "$sock_dir" ] || return 1
+  if [ -e "$sock_dir" ]; then
+    [ -d "$sock_dir" ] && [ -O "$sock_dir" ] || return 1
+    local dir_mode
+    dir_mode="$(stat -c '%a' "$sock_dir" 2>/dev/null || stat -f '%Lp' "$sock_dir" 2>/dev/null || true)"
+    [[ "$dir_mode" =~ ^[0-7]+$ ]] || return 1
+    [ "$(( 8#$dir_mode & 8#077 ))" -eq 0 ] || return 1
+  fi
+
+  local daemon_py="$_HARNESS_PLUGIN_ROOT/sidecars/harness-daemon/daemon.py"
+  [ -f "$daemon_py" ] || return 1
+
+  HARNESS_DAEMON_SOCK="$sock" HARNESS_DAEMON_EXIT_ON_LOCK_BUSY=1 nohup python3 -B "$daemon_py" </dev/null >/dev/null 2>&1 &
+
+  local max_ticks="${HARNESS_DAEMON_STARTUP_WAIT_TICKS:-8}"
+  local tick=0
+  while [ "$tick" -lt "$max_ticks" ]; do
+    if harness_is_safe_daemon_socket "$sock" && \
+       curl -fsS --max-time 0.05 --unix-socket "$sock" "http://localhost/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.025
+    tick=$((tick + 1))
+  done
+
+  harness_is_safe_daemon_socket "$sock"
+}
+
 # Query the background harness-daemon over its Unix domain socket.
-# Returns 1 immediately when daemon is disabled, socket fails safety checks, or curl fails.
+# Auto-starts the daemon when enabled and socket is missing; fails closed on unsafe/missing/error sockets.
 harness_daemon_call() {
   local endpoint="${1:?endpoint required}"
   local payload="${2:?payload required}"
@@ -49,13 +97,38 @@ harness_daemon_call() {
   fi
   local sock
   sock="$(harness_daemon_socket_path)"
-  harness_is_safe_daemon_socket "$sock" || return 1
+  if ! harness_is_safe_daemon_socket "$sock"; then
+    if [ ! -e "$sock" ] && [ ! -L "$sock" ]; then
+      harness_ensure_daemon "$sock" || return 1
+    else
+      return 1
+    fi
+  fi
   local timeout_sec="${HARNESS_DAEMON_TIMEOUT_SEC:-0.35}"
-  curl -fsS --max-time "$timeout_sec" --unix-socket "$sock" \
+  local resp=""
+  local rc=0
+  resp="$(printf '%s' "$payload" | curl -fsS --max-time "$timeout_sec" --unix-socket "$sock" \
     -H "Content-Type: application/json" \
     -X POST \
-    --data-binary "$payload" \
-    "http://localhost${endpoint}" 2>/dev/null
+    --data-binary @- \
+    "http://localhost${endpoint}" 2>/dev/null)" || rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$resp"
+    return 0
+  fi
+
+  if [ "$rc" -eq 7 ] && harness_ensure_daemon "$sock" "recover"; then
+    resp="$(printf '%s' "$payload" | curl -fsS --max-time "$timeout_sec" --unix-socket "$sock" \
+      -H "Content-Type: application/json" \
+      -X POST \
+      --data-binary @- \
+      "http://localhost${endpoint}" 2>/dev/null)" || return 1
+    printf '%s\n' "$resp"
+    return 0
+  fi
+
+  return 1
 }
 
 # Read hook JSON payload from stdin into HOOK_INPUT and resolve WORKSPACE_ROOT.
@@ -66,9 +139,10 @@ harness_read_stdin() {
     HOOK_INPUT="$(cat)"
   fi
 
-  if [ -z "${HOOK_INPUT//[[:space:]]/}" ]; then
-    HOOK_INPUT="{}"
-  fi
+  case "$HOOK_INPUT" in
+    *[![:space:]]*) ;;
+    *) HOOK_INPUT="{}" ;;
+  esac
 
   local ws=""
   ws="$(printf '%s\n' "$HOOK_INPUT" | jq -r '.workspacePaths[0] // empty' 2>/dev/null || true)"
@@ -260,11 +334,13 @@ harness_validate_walkthrough() {
 #   unset | orchestrator | carbon | argon_low | argon | hydrogen | claude | flash | custom
 harness_classify_parent_model() {
   local raw="${1:-}"
-  local trimmed="${raw//[[:space:]]/}"
-  if [ -z "$trimmed" ]; then
-    printf 'unset\n'
-    return 0
-  fi
+  case "$raw" in
+    *[![:space:]]*) ;;
+    *)
+      printf 'unset\n'
+      return 0
+      ;;
+  esac
 
   local norm
   norm="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
@@ -403,11 +479,11 @@ emit_overwrite() {
   local overwrite_json="${1:?emit_overwrite requires a JSON object string}"
   local reason="${2:-}"
   if [ -n "$reason" ]; then
-    jq -nc --argjson overwrite "$overwrite_json" --arg reason "$reason" \
-      '{decision: "allow", overwrite: $overwrite, reason: $reason}'
+    printf '%s\n' "$overwrite_json" | jq -c --arg reason "$reason" \
+      '{decision: "allow", overwrite: ., reason: $reason}'
   else
-    jq -nc --argjson overwrite "$overwrite_json" \
-      '{decision: "allow", overwrite: $overwrite}'
+    printf '%s\n' "$overwrite_json" | jq -c \
+      '{decision: "allow", overwrite: .}'
   fi
 }
 

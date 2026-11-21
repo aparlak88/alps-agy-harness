@@ -63,8 +63,12 @@ class DaemonLogger:
                 pass
 
 
-def enrich_startup_path() -> None:
-    """Merge login-shell PATH into ``os.environ['PATH']`` for macOS GUI sidecars."""
+_PATH_SYNC_LOCK = threading.Lock()
+_PATH_SYNC_DONE = False
+
+
+def enrich_fast_fallback_path() -> None:
+    """Append standard local tool directories to ``PATH`` synchronously without shell spawning."""
     if os.environ.get("HARNESS_SKIP_SHELL_PATH_SYNC") == "1":
         return
 
@@ -78,28 +82,55 @@ def enrich_startup_path() -> None:
         str(Path.home() / ".local" / "bin"),
         str(Path.home() / ".dotnet" / "tools"),
     ]
-
-    shell_bin = os.environ.get("SHELL") or "/bin/zsh"
-    shell_parts: list[str] = []
-    if os.path.isabs(shell_bin) and os.access(shell_bin, os.X_OK):
-        try:
-            proc = subprocess.run(
-                [shell_bin, "-lc", 'printf "%s" "$PATH"'],
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-            if proc.returncode == 0 and proc.stdout:
-                shell_parts = [p for p in proc.stdout.strip().split(os.pathsep) if p]
-        except Exception:
-            pass
-
-    for candidate in [*shell_parts, *fallback_dirs]:
+    for candidate in fallback_dirs:
         if candidate not in seen and os.path.isdir(candidate):
             seen.add(candidate)
             parts.append(candidate)
 
     os.environ["PATH"] = os.pathsep.join(parts)
+
+
+def ensure_startup_path_enriched() -> None:
+    """Once-guarded login-shell ``PATH`` merge executed asynchronously after socket bind."""
+    global _PATH_SYNC_DONE
+    if _PATH_SYNC_DONE or os.environ.get("HARNESS_SKIP_SHELL_PATH_SYNC") == "1":
+        return
+
+    with _PATH_SYNC_LOCK:
+        if _PATH_SYNC_DONE:
+            return
+        enrich_fast_fallback_path()
+        current_path = os.environ.get("PATH", "")
+        parts = [p for p in current_path.split(os.pathsep) if p]
+        seen = set(parts)
+
+        shell_bin = os.environ.get("SHELL") or "/bin/zsh"
+        shell_parts: list[str] = []
+        if os.path.isabs(shell_bin) and os.access(shell_bin, os.X_OK):
+            try:
+                proc = subprocess.run(
+                    [shell_bin, "-lc", 'printf "%s" "$PATH"'],
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    shell_parts = [p for p in proc.stdout.strip().split(os.pathsep) if p]
+            except Exception:
+                pass
+
+        for candidate in shell_parts:
+            if candidate not in seen and os.path.isdir(candidate):
+                seen.add(candidate)
+                parts.append(candidate)
+
+        os.environ["PATH"] = os.pathsep.join(parts)
+        _PATH_SYNC_DONE = True
+
+
+def enrich_startup_path() -> None:
+    """Merge login-shell PATH into ``os.environ['PATH']`` for macOS GUI sidecars."""
+    ensure_startup_path_enriched()
 
 
 def validate_and_prepare_socket_dir(sock_path: Path) -> None:
@@ -513,6 +544,7 @@ class HarnessDaemonState:
         health_epoch = float(prev_health.get("epoch", 0)) if isinstance(prev_health, dict) else 0.0
         health_expired = (now - health_epoch) >= self.health_ttl_sec
         if force_health or prev_health is None or health_expired or sig["cfg"] != prev_sig.get("cfg"):
+            ensure_startup_path_enriched()
             effective_env_key = bool(env_hint) if env_hint is not None else self.startup_env_key_present
             doctor_res = harness_core.run_doctor_checks(
                 ws_path,
@@ -576,6 +608,7 @@ class HarnessDaemonState:
         except OSError:
             pass
 
+        ensure_startup_path_enriched()
         rc = harness_core.run_sync_graphify(ws_path)
         duration_ms = int((time.monotonic() - t0) * 1000)
         finished_status = {
@@ -609,6 +642,7 @@ class HarnessDaemonState:
 
     def watcher_loop(self) -> None:
         """Background loop performing TTL eviction, mtime polling, and graphify dispatch."""
+        ensure_startup_path_enriched()
         while not self.stop_event.is_set():
             now = time.time()
             to_refresh: list[str] = []
@@ -803,11 +837,19 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, {"decision": "allow"})
                 return
             caches = state.get_caches(ws_path, allow_disk_hydration=False)
+
+            def _get_worktree_caches(target_ws: Path) -> dict[str, Any]:
+                reg_ws, wt_ignored = state.register_workspace(str(target_ws), warm_now=False)
+                if wt_ignored or reg_ws is None:
+                    return {}
+                return state.get_caches(reg_ws, allow_disk_hydration=False)
+
             resp = harness_core.evaluate_pre_command(
                 ws_path,
                 body,
                 spec_index=caches.get("specPackages"),
                 doc_cache=caches.get("docValidation"),
+                worktree_cache_getter=_get_worktree_caches,
             )
             self._send_json(200, resp)
             return
@@ -820,9 +862,20 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
             if ignored:
                 self._send_json(200, {"decision": "allow"})
                 return
-            resp = harness_core.evaluate_pre_edit(ws_path, body)
+            resolved_ws_holder = [ws_path]
+
+            def _on_wt_resolved(wt: Path) -> None:
+                reg_wt, _ = state.register_workspace(str(wt), warm_now=False)
+                if reg_wt is not None:
+                    resolved_ws_holder[0] = reg_wt
+
+            resp = harness_core.evaluate_pre_edit(
+                ws_path,
+                body,
+                on_worktree_resolved=_on_wt_resolved,
+            )
             if resp.get("decision") == "allow":
-                state.mark_dirty(ws_path)
+                state.mark_dirty(resolved_ws_holder[0])
             self._send_json(200, resp)
             return
 
@@ -834,12 +887,48 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
             if ignored:
                 self._send_json(200, {})
                 return
+
+            def _on_wt_touched(wt: Path) -> None:
+                reg_wt, wt_ign = state.register_workspace(str(wt), warm_now=False)
+                if not wt_ign and reg_wt is not None:
+                    state.mark_dirty(reg_wt)
+
+            def _on_graphify(wt: Path, reason: str) -> None:
+                reg_wt, wt_ign = state.register_workspace(str(wt), warm_now=False)
+                if not wt_ign and reg_wt is not None:
+                    state.enqueue_graphify(reg_wt, reason)
+
             resp = harness_core.evaluate_post_command(
                 ws_path,
                 body,
-                on_graphify_trigger=lambda ws, reason: state.enqueue_graphify(ws, reason),
+                on_graphify_trigger=_on_graphify,
+                on_worktree_touched=_on_wt_touched,
             )
             state.mark_dirty(ws_path)
+            self._send_json(200, resp)
+            return
+
+        if self.path == "/hook/pre-subagent":
+            ws_path, ignored = state.register_workspace(raw_ws, warm_now=False)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            if ignored:
+                self._send_json(200, {"decision": "allow"})
+                return
+            resp = harness_core.evaluate_pre_subagent(ws_path, body)
+            self._send_json(200, resp)
+            return
+
+        if self.path == "/hook/stop-gate":
+            ws_path, ignored = state.register_workspace(raw_ws, warm_now=False)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            if ignored:
+                self._send_json(200, {})
+                return
+            resp = harness_core.evaluate_stop_gate(ws_path, body)
             self._send_json(200, resp)
             return
 
@@ -875,7 +964,7 @@ def run_daemon() -> int:
     if "TYPESAFE_API_KEY" in os.environ:
         os.environ["TYPESAFE_API_KEY"] = ""
 
-    enrich_startup_path()
+    enrich_fast_fallback_path()
 
     data_dir = harness_core.default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -910,6 +999,10 @@ def run_daemon() -> int:
             acquired = True
             break
         except BlockingIOError:
+            if os.environ.get("HARNESS_DAEMON_EXIT_ON_LOCK_BUSY") == "1":
+                logger.log("INFO", "Another harness-daemon holds lock; auto-start helper exiting cleanly.")
+                lock_fd.close()
+                return 0
             alive, _ = harness_core.probe_daemon_health(sock_path)
             if alive:
                 logger.log("INFO", "Another healthy harness-daemon holds lock; waiting in passive standby.")
