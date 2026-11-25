@@ -100,11 +100,11 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** İşçi dallarında parça parça veya mükerrer Walkthrough/PR kapısı üretilmesini önleyip tüm diff'i kapsayan tekil PR denetimi sağlamak için güncellendi.
 
 ### `tests/test-command-hooks.sh` — [GÜNCELLENDİ] (`Komut Kancası Test Paketi`)
-- **Ne Değişti / Ne Üretildi?:** `test_detached_linked_worktree_context7_survives_commit` (detached linked worktree'de yeni commit sonrası `context7` izninin korunması) ve `test_hook_input_cwd_resolves_worktree_without_cd` (`workspacePaths[0]=main` iken `HOOK_INPUT.cwd` üzerinden kardeş worktree `git push`, `npm install`, `gh pr create`, `post-command-hooks.sh` ve açık `git -C` önceliği) testleri eklendi.
+- **Ne Değişti / Ne Üretildi?:** `test_detached_linked_worktree_context7_survives_commit` (detached linked worktree'de yeni commit sonrası `context7` izninin korunması) ve `test_hook_input_cwd_resolves_sibling_worktree_without_cd` (`workspacePaths[0]=main` iken `HOOK_INPUT.cwd` üzerinden kardeş worktree `git push`, `npm install`, `gh pr create`, `post-command-hooks.sh` ve açık `git -C` önceliği) testleri eklendi.
 - **Neden Değişti / Neden Üretildi?:** Detached worktree state sürekliliğini ve `HOOK_INPUT.cwd` tabanlı komut/post-command çözümlemesini regresyon testine bağlamak için güncellendi.
 
 ### `tests/test-edit-and-session-hooks.sh` — [GÜNCELLENDİ] (`Dosya ve Oturum Kancası Test Paketi`)
-- **Ne Değişti / Ne Üretildi?:** `test_hook_input_cwd_relative_pre_edit_sibling_worktree` (göreceli `Path` + `HOOK_INPUT.cwd`), `test_nested_git_worktree_pre_edit_enforces_rules` (`<main>/.worktrees/worker-nested` içinde mutlak/göreceli edit, `eval()`, sözlük, `.harness-ignore`, `on_worktree_resolved` ve sıcak `daemon.py` paritesi) ve `test_session_start_swarm_and_branch_guardrails` (`Swarm Worker Mode`, `[BRANCH GUARD]`, `[DETACHED HEAD]` ve git-dışı dizinde yanlış uyarı verilmemesi) testleri eklendi.
+- **Ne Değişti / Ne Üretildi?:** `test_hook_input_cwd_relative_edit_in_sibling_worktree` (göreceli `Path` + `HOOK_INPUT.cwd`), `test_nested_git_worktree_pre_edit_enforces_rules` (`<main>/.worktrees/worker-nested` içinde mutlak/göreceli edit, `eval()`, sözlük, `.harness-ignore`, `on_worktree_resolved` ve sıcak `daemon.py` paritesi) ve `test_session_start_swarm_protocol_branch_guard_and_detached_head` (`Swarm Worker Mode`, `[BRANCH GUARD]`, `[DETACHED HEAD]` ve git-dışı dizinde yanlış uyarı verilmemesi) testleri eklendi.
 - **Neden Değişti / Neden Üretildi?:** Kardeş ve iç içe `.worktrees/*` senaryolarında `pre-edit-guard` kurallarının atlanmamasını ve `SessionStart` uyarı koşullarını doğrulamak için güncellendi.
 
 ### `tests/test-manifest.sh` — [GÜNCELLENDİ] (`Manifest ve Kanca Şeması Test Paketi`)
@@ -124,11 +124,11 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Yeni eklenen tüm Swarm ve worktree davranışlarının canlı HTTP/Unix soket daemon ile soğuk Python CLI arasında sıfır sapma gösterdiğini kanıtlamak için güncellendi.
 
 ### `tests/test-stamp-and-common.sh` — [GÜNCELLENDİ] (`Ortak Kütüphane ve Damga Test Paketi`)
-- **Ne Değişti / Ne Üretildi?:** `dispatch` testine tire ile başlayan `--conversation-id "-conv-dash"` sınaması eklendi; `test_detached_head_linked_worktree_stable_slug_across_commits` (ana repo vs linked `--detach` worktree slug paritesi ve commit sonrası `context7` korunumu) ve `test_gemini4_and_orchestrator_parent_model_classification_and_selector` içine `neon`, `gemini-4-*` ile `custom` (`bounded_execution -> pro`) Bash/Python kombinasyon parite kontrolleri eklendi.
+- **Ne Değişti / Ne Üretildi?:** `dispatch` testine tire ile başlayan `--conversation-id "-conv-dash"` sınaması eklendi; `test_detached_head_linked_worktree_stable_slug_across_commits` (ana repo vs linked `--detach` worktree slug paritesi ve commit sonrası `context7` korunumu) ve `test_neon_gemini4_and_custom_model_classification_parity` (`neon`, `gemini-4-*` ile `custom` `bounded_execution -> pro` Bash/Python kombinasyon parite kontrolleri) eklendi.
 - **Neden Değişti / Neden Üretildi?:** `common.sh` ve `harness_core.py` arasındaki deterministik slug ve model sınıflandırma/çözümleme eşitliğini tüm kenar durumlarla kilitlemek için güncellendi.
 
 ### `tests/test-subagent-and-stop-hooks.sh` — [GÜNCELLENDİ] (`Alt Ajan ve Stop Kancası Test Paketi`)
-- **Ne Değişti / Ne Üretildi?:** Mevcut paralel kilitleme testine harici ana makine daemon'ından etkilenmemesi için `HARNESS_DISABLE_DAEMON=1` eklendi; `test_swarm_pre_tool_use_brief_enrichment_and_passthrough` (`status`/`models`/`title`/`model`/`kill` passthrough, `add` + `share`/`inherit` başlık enjeksiyonu, `tasks`/`n` korunumu, UTF-8 idempotency, izole `"swarm"` dispatch tüketimi) ve `test_parallel_same_role_dispatch_queue_and_neon_routing` (FIFO `pendingQueues`, `conversationId` affinity, 3. çağrıda `deny`, `neon`/`custom` yönlendirmesi) eklendi.
+- **Ne Değişti / Ne Üretildi?:** Mevcut paralel kilitleme testine harici ana makine daemon'ından etkilenmemesi için `HARNESS_DISABLE_DAEMON=1` eklendi; `test_swarm_pre_tool_use_brief_enrichment_and_passthrough` (`status`/`models`/`title`/`model`/`kill` passthrough, `add` + `share`/`inherit` başlık enjeksiyonu, `tasks`/`n` korunumu, UTF-8 idempotency, izole `"swarm"` dispatch tüketimi), `test_parallel_same_role_dispatch_queue_and_conversation_affinity` (FIFO `pendingQueues`, `conversationId` affinity, 3. çağrıda `deny`) ve `test_neon_gemini4_and_custom_parent_model_routing` (`neon`/`custom` yönlendirmesi) eklendi.
 - **Neden Değişti / Neden Üretildi?:** `evaluate_pre_swarm` ve `pendingQueues` davranışlarının tüm durum geçişlerini ve geriye dönük `entries[role]` uyumluluğunu uçtan uca doğrulamak için güncellendi.
 
 ### `tests/test-utilities.sh` — [GÜNCELLENDİ] (`Araçlar ve Doctor Test Paketi`)
@@ -166,7 +166,7 @@ sequenceDiagram
 | `tests/test-subagent-and-stop-hooks.sh` | `13 passed, 0 failed` | `evaluate_pre_swarm` idempotency, paralel `pendingQueues`, `HARNESS_DISABLE_DAEMON=1` izolasyonu |
 | `tests/test-utilities.sh` | `9 passed, 0 failed` | `swarm_install_advisory` (`INFO`, `healthy: true`), `run-quiet.sh`, `mobile-logs.sh` |
 
-### Scratchpad Uçtan Uca (`E2E`) Doğrulaması (`scratch/run_e2e.sh`)
+### Harici Scratchpad Uçtan Uca (`E2E`) Doğrulaması (Depo Dışı Geçici `run_e2e.sh`)
 - İzole `/tmp/agy-e2e-*.sock` üzerinde canlı `daemon.py` ve `origin.git` uzak deposuna bağlı `mini-shop` projesi üzerinde koşturuldu:
   1. Koordinatör `main` üzerinde `[BRANCH GUARD]` + `Swarm Worker Mode` (`family: neon`) ve `src/index.ts` yazım kilidi doğrulandı.
   2. `feat/cart-swarm` dalında `swarm(action="add", workspace="share", tasks=..., n=2)` sıcak daemon ve soğuk fallback paritesiyle yalnız `overwrite.brief` üretti ve replay'de idempotent kaldı.
