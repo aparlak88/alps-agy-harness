@@ -15,6 +15,8 @@ EXPECTED_MEDIUM="[EFFORT_PROFILE: MEDIUM — Standart TDD döngüsü uygula; yal
 EXPECTED_HIGH="[EFFORT_PROFILE: HIGH — Katman sınırlarını, LSP tanılamalarını ve kenar durumları çapraz doğrula; her iddiayı dosya/satır kanıtına bağla.]"
 EXPECTED_XHIGH="[EFFORT_PROFILE: XHIGH — Derin çok adımlı muhakeme uygula; katman sözleşmelerini, tip güvenliğini ve tüm hata/kenar yollarını uçtan uca doğrula.]"
 EXPECTED_MAX="[EFFORT_PROFILE: MAX — Sıfır varsayım; tüm bağımlılık zincirini, karşı-örnekleri ve güvenlik/kanon değişmezlerini satır satır kanıtla.]"
+EXPECTED_SWARM_CONTRACT="[SWARM_WORKER_CONTRACT — Koordinatör brief kapsamına sadık kal; yeniden jev_classify, brainstorming, Spec, Walkthrough veya gh pr create çalıştırma; docs/parking-lot.md ve docs/canon/* önerilerini panoda @coordinator'a bildir.]"
+EXPECTED_SWARM_BRANCH_GUARD="[SWARM_BRANCH_GUARD — Koda dokunmadan önce kendi özellik dalını aç (git checkout -b feat/<konu>-<ad>); detached HEAD veya main üzerinde kalma.]"
 EXPECTED_STOP_REASON="PR açıldı; oturumu kapatmadan önce review-pr skill'ini kullanarak pr-auditor değerlendirmesini çalıştır."
 
 test_security_and_pr_auditor_auto_overwrite_to_pro() {
@@ -1064,6 +1066,265 @@ test_conversation_id_isolated_pr_audit_and_stop_gate() {
   # 5. clear-pr-audit clears dispatched sibling pending file cleanly
   "$STAMP_GATE" clear-pr-audit --workspace "$main_repo"
   [ ! -f "$pending_be" ] || { echo "clear-pr-audit must remove dispatched sibling pr-audit-pending.json" >&2; return 1; }
+}
+
+test_swarm_pre_tool_use_brief_enrichment_and_passthrough() {
+  [ -x "$PRE_SUBAGENT_GUARD" ] || { echo "pre-subagent-guard.sh missing or not executable: $PRE_SUBAGENT_GUARD" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
+
+  local repo
+  repo=$(make_temp_repo)
+
+  # 1. Non-add actions (status, models, title, model, kill) pass through without overwrite
+  local act p_pass out_pass
+  for act in status models title model kill; do
+    p_pass=$(jq -nc --arg ws "$repo" --arg act "$act" '{
+      workspacePaths: [$ws],
+      toolCall: {
+        name: "swarm",
+        args: {
+          action: $act,
+          name: "worker-1",
+          workspace: "share",
+          brief: "Should not be overwritten."
+        }
+      }
+    }')
+    out_pass=$(printf '%s\n' "$p_pass" | "$PRE_SUBAGENT_GUARD")
+    assert_json_field "$out_pass" ".decision" "allow" "swarm action=$act must allow"
+    assert_json_field "$out_pass" "has(\"overwrite\")" "false" "swarm action=$act must not overwrite"
+  done
+
+  # Empty brief on action=add also passes through without overwrite
+  local p_empty out_empty
+  p_empty=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {action: "add", name: "empty-worker", workspace: "share", brief: ""}
+    }
+  }')
+  out_empty=$(printf '%s\n' "$p_empty" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_empty" ".decision" "allow" "swarm add with empty brief must allow"
+  assert_json_field "$out_empty" "has(\"overwrite\")" "false" "swarm add with empty brief must not overwrite"
+
+  # 2. action=add + workspace=share + tasks + multiline UTF-8 + trailing \n\n
+  local p_share out_share
+  p_share=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "api-worker",
+        workspace: "share",
+        tasks: ["src/auth.py", "tests/test_auth.py"],
+        model: "pro",
+        fork: "coordinator",
+        brief: "Görev: Türkçe UTF-8 (ğüşiöçİĞÜŞÖÇ) & `code()` & $HOME.\nSatır 2: Birim testlerini çalıştır.\n\n"
+      }
+    }
+  }')
+  out_share=$(printf '%s\n' "$p_share" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_MEDIUM" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    --arg grd "$EXPECTED_SWARM_BRANCH_GUARD" \
+    --argjson req "$p_share" \
+    '.decision == "allow"
+     and (.overwrite | keys) == ["brief"]
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n" + $grd + "\n\n" + $req.toolCall.args.brief)
+     and (.overwrite.brief | endswith("Birim testlerini çalıştır.\n\n"))' \
+    <<< "$out_share" >/dev/null || {
+      echo "swarm add with share+tasks failed brief enrichment check: $out_share" >&2
+      return 1
+    }
+
+  # 3. action=add + workspace=inherit omits SWARM_BRANCH_GUARD
+  local p_inherit out_inherit
+  p_inherit=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "reader-1",
+        workspace: "inherit",
+        brief: "Inspect repository architecture."
+      }
+    }
+  }')
+  out_inherit=$(printf '%s\n' "$p_inherit" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_MEDIUM" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    '.decision == "allow"
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n\nInspect repository architecture.")' \
+    <<< "$out_inherit" >/dev/null || {
+      echo "swarm add with inherit failed expected brief check: $out_inherit" >&2
+      return 1
+    }
+  assert_not_contains "$(printf '%s\n' "$out_inherit" | jq -r '.overwrite.brief')" "[SWARM_BRANCH_GUARD" "inherit mode must not inject SWARM_BRANCH_GUARD"
+
+  # 4. Idempotency: re-submitting already-enriched brief produces allow without overwrite
+  local p_idem out_idem
+  p_idem=$(jq -nc --arg ws "$repo" --argjson prev "$out_share" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "api-worker",
+        workspace: "share",
+        brief: $prev.overwrite.brief
+      }
+    }
+  }')
+  out_idem=$(printf '%s\n' "$p_idem" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_idem" ".decision" "allow" "Idempotent swarm add must allow"
+  assert_json_field "$out_idem" "has(\"overwrite\")" "false" "Idempotent swarm add must not re-overwrite brief"
+
+  # 5. Optional swarm dispatch consumption (typeName == "swarm") uses registered effortProfile
+  "$STAMP_GATE" dispatch --role "swarm-arch" --type "swarm" --tier "multi_module_integration" --workspace "$repo"
+  local p_disp out_disp
+  p_disp=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "swarm-arch",
+        workspace: "branch",
+        brief: "Design module boundaries."
+      }
+    }
+  }')
+  out_disp=$(printf '%s\n' "$p_disp" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_HIGH" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    --arg grd "$EXPECTED_SWARM_BRANCH_GUARD" \
+    '.decision == "allow"
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n" + $grd + "\n\nDesign module boundaries.")' \
+    <<< "$out_disp" >/dev/null || {
+      echo "Optional swarm dispatch failed HIGH effort + branch guard check: $out_disp" >&2
+      return 1
+    }
+  assert_json_field "$repo/.harness/state/main/subagent-dispatch.json" '.entries["swarm-arch"].consumed' "true" "Matching swarm dispatch entry must be marked consumed"
+
+  # 6. A "self" or "research" dispatch entry with the same name must NOT be consumed by swarm
+  "$STAMP_GATE" dispatch --role "shared-role" --type "self" --tier "critical_architecture_or_audit" --workspace "$repo"
+  local p_self_guard out_self_guard
+  p_self_guard=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "shared-role",
+        workspace: "inherit",
+        brief: "Swarm task sharing a role name."
+      }
+    }
+  }')
+  out_self_guard=$(printf '%s\n' "$p_self_guard" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_MEDIUM" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    '.decision == "allow"
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n\nSwarm task sharing a role name.")' \
+    <<< "$out_self_guard" >/dev/null || {
+      echo "swarm must ignore self dispatch entry and fall back to MEDIUM: $out_self_guard" >&2
+      return 1
+    }
+  assert_json_field "$repo/.harness/state/main/subagent-dispatch.json" '.entries["shared-role"].consumed' "false" "swarm must NOT consume self dispatch entry"
+
+  local p_sub_after out_sub_after
+  p_sub_after=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "self",
+        Role: "shared-role",
+        Prompt: "Run invoke_subagent after swarm."
+      }
+    }
+  }')
+  out_sub_after=$(printf '%s\n' "$p_sub_after" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_sub_after" ".decision" "allow" "Unconsumed self dispatch entry must remain valid for invoke_subagent"
+  assert_json_field "$repo/.harness/state/main/subagent-dispatch.json" '.entries["shared-role"].consumed' "true" "invoke_subagent must consume self entry"
+
+  # 7. "research" entry is NOT consumed, typeName == "" IS consumed, conversationId is respected, and partial header is idempotent
+  "$STAMP_GATE" dispatch --role "shared-res" --type "research" --tier "trivial_lookup" --workspace "$repo"
+  local p_res_guard out_res_guard
+  p_res_guard=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "swarm", args: {action: "add", name: "shared-res", workspace: "inherit", brief: "Check research guard."}}
+  }')
+  out_res_guard=$(printf '%s\n' "$p_res_guard" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$repo/.harness/state/main/subagent-dispatch.json" '.entries["shared-res"].consumed' "false" "swarm must NOT consume research dispatch entry"
+  assert_contains "$(printf '%s\n' "$out_res_guard" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: MEDIUM" "swarm ignoring research entry must use MEDIUM"
+
+  local dispatch_json="$repo/.harness/state/main/subagent-dispatch.json"
+  local updated_disp
+  updated_disp=$(jq '
+    .entries["empty-type-worker"] = {typeName: "", tier: "trivial_lookup", model: "flash_lite", effortProfile: "LOW", consumed: false, timestamp: "2026-11-26T00:00:00Z"}
+    | .entries["conv-worker"] = {typeName: "swarm", tier: "critical_architecture_or_audit", model: "pro", effortProfile: "MAX", consumed: false, conversationId: "conv-alpha", timestamp: "2026-11-26T00:00:00Z"}
+  ' "$dispatch_json")
+  printf '%s\n' "$updated_disp" > "$dispatch_json"
+
+  local p_empty_type out_empty_type
+  p_empty_type=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "swarm", args: {action: "add", name: "empty-type-worker", workspace: "inherit", brief: "Quick check."}}
+  }')
+  out_empty_type=$(printf '%s\n' "$p_empty_type" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$dispatch_json" '.entries["empty-type-worker"].consumed' "true" "swarm must consume entry with empty typeName"
+  assert_contains "$(printf '%s\n' "$out_empty_type" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: LOW" "empty typeName dispatch must apply registered LOW effort"
+
+  local p_wrong_conv out_wrong_conv p_right_conv out_right_conv
+  p_wrong_conv=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-beta",
+    toolCall: {name: "swarm", args: {action: "add", name: "conv-worker", workspace: "inherit", brief: "Cross-conv task."}}
+  }')
+  out_wrong_conv=$(printf '%s\n' "$p_wrong_conv" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$dispatch_json" '.entries["conv-worker"].consumed' "false" "swarm from different conversationId must NOT consume conv-alpha dispatch"
+  assert_contains "$(printf '%s\n' "$out_wrong_conv" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: MEDIUM" "mismatched conversationId must fall back to MEDIUM"
+
+  p_right_conv=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-alpha",
+    toolCall: {name: "swarm", args: {action: "add", name: "conv-worker", workspace: "inherit", brief: "Same-conv task."}}
+  }')
+  out_right_conv=$(printf '%s\n' "$p_right_conv" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$dispatch_json" '.entries["conv-worker"].consumed' "true" "swarm from matching conversationId must consume dispatch"
+  assert_contains "$(printf '%s\n' "$out_right_conv" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: MAX" "matching conversationId must apply MAX effort"
+
+  local p_partial out_partial
+  p_partial=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "partial-worker",
+        workspace: "share",
+        brief: "[EFFORT_PROFILE: XHIGH — custom]\n\nExisting effort header."
+      }
+    }
+  }')
+  out_partial=$(printf '%s\n' "$p_partial" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    --arg grd "$EXPECTED_SWARM_BRANCH_GUARD" \
+    '.decision == "allow"
+     and .overwrite.brief == ($ctr + "\n" + $grd + "\n\n[EFFORT_PROFILE: XHIGH — custom]\n\nExisting effort header.")' \
+    <<< "$out_partial" >/dev/null || {
+      echo "Partial pre-existing EFFORT_PROFILE header was duplicated: $out_partial" >&2
+      return 1
+    }
 }
 
 run_tests

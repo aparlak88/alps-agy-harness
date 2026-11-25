@@ -101,3 +101,19 @@ Uygulama tamamlandığında:
 1. `pre-pr-readiness` skill'ini çağırın (`canon-auditor`, `security-reviewer`, Walkthrough).
 2. `gh pr create` komutunu çalıştırın.
 3. `stop-gate.sh` devreye girdiğinde `review-pr` skill'i ile `pr-auditor` denetimini gerçekleştirin.
+
+---
+
+## 8. Antigravity Swarm Orkestrasyon Modu
+
+Kullanıcı `/swarm` veya çoklu ajan koordinasyonu başlattığında ana ajan **Koordinatör**, `swarm(action="add")` ile eklenen ajanlar ise **Swarm Worker** rolündedir:
+
+1. **Tek Entegrasyon Dalı Topolojisi (`feat/<konu>`):** Koordinatör kodlama öncesinde `main` üzerinden tek bir `feat/<konu>` entegrasyon dalına geçer (`jev_classify`, `brainstorming`, Spec ve Plan yalnızca burada, bir kez yürütülür).
+2. **İzole Çalışma Alanı (`workspace: "share"` vs `"inherit"`):**
+   - Dosya düzenleyen veya test/derleme çalıştıran yazıcı işçiler mutlaka `workspace: "share"` ile başlatılır ve koda dokunmadan önce kendi alt dallarını (`git checkout -b feat/<konu>-<ad>`) açar.
+   - Salt-okunur inceleme/keşif işçileri `workspace: "inherit"` kullanır; birden fazla işçi aynı ortak dizine aynı anda yazmaz.
+3. **Engelleyici Olmayan Swarm Kancası (`pre-subagent-guard.sh`):** `hooks.json` hem `invoke_subagent` hem `swarm` çağrılarını yakalar. `swarm(action="add")` çağrılarında engelleme yapmadan `overwrite.brief` ile `[EFFORT_PROFILE: ...]` ve `[SWARM_WORKER_CONTRACT ...]` başlıklarını (ve `share`/`branch` modunda `[SWARM_BRANCH_GUARD ...]`) enjekte eder; `status`, `models`, `title`, `model`, `kill` çağrılarını doğrudan geçirir. İsteğe bağlı olarak `--type "swarm"` ile `stamp-gate.sh dispatch` kaydı da tüketilebilir.
+4. **Swarm Worker Kapsamı:** Koordinatörden `brief` alan işçi yeniden `jev_classify`, `brainstorming`, Spec, Walkthrough veya `gh pr create` başlatmaz; kendi dalı ve atanmış dosyaları içinde TDD, `context7`, `run-quiet.sh`, İngilizce `REMEDIATION:` ve güvenlik/sözlük kurallarını uygular. `docs/parking-lot.md` veya `docs/canon/*` güncellemelerini doğrudan yazmak yerine mesaj panosunda `@coordinator`'a bildirir.
+5. **`swarm` vs. `invoke_subagent` Görev Ayrımı:**
+   - **`swarm`:** Paralel uygulayıcı işçiler, paylaşılan mesaj panosu koordinasyonu ve `share`/`branch` alt dallarında eşzamanlı kodlama için kullanılır.
+   - **`invoke_subagent`:** Tekil salt-okunur profiller ve zorunlu denetim kapıları (`canon-auditor`, `security-reviewer`, `pr-auditor`, `research`, `browser`) için kullanılır. Tüm işçi dalları entegrasyon dalında birleştirildikten sonra koordinatör `pre-pr-readiness`, tek Walkthrough, `gh pr create` ve `review-pr` (`pr-auditor`) adımlarını yürütür.

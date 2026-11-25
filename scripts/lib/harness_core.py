@@ -2057,6 +2057,15 @@ EFFORT_PROFILE_HEADERS = {
     "XHIGH": "[EFFORT_PROFILE: XHIGH — Derin çok adımlı muhakeme uygula; katman sözleşmelerini, tip güvenliğini ve tüm hata/kenar yollarını uçtan uca doğrula.]",
     "MAX": "[EFFORT_PROFILE: MAX — Sıfır varsayım; tüm bağımlılık zincirini, karşı-örnekleri ve güvenlik/kanon değişmezlerini satır satır kanıtla.]",
 }
+SWARM_WORKER_CONTRACT_HEADER = (
+    "[SWARM_WORKER_CONTRACT — Koordinatör brief kapsamına sadık kal; "
+    "yeniden jev_classify, brainstorming, Spec, Walkthrough veya gh pr create çalıştırma; "
+    "docs/parking-lot.md ve docs/canon/* önerilerini panoda @coordinator'a bildir.]"
+)
+SWARM_BRANCH_GUARD_HEADER = (
+    "[SWARM_BRANCH_GUARD — Koda dokunmadan önce kendi özellik dalını aç "
+    "(git checkout -b feat/<konu>-<ad>); detached HEAD veya main üzerinde kalma.]"
+)
 TIER_DEFAULT_EFFORT = {
     "trivial_lookup": "LOW",
     "bounded_execution": "MEDIUM",
@@ -2288,28 +2297,104 @@ def mark_pr_audit_dispatched(
 def _try_consume_optional_dispatch(
     candidates: list[Path],
     role: str,
+    expected_type: Optional[str] = None,
+    cur_conv: str = "",
 ) -> tuple[Optional[dict[str, Any]], Optional[Path]]:
     """Consume an unconsumed ``role`` entry across candidate worktrees if present."""
     if not role:
         return None, None
-    for wt in candidates:
-        state_dir = _existing_state_dir(wt)
-        if state_dir is None:
-            continue
-        dispatch_file = state_dir / "subagent-dispatch.json"
-        if not dispatch_file.is_file():
-            continue
-        with locked_state_file(state_dir, "subagent-dispatch"):
-            data = read_json_file(dispatch_file)
-            if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+    norm_conv = cur_conv.strip()
+    passes = (True, False) if norm_conv else (False,)
+    saw_exact_match = False
+    for require_exact in passes:
+        if not require_exact and saw_exact_match:
+            break
+        for wt in candidates:
+            state_dir = _existing_state_dir(wt)
+            if state_dir is None:
                 continue
-            entry = data["entries"].get(role)
-            if not isinstance(entry, dict) or entry.get("consumed") is not False:
+            dispatch_file = state_dir / "subagent-dispatch.json"
+            if not dispatch_file.is_file():
                 continue
-            entry["consumed"] = True
-            atomic_write_json(state_dir, "subagent-dispatch.json", data)
-            return dict(entry), wt
+            with locked_state_file(state_dir, "subagent-dispatch"):
+                data = read_json_file(dispatch_file)
+                if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+                    continue
+                entry = data["entries"].get(role)
+                if not isinstance(entry, dict) or entry.get("consumed") is not False:
+                    continue
+                if expected_type:
+                    entry_type = str(entry.get("typeName") or "").strip()
+                    if entry_type and entry_type != expected_type:
+                        continue
+                matches, exact = _conversation_matches(entry, norm_conv)
+                if not matches:
+                    continue
+                if exact:
+                    saw_exact_match = True
+                if require_exact and not exact:
+                    continue
+                entry["consumed"] = True
+                atomic_write_json(state_dir, "subagent-dispatch.json", data)
+                return dict(entry), wt
     return None, None
+
+
+def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate ``swarm`` PreToolUse guard with non-blocking brief enrichment."""
+    if is_harness_ignored(workspace):
+        return {"decision": "allow"}
+    if not isinstance(hook_input, dict):
+        return {"decision": "allow"}
+    tool_call = hook_input.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return {"decision": "allow"}
+    tool_name = str(tool_call.get("name") or "")
+    if tool_name and tool_name != "swarm":
+        return {"decision": "allow"}
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        return {"decision": "allow"}
+
+    action = str(args.get("action") or "").strip().lower()
+    if action != "add":
+        return {"decision": "allow"}
+
+    brief = str(args.get("brief") or "")
+    if not brief.strip():
+        return {"decision": "allow"}
+
+    worker_name = str(args.get("name") or "").strip()
+    ws_mode = str(args.get("workspace") or "inherit").strip().lower()
+
+    effort = "MEDIUM"
+    if worker_name:
+        candidates = _ordered_candidate_worktrees(workspace, brief)
+        cur_conv = str(hook_input.get("conversationId") or "").strip()
+        entry, _ = _try_consume_optional_dispatch(
+            candidates,
+            worker_name,
+            expected_type="swarm",
+            cur_conv=cur_conv,
+        )
+        if entry is not None:
+            reg_effort = str(entry.get("effortProfile") or "").strip()
+            if is_valid_effort_profile(reg_effort):
+                effort = reg_effort
+
+    headers: list[str] = []
+    if "[EFFORT_PROFILE:" not in brief:
+        headers.append(EFFORT_PROFILE_HEADERS[effort])
+    if "[SWARM_WORKER_CONTRACT" not in brief:
+        headers.append(SWARM_WORKER_CONTRACT_HEADER)
+    if ws_mode in ("share", "branch") and "[SWARM_BRANCH_GUARD" not in brief:
+        headers.append(SWARM_BRANCH_GUARD_HEADER)
+
+    if not headers:
+        return {"decision": "allow"}
+
+    new_brief = "\n".join(headers) + "\n\n" + brief
+    return {"decision": "allow", "overwrite": {"brief": new_brief}}
 
 
 def _build_subagent_overwrite(model: str, effort: str, orig_prompt: str) -> dict[str, Any]:
@@ -2330,6 +2415,8 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     if not isinstance(tool_call, dict):
         return {"decision": "allow"}
     tool_name = str(tool_call.get("name") or "")
+    if tool_name == "swarm":
+        return evaluate_pre_swarm(workspace, hook_input)
     if tool_name and tool_name != "invoke_subagent":
         return {"decision": "allow"}
     args = tool_call.get("args")
