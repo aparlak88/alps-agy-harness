@@ -199,6 +199,16 @@ flowchart TD
     Review --> Done(["PR İncelemesi Tamamlandı"])
 ```
 
+### Antigravity Swarm ile Kullanım
+
+Antigravity Swarm (`/swarm` veya çoklu ajan iş akışı) kullanılırken harness hem koordinatörü hem paralel işçileri deterministik sınırlar içinde tutar:
+
+- **Tek Entegrasyon Dalı Topolojisi (`feat/*`):** Koordinatör `main` üzerinden tek bir `feat/<konu>` entegrasyon dalına geçer; `jev_classify`, `superpowers:brainstorming`, Spec ve Plan yalnızca burada bir kez yürütülür. Tüm işçi dalları tamamlandığında önce koordinatörün entegrasyon dalında birleştirilir; ardından tek bir bütünleşik `docs/walkthroughs/*.md` rehberi, `canon-auditor`, `security-reviewer`, `gh pr create` ve `pr-auditor` çalıştırılır.
+- **İzole Yazıcı Kopyaları (`workspace: "share"` + alt dal):** Kod yazan veya derleme/test çalıştıran işçiler `workspace: "share"` (veya tam izole klon için `"branch"`) ile başlatılır ve koda dokunmadan önce kendi alt dallarını (`git checkout -b feat/<konu>-<işçi>`) açar. Salt-okunur inceleme ve keşif işçileri ise `workspace: "inherit"` kullanır.
+- **`invoke_subagent|swarm` Kancası (`pre-subagent-guard.sh`):** `hooks.json` içindeki `PreToolUse` eşleştiricisi `invoke_subagent|swarm` desenini izler. `swarm(action="add")` çağrılarında işlemi engellemeden (`non-blocking overwrite`) `brief` başına `[EFFORT_PROFILE: ...]`, `[SWARM_WORKER_CONTRACT ...]` ve `share`/`branch` modlarında `[SWARM_BRANCH_GUARD ...]` başlıklarını ekler; aynı `Role` için paralel dispatch kayıtları `pendingQueues` ve `conversationId` yakınlığıyla çakışmasız tüketilir.
+- **Kararlı `detached-wt-*` Slug'ı:** Linked Git worktree'lerde `detached HEAD` durumunda `common.sh` ve `harness_core.py`, commit hash'ine bağlı değişen `detached-<7sha>` yerine worktree dizin adına sabitlenen `detached-wt-*` (`detached-wt-<ad>`) slug'ını üretir. Böylece işçi yeni commit attığında `.harness/state/detached-wt-<ad>/` altındaki `context7` ve diğer damgalar bozulmaz.
+- **Global Kurulum Önerisi:** Swarm'ın `workspace: "share"` ve `"branch"` modlarında oluşturduğu çalışma kopyalarının kancaları ve arka plan daemon'ını kesintisiz devralması için **Global Kurulum** (`~/.gemini/config/plugins/alps-agy-harness`) önerilir. Proje bazlı `.agents/plugins/` kurulumu kullanılıyorsa `./scripts/harness-doctor.sh` çıktıya `INFO` seviyesinde `swarm_install_advisory` uyarısı ekleyerek global kurulumu veya işçi klonlarında `--recurse-submodules` (`git submodule update --init --recursive`) kullanımını hatırlatır.
+
 ---
 
 ## 8. Bileşenler Özeti
@@ -208,7 +218,7 @@ flowchart TD
 | **Kancalar (`hooks.json`)** | `session-start.sh` | Oturum başında dal, aktif model ailesi (`modelName`), kanon ve araç durumunu enjekte eder; soket yoksa `harness-daemon`'ı arka planda başlatır. |
 | | `pre-edit-guard.sh` | `main` dalı kod kilidi, kardeş worktree çözümlemesi, doküman sonu sözlük kapısı ve güvenlik süzgeci. |
 | | `pre-command-guard.sh` | `cd`/`git -C` worktree çözümlemesi, paket kurulum doğrulaması, logcat koruması ve `.gitignore` uyumlu sert PR açma kapısı. |
-| | `pre-subagent-guard.sh` | Gemini 4 & `Orchestrator` duyarlı alt ajan modeli/efor `overwrite` kilidi, `flock`-atomik ve kardeş worktree taramalı `subagent-dispatch.json` tüketimi. |
+| | `pre-subagent-guard.sh` | `invoke_subagent\|swarm` eşleştiricisiyle Gemini 4 & `Orchestrator` duyarlı model/efor `overwrite` kilidi, `swarm(action="add")` için non-blocking `brief` zenginleştirme ve `flock`-atomik `pendingQueues` / `conversationId` tüketimi. |
 | | `post-command-hooks.sh` | Başarılı PR sonrası etkin worktree + `conversationId` kayıtlı denetim bayrağı ve asenkron `graphify` güncellemesi. |
 | | `stop-gate.sh` | `conversationId` izolasyonuyla yalnızca PR açan oturumda `pr-auditor` çalıştırılmadan çıkışı engeller. |
 | **Arka Plan Sidecar (`sidecars/`)** | `harness-daemon/sidecar.json` & `daemon.py` | Sıfır gecikmeli Unix socket kanca motoru (`HARNESS_AUTO_START_DAEMON=1` otomatik başlatma), tekil kuyruklu asenkron `graphify`, doktor/damga/spec önbelleği ve iOS crash izleyici (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir). |
@@ -250,5 +260,6 @@ flowchart TD
 | **Sequence Diagram** | İstemci ile sunucu arasındaki mesajlaşma ve metot çağrı sırasını adım adım gösteren zaman eksenli UML diyagramı. |
 | **Sidecar (`harness-daemon`)** | Antigravity'nin ana ajandan bağımsız yönettiği, arka plan önbellekleme ve Unix domain socket üzerinden sıcak kanca değerlendirmesi sunan yardımcı süreç. |
 | **Subagent Dispatch** | Ana ajanın alt ajan çalıştırmadan önce işin karmaşıklığını puanlayıp uygun model ve efor profilini damgalaması süreci. |
+| **Swarm (Antigravity Swarm)** | Koordinatör ajanın ortak mesaj panosu ve izole çalışma alanları (`workspace: "share"` / `"inherit"` / `"branch"`) üzerinden paralel işçi ajanları eşzamanlı koordine ettiği çoklu ajan yürütme mimarisi. |
 | **Ubiquitous Language** | Ekip, dokümanlar ve kaynak kod arasında terim karmaşasını önlemek için kullanılan ortak ve tekil alan dili sözlüğü. |
 | **Walkthrough** | Bir PR'ın mimari kararlarını, değişen katmanlarını ve doğrulama kanıtlarını görsel diyagramlarla anlatan rehber doküman. |

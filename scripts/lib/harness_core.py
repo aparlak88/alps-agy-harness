@@ -3371,6 +3371,13 @@ def run_doctor_checks(
         add_check("install_mode", "workspace", "INFO", ".harness-ignore active (harness disabled for this workspace)")
     elif (workspace / ".agents" / "plugins").is_dir() or (workspace / ".agents" / "plugins.json").is_file():
         add_check("install_mode", "workspace", "OK", "Project-level plugin installed")
+        add_check(
+            "swarm_install_advisory",
+            "workspace",
+            "INFO",
+            "Project-level plugin install detected; Swarm share/branch workspaces need global install (~/.gemini/config/plugins/alps-agy-harness) or submodule init (--recurse-submodules) so worker copies inherit hooks",
+            "Fix: Install alps-agy-harness globally in ~/.gemini/config/plugins/alps-agy-harness or run git submodule update --init --recursive in Swarm share/branch copies",
+        )
     elif (cfg_dir / "plugins" / "alps-agy-harness").is_dir():
         add_check("install_mode", "workspace", "OK", "Global plugin active")
     else:

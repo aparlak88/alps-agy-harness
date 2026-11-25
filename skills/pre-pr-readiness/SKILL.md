@@ -61,6 +61,9 @@ Okuyucunun IDE'yi açmadan tüm işi, mimari kararları ve her bir dosyadaki de�
 > [!NOTE]
 > `codeTreeSha` hesabı `docs/walkthroughs/` ve `docs/parking-lot.md` dosyalarını otomatik olarak dışarıda bırakır; böylece walkthrough commit edildikten veya güncellendikten sonra denetim damgaları bozulmaz.
 
+> [!IMPORTANT]
+> **Swarm Entegrasyon Dalı Kuralı:** Antigravity Swarm oturumunda paralel çalışan işçilerin dalları (`feat/<konu>-<işçi>`) doğrudan PR'a gönderilmez ve işçi başına ayrı Walkthrough üretilmez. Çoklu Swarm işçi dalları önce koordinatörün tek `feat/*` entegrasyon dalında birleştirilir; ardından bu entegrasyon dalı üzerinde tek bir bütünleşik `docs/walkthroughs/*.md` rehberi hazırlanır ve `canon-auditor` + `security-reviewer` denetimleri tek seferde çalıştırılarak damgalanır.
+
 ---
 
 ### Adım 3: `canon-auditor` Denetimi ve Damgası
