@@ -224,8 +224,8 @@ EOF
         /*) cd_abs="$raw_cd" ;;
         *) cd_abs="$workspace/$raw_cd" ;;
       esac
-      real_gd="$(unset CDPATH && cd -- "$gd_abs" 2>/dev/null && pwd -P || true)"
-      real_cd="$(unset CDPATH && cd -- "$cd_abs" 2>/dev/null && pwd -P || true)"
+      real_gd="$(unset CDPATH && cd -P -- "$gd_abs" 2>/dev/null && pwd -P || true)"
+      real_cd="$(unset CDPATH && cd -P -- "$cd_abs" 2>/dev/null && pwd -P || true)"
       if [ -n "$real_gd" ] && [ -n "$real_cd" ] && [ "$real_gd" != "$real_cd" ]; then
         local wt_parent wt_name
         wt_parent="$(basename "$(dirname "$real_gd")")"

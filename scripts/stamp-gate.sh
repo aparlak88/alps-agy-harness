@@ -407,7 +407,7 @@ cmd_dispatch() {
     --tier "$tier" \
     --model "$model" \
     --effort "$effort" \
-    --conversation-id "$conversation_id"
+    --conversation-id="$conversation_id"
 }
 
 cmd_select_model() {

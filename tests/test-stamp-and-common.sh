@@ -221,6 +221,10 @@ test_dispatch_tier_mapping() {
     .entries["Security Auditor"].consumed == false
   ' "$dispatch_file" >/dev/null
 
+  # Leading-hyphen conversationId passes safely through to python argparse
+  "$STAMP_GATE" dispatch --role "Dash Conv" --type "self" --tier "bounded_execution" --conversation-id "-conv-dash" --workspace "$repo"
+  assert_json_field "$dispatch_file" '.entries["Dash Conv"].conversationId' "-conv-dash" "Leading-hyphen conversationId must be preserved"
+
   # Invalid tier must fail
   if "$STAMP_GATE" dispatch --role "Bad" --type "self" --tier "unknown_tier" --workspace "$repo" >/dev/null 2>&1; then
     echo "dispatch with invalid tier must fail" >&2

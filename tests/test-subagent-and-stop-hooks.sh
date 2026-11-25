@@ -904,6 +904,7 @@ test_stop_gate_allows_async_wait_when_pr_auditor_dispatched() {
 }
 
 test_parallel_subagent_dispatch_locking_and_sibling_worktree_discovery() {
+  export HARNESS_DISABLE_DAEMON=1
   local main_repo wt_parent wt_backend wt_ios
   main_repo=$(make_temp_repo)
   echo "init" > "$main_repo/README.md"

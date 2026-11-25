@@ -604,6 +604,197 @@ test_hook_input_cwd_relative_edit_in_sibling_worktree() {
   assert_json_field "$out_rel_ext" ".decision" "allow" "Relative edit in unrelated external repo via cwd must preserve external allow"
 }
 
+test_nested_git_worktree_pre_edit_enforces_rules() {
+  [ -x "$PRE_EDIT_GUARD" ] || { echo "pre-edit-guard.sh missing or not executable: $PRE_EDIT_GUARD" >&2; return 1; }
+  local DAEMON_PY="$REPO_ROOT/sidecars/harness-daemon/daemon.py"
+  [ -x "$DAEMON_PY" ] || { echo "daemon.py missing or not executable: $DAEMON_PY" >&2; return 1; }
+
+  local main_repo wt_nested wt_ignored other_nested
+  main_repo=$(make_temp_repo)
+  echo "init" > "$main_repo/README.md"
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+
+  mkdir -p "$main_repo/.worktrees"
+  wt_nested="$main_repo/.worktrees/worker-nested"
+  wt_ignored="$main_repo/.worktrees/worker-ignored"
+  git -C "$main_repo" worktree add "$wt_nested" -b "feat/nested" --quiet
+  git -C "$main_repo" worktree add "$wt_ignored" -b "feat/ignored" --quiet
+  : > "$wt_ignored/.harness-ignore"
+
+  other_nested="$main_repo/vendor/other-repo"
+  mkdir -p "$other_nested"
+  (
+    cd "$other_nested"
+    git init --quiet -b main 2>/dev/null || (git init --quiet && git checkout -b main --quiet)
+    git config user.name "Harness Test"
+    git config user.email "harness@test.local"
+    echo "other" > README.md
+    git add README.md
+    git commit -m "chore: other" --quiet
+    git checkout -b "feat/other" --quiet
+  )
+
+  # 1. Cold fallback (HARNESS_DISABLE_DAEMON=1): absolute + relative writes inside nested .worktrees/worker-nested
+  local p_abs_clean p_rel_clean p_abs_eval p_rel_eval p_abs_doc p_rel_doc p_doc_good p_main_direct p_ignored
+  local out_abs_clean out_rel_clean out_abs_eval out_rel_eval out_abs_doc out_rel_doc out_doc_good out_main_direct out_ignored
+
+  p_abs_clean=$(jq -nc --arg ws "$main_repo" --arg path "$wt_nested/src/CleanAbs.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const ok = 1;"}}}')
+  out_abs_clean=$(printf '%s' "$p_abs_clean" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_abs_clean" ".decision" "allow" "Absolute clean write in nested feature worktree must be allowed while main_repo is on main"
+
+  p_rel_clean=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_nested" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "src/CleanRel.ts", Content: "export const rel = 1;"}}}')
+  out_rel_clean=$(printf '%s' "$p_rel_clean" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_clean" ".decision" "allow" "Relative clean write via cwd in nested feature worktree must be allowed while main_repo is on main"
+
+  p_abs_eval=$(jq -nc --arg ws "$main_repo" --arg path "$wt_nested/src/BadAbs.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const bad = eval(\"1\");"}}}')
+  out_abs_eval=$(printf '%s' "$p_abs_eval" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_abs_eval" ".decision" "deny" "Absolute eval() in nested worktree must be denied"
+  assert_contains "$(printf '%s' "$out_abs_eval" | jq -r '.reason')" "eval()" "Nested worktree deny must be Rule 3 eval() error, not main branch lock"
+
+  p_rel_eval=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_nested" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "src/BadRel.ts", Content: "export const bad = eval(\"1\");"}}}')
+  out_rel_eval=$(printf '%s' "$p_rel_eval" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_eval" ".decision" "deny" "Relative eval() in nested worktree must be denied"
+  assert_contains "$(printf '%s' "$out_rel_eval" | jq -r '.reason')" "eval()"
+
+  p_abs_doc=$(jq -nc --arg ws "$main_repo" --arg path "$wt_nested/docs/plan.md" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "# Nested Plan\n\nNo glossary."}}}')
+  out_abs_doc=$(printf '%s' "$p_abs_doc" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_abs_doc" ".decision" "deny" "Absolute doc without glossary in nested worktree must be denied"
+  assert_contains "$(printf '%s' "$out_abs_doc" | jq -r '.reason')" "Glossary" "Nested worktree doc deny must enforce Rule 2 Glossary"
+
+  p_rel_doc=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_nested" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "docs/plan-rel.md", Content: "# Nested Rel Plan\n\nNo glossary."}}}')
+  out_rel_doc=$(printf '%s' "$p_rel_doc" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_doc" ".decision" "deny" "Relative doc without glossary in nested worktree must be denied"
+  assert_contains "$(printf '%s' "$out_rel_doc" | jq -r '.reason')" "Glossary"
+
+  local valid_doc_content
+  valid_doc_content=$(cat <<'EOF'
+# Nested Plan
+
+Details.
+
+## Technical Glossary
+
+| Term | Description |
+| :--- | :--- |
+| Worktree | Linked git checkout |
+EOF
+)
+  p_doc_good=$(jq -nc --arg ws "$main_repo" --arg path "$wt_nested/docs/plan-good.md" --arg content "$valid_doc_content" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: $content}}}')
+  out_doc_good=$(printf '%s' "$p_doc_good" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_doc_good" ".decision" "allow" "Nested worktree doc with glossary must be allowed"
+
+  p_main_direct=$(jq -nc --arg ws "$main_repo" --arg path "$main_repo/src/DirectMain.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const m = 1;"}}}')
+  out_main_direct=$(printf '%s' "$p_main_direct" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_main_direct" ".decision" "deny" "Direct write in main_repo on main must remain denied"
+
+  p_ignored=$(jq -nc --arg ws "$main_repo" --arg path "$wt_ignored/src/Ignored.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const bad = eval(\"1\");"}}}')
+  out_ignored=$(printf '%s' "$p_ignored" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_ignored" ".decision" "allow" "Nested linked worktree with .harness-ignore must allow"
+
+  # 2. Direct Python on_worktree_resolved callback parity (and non-resolution of unrelated nested repo)
+  python3 -B - "$REPO_ROOT/scripts/lib" "$main_repo" "$wt_nested" "$other_nested" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import harness_core
+
+main_repo = Path(sys.argv[2])
+wt_nested = Path(sys.argv[3])
+other_nested = Path(sys.argv[4])
+expected_wt = Path(os.path.realpath(str(wt_nested)))
+
+seen_abs = []
+res_abs = harness_core.evaluate_pre_edit(
+    main_repo,
+    {"toolCall": {"name": "write_file", "args": {"Path": str(wt_nested / "src" / "CbAbs.ts"), "Content": "export const x = 1;"}}},
+    on_worktree_resolved=seen_abs.append,
+)
+assert res_abs.get("decision") == "allow", res_abs
+assert seen_abs == [expected_wt], f"Expected on_worktree_resolved={[expected_wt]}, got {seen_abs}"
+
+seen_rel = []
+res_rel = harness_core.evaluate_pre_edit(
+    main_repo,
+    {"cwd": str(wt_nested), "toolCall": {"name": "write_file", "args": {"Path": "src/CbRel.ts", "Content": "export const y = 1;"}}},
+    on_worktree_resolved=seen_rel.append,
+)
+assert res_rel.get("decision") == "allow", res_rel
+assert seen_rel == [expected_wt], f"Expected relative on_worktree_resolved={[expected_wt]}, got {seen_rel}"
+
+seen_other = []
+res_other = harness_core.evaluate_pre_edit(
+    main_repo,
+    {"toolCall": {"name": "write_file", "args": {"Path": str(other_nested / "src" / "Other.ts"), "Content": "export const z = 1;"}}},
+    on_worktree_resolved=seen_other.append,
+)
+assert res_other.get("decision") == "deny", res_other
+assert seen_other == [], f"Unrelated nested git repo must not resolve as linked worktree: {seen_other}"
+PY
+
+  # 3. Warm daemon parity + auto-registration of nested worktree
+  _NESTED_SOCK_DIR=$(mktemp -d "/tmp/hd-nested.XXXXXX")
+  _NESTED_DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hd-nested-data.XXXXXX")
+  _NESTED_DAEMON_PID=""
+  local sock_path="$_NESTED_SOCK_DIR/d.sock"
+  _nested_wt_cleanup() {
+    if [ -n "${_NESTED_DAEMON_PID:-}" ]; then
+      kill "$_NESTED_DAEMON_PID" 2>/dev/null || true
+      wait "$_NESTED_DAEMON_PID" 2>/dev/null || true
+      _NESTED_DAEMON_PID=""
+    fi
+    rm -rf "${_NESTED_SOCK_DIR:-}" "${_NESTED_DATA_DIR:-}" 2>/dev/null || true
+  }
+  trap _nested_wt_cleanup EXIT INT TERM
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$_NESTED_DATA_DIR" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  _NESTED_DAEMON_PID=$!
+
+  local tries=0 ready=0
+  while [ "$tries" -lt 40 ]; do
+    if [ -S "$sock_path" ] && curl -fsS --max-time 0.2 --unix-socket "$sock_path" "http://localhost/health" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  [ "$ready" -eq 1 ] || { echo "Ephemeral daemon did not start for nested worktree test" >&2; return 1; }
+
+  local d_abs_clean d_rel_clean d_abs_eval d_abs_doc active_cnt
+  d_abs_clean=$(printf '%s' "$p_abs_clean" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$d_abs_clean" ".decision" "allow" "Warm daemon must allow clean absolute write in nested worktree"
+
+  d_rel_clean=$(printf '%s' "$p_rel_clean" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$d_rel_clean" ".decision" "allow" "Warm daemon must allow clean relative write in nested worktree"
+
+  d_abs_eval=$(printf '%s' "$p_abs_eval" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$d_abs_eval" ".decision" "deny" "Warm daemon must deny eval() in nested worktree"
+  assert_contains "$(printf '%s' "$d_abs_eval" | jq -r '.reason')" "eval()"
+
+  d_abs_doc=$(printf '%s' "$p_abs_doc" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$d_abs_doc" ".decision" "deny" "Warm daemon must deny doc without glossary in nested worktree"
+  assert_contains "$(printf '%s' "$d_abs_doc" | jq -r '.reason')" "Glossary"
+
+  active_cnt=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.activeWorkspaces')
+  [ "$active_cnt" -ge 2 ] || { echo "Expected nested worktree auto-registered in daemon (activeWorkspaces=$active_cnt)" >&2; return 1; }
+}
+
 test_session_start_swarm_protocol_branch_guard_and_detached_head() {
   [ -x "$SESSION_START" ] || { echo "session-start.sh missing or not executable: $SESSION_START" >&2; return 1; }
   export HARNESS_DISABLE_DAEMON=1
@@ -643,6 +834,15 @@ test_session_start_swarm_protocol_branch_guard_and_detached_head() {
   assert_contains "$msg_feat" "Swarm Worker Mode"
   assert_not_contains "$msg_feat" "[BRANCH GUARD]" "Feature branch must not emit [BRANCH GUARD]"
   assert_not_contains "$msg_feat" "[DETACHED HEAD]" "Feature branch must not emit [DETACHED HEAD]"
+
+  # 5. Non-git directory -> neither [BRANCH GUARD] nor [DETACHED HEAD]
+  local nongit_dir msg_nongit
+  nongit_dir=$(mktemp -d "${TMPDIR:-/tmp}/harness-nongit.XXXXXX")
+  echo "$nongit_dir" >> "$_HARNESS_TEMP_TRACKER"
+  msg_nongit=$(jq -nc --arg ws "$nongit_dir" '{workspacePaths: [$ws]}' | "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$msg_nongit" "Swarm Worker Mode"
+  assert_not_contains "$msg_nongit" "[BRANCH GUARD]" "Non-git directory must not emit [BRANCH GUARD]"
+  assert_not_contains "$msg_nongit" "[DETACHED HEAD]" "Non-git directory must not emit [DETACHED HEAD]"
 }
 
 run_tests

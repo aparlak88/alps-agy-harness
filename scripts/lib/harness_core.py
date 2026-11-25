@@ -1242,6 +1242,7 @@ def evaluate_pre_edit(
 
     effective_ws = workspace
     rel_path, is_external = _resolve_rel_path(workspace, candidate)
+    linked_wt: Optional[Path] = None
     if is_external:
         try:
             real_candidate = Path(os.path.realpath(candidate))
@@ -1249,11 +1250,36 @@ def evaluate_pre_edit(
             return {"decision": "allow"}
 
         linked_wt = resolve_linked_worktree(workspace, real_candidate)
-        if linked_wt is None or is_harness_ignored(linked_wt):
+        if linked_wt is None:
             return {"decision": "allow"}
+    else:
+        try:
+            real_ws = Path(os.path.realpath(str(workspace)))
+        except OSError:
+            real_ws = Path(os.path.normpath(str(workspace)))
+        try:
+            real_candidate = Path(os.path.realpath(candidate))
+        except OSError:
+            real_candidate = Path(os.path.normpath(candidate))
 
-        rel_path, is_external = _resolve_rel_path(linked_wt, str(real_candidate))
-        if is_external or not rel_path:
+        cur = _nearest_existing_dir(real_candidate)
+        while cur is not None and cur != real_ws and cur != cur.parent:
+            try:
+                has_git = (cur / ".git").exists()
+            except OSError:
+                has_git = False
+            if has_git:
+                cand_wt = resolve_linked_worktree(workspace, real_candidate)
+                if cand_wt is not None and cand_wt != real_ws:
+                    linked_wt = cand_wt
+                    break
+            cur = cur.parent
+
+    if linked_wt is not None:
+        if is_harness_ignored(linked_wt):
+            return {"decision": "allow"}
+        rel_path, wt_ext = _resolve_rel_path(linked_wt, str(real_candidate))
+        if wt_ext or not rel_path:
             return {"decision": "allow"}
         effective_ws = linked_wt
         if on_worktree_resolved is not None:
@@ -3617,7 +3643,7 @@ def build_session_start_payload(
             f"[BRANCH GUARD] Active branch is '{branch}' (protected). "
             "Create or switch to a feature branch/worktree (e.g. git checkout -b feat/<topic>) before modifying source files."
         )
-    elif branch == "HEAD":
+    elif branch == "HEAD" and live_head != "UNBORN":
         lines.append(
             "[DETACHED HEAD] Repository is in detached HEAD state. "
             "Before editing source files, create or switch to a named feature branch (git checkout -b feat/<topic>)."
