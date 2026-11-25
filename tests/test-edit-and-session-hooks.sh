@@ -550,4 +550,99 @@ test_sibling_git_worktree_pre_edit_enforces_rules_while_unrelated_external_allow
   assert_json_field "$out_ext" ".decision" "allow" "Unrelated external git repo must preserve external allow behavior"
 }
 
+test_hook_input_cwd_relative_edit_in_sibling_worktree() {
+  [ -x "$PRE_EDIT_GUARD" ] || { echo "pre-edit-guard.sh missing or not executable: $PRE_EDIT_GUARD" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
+
+  local main_repo wt_parent wt_feat other_repo
+  main_repo=$(make_temp_repo)
+  echo "init" > "$main_repo/README.md"
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+
+  wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/harness-wt-cwd-edit.XXXXXX")
+  echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"
+  wt_feat="$wt_parent/worker-edit"
+  git -C "$main_repo" worktree add "$wt_feat" -b "feat/cwd-edit" --quiet
+
+  other_repo=$(make_temp_repo)
+  echo "other" > "$other_repo/README.md"
+  git -C "$other_repo" add README.md
+  git -C "$other_repo" commit -m "chore: other" --quiet
+  git -C "$other_repo" checkout -b "feat/other" --quiet
+
+  # 1. Relative write_file with HOOK_INPUT.cwd in sibling worktree -> allow (not blocked by main_repo main lock!)
+  local out_rel_clean out_rel_no_cwd out_rel_doc out_rel_eval out_rel_ext
+  out_rel_clean=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "src/Clean.ts", Content: "export const ok = 1;"}}}' \
+    | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_clean" ".decision" "allow" "Relative write_file in cwd sibling feature worktree must allow"
+
+  # 2. Same relative write_file without cwd -> resolves to main_repo on main -> deny
+  out_rel_no_cwd=$(jq -nc --arg ws "$main_repo" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: "src/Clean.ts", Content: "export const ok = 1;"}}}' \
+    | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_no_cwd" ".decision" "deny" "Relative write_file without cwd resolves to main_repo on main -> deny"
+
+  # 3. Relative doc without glossary in cwd sibling worktree -> deny
+  out_rel_doc=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "docs/plan.md", Content: "# Plan\n\nNo glossary."}}}' \
+    | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_doc" ".decision" "deny" "Relative doc missing glossary in cwd sibling worktree must deny"
+  assert_contains "$(printf '%s' "$out_rel_doc" | jq -r '.reason')" "Glossary"
+
+  # 4. Relative dangerous eval() in cwd sibling worktree -> deny
+  out_rel_eval=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "src/Bad.ts", Content: "export const bad = eval(\"1\");"}}}' \
+    | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_eval" ".decision" "deny" "Relative eval() in cwd sibling worktree must deny"
+
+  # 5. Relative edit in unrelated external repo via cwd preserves external allow
+  out_rel_ext=$(jq -nc --arg ws "$main_repo" --arg cwd "$other_repo" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "src/Bad.ts", Content: "export const bad = eval(\"1\");"}}}' \
+    | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_rel_ext" ".decision" "allow" "Relative edit in unrelated external repo via cwd must preserve external allow"
+}
+
+test_session_start_swarm_protocol_branch_guard_and_detached_head() {
+  [ -x "$SESSION_START" ] || { echo "session-start.sh missing or not executable: $SESSION_START" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
+
+  local repo
+  repo=$(make_temp_repo)
+
+  # 1. Unborn main -> Swarm Worker Mode present, no [BRANCH GUARD], no [DETACHED HEAD]
+  local msg_unborn
+  msg_unborn=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' | "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$msg_unborn" "Swarm Worker Mode" "SessionStart must inject Swarm Worker Mode protocol"
+  assert_not_contains "$msg_unborn" "[BRANCH GUARD]" "Unborn main must not emit [BRANCH GUARD]"
+  assert_not_contains "$msg_unborn" "[DETACHED HEAD]" "Unborn main must not emit [DETACHED HEAD]"
+
+  # 2. Committed main -> [BRANCH GUARD] present, no [DETACHED HEAD]
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  local msg_main
+  msg_main=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' | "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$msg_main" "Swarm Worker Mode"
+  assert_contains "$msg_main" "[BRANCH GUARD]" "Committed main must emit [BRANCH GUARD]"
+  assert_not_contains "$msg_main" "[DETACHED HEAD]"
+
+  # 3. Detached HEAD -> [DETACHED HEAD] present, no [BRANCH GUARD]
+  git -C "$repo" checkout --detach --quiet
+  local msg_detached
+  msg_detached=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' | "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$msg_detached" "Swarm Worker Mode"
+  assert_contains "$msg_detached" "[DETACHED HEAD]" "Detached HEAD must emit [DETACHED HEAD]"
+  assert_not_contains "$msg_detached" "[BRANCH GUARD]"
+
+  # 4. Feature branch -> neither [BRANCH GUARD] nor [DETACHED HEAD]
+  git -C "$repo" checkout -b "feat/swarm-session" --quiet
+  local msg_feat
+  msg_feat=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' | "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$msg_feat" "Swarm Worker Mode"
+  assert_not_contains "$msg_feat" "[BRANCH GUARD]" "Feature branch must not emit [BRANCH GUARD]"
+  assert_not_contains "$msg_feat" "[DETACHED HEAD]" "Feature branch must not emit [DETACHED HEAD]"
+}
+
 run_tests

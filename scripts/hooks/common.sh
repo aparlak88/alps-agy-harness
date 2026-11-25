@@ -369,8 +369,14 @@ harness_validate_walkthrough() {
   WT_TEXT="$wt_text" DIFF_FILES_RAW="$diff_files_raw" python3 -B "$(harness_core_python)" validate-walkthrough
 }
 
+# Return 0 when normalized model name indicates a low-effort tier variant.
+_harness_is_low_model_variant() {
+  local norm="${1:-}"
+  [[ "$norm" == *-low ]] || [[ "$norm" == *"(low)"* ]] || [[ "$norm" == *" low"* ]]
+}
+
 # Classify a parent session modelName (slug or display label) into a canonical routing family:
-#   unset | orchestrator | carbon | argon_low | argon | hydrogen | claude | flash | custom
+#   unset | orchestrator | carbon | neon | argon_low | argon | hydrogen | claude | flash | custom
 harness_classify_parent_model() {
   local raw="${1:-}"
   case "$raw" in
@@ -391,8 +397,15 @@ harness_classify_parent_model() {
     *carbon*)
       printf 'carbon\n'
       ;;
+    *neon*)
+      if _harness_is_low_model_variant "$norm"; then
+        printf 'argon_low\n'
+      else
+        printf 'neon\n'
+      fi
+      ;;
     *argon*)
-      if [[ "$norm" == *-low ]] || [[ "$norm" == *"(low)"* ]] || [[ "$norm" == *" low"* ]]; then
+      if _harness_is_low_model_variant "$norm"; then
         printf 'argon_low\n'
       else
         printf 'argon\n'
@@ -406,6 +419,13 @@ harness_classify_parent_model() {
       ;;
     *flash*|*gpt-oss*)
       printf 'flash\n'
+      ;;
+    *gemini-4*|*"gemini 4"*)
+      if _harness_is_low_model_variant "$norm"; then
+        printf 'argon_low\n'
+      else
+        printf 'argon\n'
+      fi
       ;;
     *)
       printf 'custom\n'
@@ -451,7 +471,7 @@ harness_resolve_subagent_model() {
         orchestrator|hydrogen|argon_low)
           printf 'inherit\n'
           ;;
-        carbon|argon|claude)
+        carbon|neon|argon|claude|custom)
           printf 'pro\n'
           ;;
         *)
@@ -464,7 +484,7 @@ harness_resolve_subagent_model() {
         orchestrator|argon|claude|custom)
           printf 'inherit\n'
           ;;
-        carbon)
+        carbon|neon)
           if [ "$caller_model" = "inherit" ]; then
             printf 'inherit\n'
           else
@@ -485,7 +505,7 @@ harness_resolve_subagent_model() {
       ;;
     critical_architecture_or_audit)
       case "$family" in
-        orchestrator|carbon|argon|claude|custom)
+        orchestrator|carbon|neon|argon|claude|custom)
           printf 'inherit\n'
           ;;
         *)

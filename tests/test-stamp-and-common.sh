@@ -706,4 +706,89 @@ test_detached_head_linked_worktree_stable_slug_across_commits() {
   assert_json_field "$state_dir_before/context7-verified.json" '.packages["zod"].version' "3.24.0" "context7-verified.json must remain valid after commit"
 }
 
+test_neon_gemini4_and_custom_model_classification_parity() {
+  [ -x "$COMMON_SH" ] || { echo "common.sh missing or not executable" >&2; return 1; }
+  [ -x "$STAMP_GATE" ] || { echo "stamp-gate.sh missing or not executable" >&2; return 1; }
+  # shellcheck source=/dev/null
+  source "$COMMON_SH"
+
+  local repo
+  repo=$(make_temp_repo)
+
+  # 1. Bash vs Python classify_parent_model parity across new Gemini 4 families and existing ones
+  local py_cls='import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.classify_parent_model(sys.argv[2]))'
+  local model expected sh_cls py_cls_out
+  local cases=(
+    "gemini-4-neon-high|neon"
+    "Gemini 4 Neon (Medium)|neon"
+    "gemini-4-neon-low|argon_low"
+    "Gemini 4 Neon (Low)|argon_low"
+    "gemini-4-neon low|argon_low"
+    "Orchestrator (Neon)|orchestrator"
+    "gemini-4-pro|argon"
+    "Gemini 4 Ultra (High)|argon"
+    "gemini-4-pro-low|argon_low"
+    "Gemini 4 (Low)|argon_low"
+    "gemini-4-flash|flash"
+    "gemini-4-flash-low|flash"
+    "enterprise-tuned-v1|custom"
+    "|unset"
+  )
+  local pair
+  for pair in "${cases[@]}"; do
+    model="${pair%%|*}"
+    expected="${pair##*|}"
+    sh_cls=$(harness_classify_parent_model "$model")
+    py_cls_out=$(python3 -B -c "$py_cls" "$REPO_ROOT/scripts/lib" "$model")
+    assert_eq "$expected" "$sh_cls" "common.sh classify('$model')"
+    assert_eq "$expected" "$py_cls_out" "harness_core.py classify('$model')"
+  done
+
+  # 2. Bash vs Python resolve_subagent_model parity across all tiers, caller_model, and floor_upgraded
+  local py_res='import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.resolve_subagent_model(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "true"))'
+  local tier caller floor sh_res py_res_out
+  local m_list=("gemini-4-neon-high" "gemini-4-neon-low" "gemini-4-pro" "gemini-4-flash" "enterprise-tuned-v1" "")
+  local t_list=("trivial_lookup" "bounded_execution" "multi_module_integration" "critical_architecture_or_audit")
+  for model in "${m_list[@]}"; do
+    for tier in "${t_list[@]}"; do
+      for caller in "" "inherit"; do
+        for floor in "false" "true"; do
+          sh_res=$(harness_resolve_subagent_model "$model" "$tier" "$caller" "$floor")
+          py_res_out=$(python3 -B -c "$py_res" "$REPO_ROOT/scripts/lib" "$model" "$tier" "$caller" "$floor")
+          assert_eq "$py_res_out" "$sh_res" "Parity failed for model='$model' tier='$tier' caller='$caller' floor='$floor'"
+        done
+      done
+    done
+  done
+
+  # 3. Specific routing contracts via stamp-gate.sh select-model
+  local sel_neon_bounded sel_neon_multi_def sel_neon_multi_inh sel_neon_crit sel_custom_bounded sel_unset_bounded sel_flash_bounded sel_g4_pro_bounded
+  sel_neon_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-neon-high" --workspace "$repo")
+  assert_json_field "$sel_neon_bounded" ".parentFamily" "neon"
+  assert_json_field "$sel_neon_bounded" ".model" "pro" "neon bounded_execution -> pro"
+
+  sel_neon_multi_def=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-4-neon-high" --workspace "$repo")
+  assert_json_field "$sel_neon_multi_def" ".model" "pro" "neon multi_module default -> pro"
+
+  sel_neon_multi_inh=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-4-neon-high" --caller-model "inherit" --workspace "$repo")
+  assert_json_field "$sel_neon_multi_inh" ".model" "inherit" "neon multi_module with caller inherit -> inherit"
+
+  sel_neon_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "gemini-4-neon-high" --workspace "$repo")
+  assert_json_field "$sel_neon_crit" ".model" "inherit" "neon critical_architecture_or_audit -> inherit"
+
+  sel_custom_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "enterprise-tuned-v1" --workspace "$repo")
+  assert_json_field "$sel_custom_bounded" ".parentFamily" "custom"
+  assert_json_field "$sel_custom_bounded" ".model" "pro" "custom bounded_execution -> pro"
+
+  sel_unset_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "" --workspace "$repo")
+  assert_json_field "$sel_unset_bounded" ".model" "flash" "unset bounded_execution remains flash"
+
+  sel_flash_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-flash" --workspace "$repo")
+  assert_json_field "$sel_flash_bounded" ".model" "flash" "flash bounded_execution remains flash"
+
+  sel_g4_pro_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-pro" --workspace "$repo")
+  assert_json_field "$sel_g4_pro_bounded" ".parentFamily" "argon"
+  assert_json_field "$sel_g4_pro_bounded" ".model" "pro" "unmatched gemini-4-pro classifies as argon and routes bounded_execution -> pro"
+}
+
 run_tests "$@"

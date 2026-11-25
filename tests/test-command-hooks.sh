@@ -1035,4 +1035,131 @@ test_detached_linked_worktree_context7_survives_commit() {
   assert_json_field "$out_unstamped" ".decision" "deny" "Unstamped package must still be denied after commit"
 }
 
+test_hook_input_cwd_resolves_sibling_worktree_without_cd() {
+  [ -x "$PRE_COMMAND_GUARD" ] || { echo "pre-command-guard.sh missing or not executable: $PRE_COMMAND_GUARD" >&2; return 1; }
+  [ -x "$POST_COMMAND_HOOKS" ] || { echo "post-command-hooks.sh missing or not executable: $POST_COMMAND_HOOKS" >&2; return 1; }
+  [ -x "$STAMP_GATE" ] || { echo "stamp-gate.sh missing or not executable: $STAMP_GATE" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
+
+  local main_repo wt_parent wt_feat wt_detached
+  main_repo=$(make_temp_repo)
+  cat << 'EOF' > "$main_repo/README.md"
+# Repo
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Repo | Kod deposu |
+EOF
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+  git -C "$main_repo" remote add origin "https://github.com/example/swarm-cwd.git"
+
+  wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/harness-wt-cwd-cmd.XXXXXX")
+  echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"
+  wt_feat="$wt_parent/worker-feat"
+  wt_detached="$wt_parent/worker-detached"
+  git -C "$main_repo" worktree add "$wt_feat" -b "feat/cwd-worker" --quiet
+  git -C "$main_repo" worktree add --detach "$wt_detached" --quiet
+
+  # 1. git push without cd when HOOK_INPUT.cwd is wt_feat -> allow (while cwd=main_repo denies)
+  local out_push_wt out_push_main out_push_explicit_c out_push_bad_cwd
+  out_push_wt=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "git push"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_push_wt" ".decision" "allow" "git push with HOOK_INPUT.cwd in sibling worktree must allow"
+
+  out_push_main=$(jq -nc --arg ws "$main_repo" --arg cwd "$main_repo" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "git push"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_push_main" ".decision" "deny" "git push with HOOK_INPUT.cwd in main_repo must deny"
+
+  out_push_explicit_c=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" --arg cmd "git -C \"$main_repo\" push" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_push_explicit_c" ".decision" "deny" "Explicit git -C main_repo must override HOOK_INPUT.cwd"
+
+  out_push_bad_cwd=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_parent/does-not-exist" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "git push"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_push_bad_cwd" ".decision" "deny" "Invalid HOOK_INPUT.cwd must fall back safely to workspace"
+
+  # 2. npm install without cd resolves context7 state in HOOK_INPUT.cwd worktree (including detached-wt-*)
+  local out_npm_deny out_npm_allow out_npm_main out_det_deny out_det_allow
+  out_npm_deny=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "npm install zod@^3.24.0"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_npm_deny" ".decision" "deny" "Unstamped npm install in cwd sibling worktree must deny"
+
+  "$STAMP_GATE" context7 --workspace "$wt_feat" --package "zod" --version "3.24.0" --source "locked"
+  out_npm_allow=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "npm install zod@^3.24.0"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_npm_allow" ".decision" "allow" "Stamped npm install in cwd sibling worktree must allow without cd"
+
+  out_npm_main=$(jq -nc --arg ws "$main_repo" --arg cwd "$main_repo" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "npm install zod@^3.24.0"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_npm_main" ".decision" "deny" "main_repo remains unstamped when HOOK_INPUT.cwd is main_repo"
+
+  out_det_deny=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_detached" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "npm install zod@^3.24.0"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_det_deny" ".decision" "deny" "Detached sibling worktree via cwd must deny before stamp"
+  "$STAMP_GATE" context7 --workspace "$wt_detached" --package "zod" --version "3.24.0" --source "locked"
+  out_det_allow=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_detached" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "npm install zod@^3.24.0"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_det_allow" ".decision" "allow" "Detached sibling worktree via cwd must allow after stamp"
+
+  # 3. gh pr create without cd resolves wt_feat PR checks + post-command writes pr-audit-pending.json into wt_feat
+  mkdir -p "$wt_feat/src" "$wt_feat/docs/walkthroughs"
+  echo "export const c = 1;" > "$wt_feat/src/Feature.ts"
+  cat << 'EOF' > "$wt_feat/docs/walkthroughs/2026-11-26-cwd.md"
+# Pull Request Mühendislik Rehberi: CWD Testi
+
+```mermaid
+flowchart LR
+  Cwd["HOOK_INPUT.cwd"] --> Feature["src/Feature.ts"]
+```
+
+```mermaid
+sequenceDiagram
+  Hook->>Worker: resolve cwd
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/Feature.ts` — [ÜRETİLDİ] (`Domain`)
+- **Ne Değişti / Ne Üretildi?:** `HOOK_INPUT.cwd` testi için `Feature.ts` modülü ve `c` sabiti oluşturuldu.
+- **Neden Değişti / Neden Üretildi?:** Kardeş worktree içinde `cd` olmadan `gh pr create` kapısını doğrulamak için üretildi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| HOOK_INPUT.cwd | Kanca çalışma dizini alanı |
+EOF
+  git -C "$wt_feat" add src/Feature.ts docs/walkthroughs/2026-11-26-cwd.md
+  git -C "$wt_feat" commit -m "feat: add feature and walkthrough" --quiet
+  "$STAMP_GATE" canon --workspace "$wt_feat" --verdict PASS --allow-file "src/Feature.ts"
+  "$STAMP_GATE" security --workspace "$wt_feat" --verdict PASS --critical 0 --important 0
+
+  local out_pr_wt out_post_pr pending_wt
+  out_pr_wt=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_wt" ".decision" "allow" "gh pr create with HOOK_INPUT.cwd in wt_feat must allow without cd"
+
+  out_post_pr=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, conversationId: "conv-cwd", toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}, toolOutput: {output: "https://github.com/example/swarm-cwd/pull/7"}}' \
+    | "$POST_COMMAND_HOOKS")
+  assert_eq "{}" "$out_post_pr" "post-command-hooks.sh must output {}"
+  pending_wt="$wt_feat/.harness/state/feat-cwd-worker/pr-audit-pending.json"
+  [ -f "$pending_wt" ] || { echo "Expected pr-audit-pending.json in $pending_wt" >&2; return 1; }
+  [ ! -f "$main_repo/.harness/state/main/pr-audit-pending.json" ] || { echo "main_repo must not receive wt_feat pr-audit-pending.json" >&2; return 1; }
+  assert_json_field "$pending_wt" ".conversationId" "conv-cwd"
+}
+
 run_tests
