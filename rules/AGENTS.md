@@ -34,13 +34,13 @@ Wraps `superpowers` workflows with `hooks.json` gates, `jev` calibration, Clean 
 - **Scope Lock:** Declare Plan file budget, abstraction rationale, and `Out-of-Scope` (`jev_ask`). Edit only `allowedFiles`; log out-of-scope ideas as 1-line notes in `docs/parking-lot.md` (cleaned via `entropy-sweep`).
 
 ## 7. Hybrid `jev` & Gemini 4 Parent-Aware Subagent Routing
-- **Runtime Tiers:** `invoke_subagent` uses `inherit | flash_lite | flash | pro` (`pro` = Argon, `flash` = 3.8 Flash, `inherit` = parent's Carbon/Argon/Hydrogen/`Orchestrator`/Claude). `pre-subagent-guard.sh` reads `HOOK_INPUT.modelName`: Carbon/`Orchestrator`/Argon(Med,High)/Claude audits keep `inherit`; Hydrogen/Argon-Low/Flash escalate via `pro`.
+- **Runtime Tiers:** `invoke_subagent` uses `inherit | flash_lite | flash | pro` (`pro` = Argon, `flash` = 3.8 Flash, `inherit` = parent's Carbon/Neon/Argon/Hydrogen/`Orchestrator`/Claude/custom). `pre-subagent-guard.sh` reads `HOOK_INPUT.modelName`: Carbon/Neon/`Orchestrator`/Argon(Med,High)/Claude/custom audits keep `inherit`; Hydrogen/Argon-Low/Flash escalate via `pro`.
 - **Fixed:** `security-reviewer` -> `inherit`|`pro` (`MAX`); `pr-auditor` -> `inherit`|`pro` (`HIGH`/`XHIGH`/`MAX`); `browser` -> `flash` default; `image-generator` -> pass-through.
 - **Dynamic (`self`, `research`, `canon-auditor`, custom):** Classify via `jev_classify`/`jev_score` (`>= 0.75`) and register `./scripts/stamp-gate.sh dispatch --role "<Role>" --type "<TypeName>" --tier "<tier>" [--effort LOW|MEDIUM|HIGH|XHIGH|MAX]`:
   - `trivial_lookup` -> `flash_lite` (`LOW`)
-  - `bounded_execution` -> `inherit` (`Orchestrator`/Hydrogen/Argon-Low), `pro` (Carbon/Argon-Med,High/Claude), else `flash` (`MEDIUM`/`XHIGH`)
-  - `multi_module_integration` -> `inherit` (`Orchestrator`/Argon-Med,High/Claude) or `pro` (`inherit` on Carbon) (`HIGH`; `canon-auditor` floor)
-  - `critical_architecture_or_audit` -> `inherit` (Carbon/`Orchestrator`/Argon-Med,High/Claude) else `pro` (`MAX`)
+  - `bounded_execution` -> `inherit` (`Orchestrator`/Hydrogen/Argon-Low), `pro` (Carbon/Neon/Argon-Med,High/Claude/custom), else `flash` (Flash/`unset`) (`MEDIUM`/`XHIGH`)
+  - `multi_module_integration` -> `inherit` (`Orchestrator`/Argon-Med,High/Claude/custom) or `pro` (`inherit` on Carbon/Neon if `Model: "inherit"`; else `pro`) (`HIGH`; `canon-auditor` floor)
+  - `critical_architecture_or_audit` -> `inherit` (Carbon/Neon/`Orchestrator`/Argon-Med,High/Claude/custom) else `pro` (`MAX`)
 
 ## 8. Context Window Shield (`run-quiet.sh` & `mobile-logs.sh`)
 - Wrap noisy build/test/lint commands in `./scripts/run-quiet.sh <label> -- <cmd...>` (1-line summary; full log in `.harness/logs/last.log`).

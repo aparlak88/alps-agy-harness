@@ -2563,7 +2563,7 @@ def _build_subagent_overwrite(model: str, effort: str, orig_prompt: str) -> dict
 
 
 def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate ``invoke_subagent`` PreToolUse guard with atomic locking and worktree discovery."""
+    """Evaluate ``invoke_subagent`` and ``swarm`` PreToolUse guards with atomic locking and worktree discovery."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
     if not isinstance(hook_input, dict):

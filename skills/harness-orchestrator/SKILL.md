@@ -54,7 +54,7 @@ Kodlama aşamasına geçmeden önce `main` dalında doğrudan kod yazımı `pre-
 
 ## 4. Hibrit `jev` ve Gemini 4 / `Orchestrator` Duyarlı Alt Ajan Yönlendirme
 
-Antigravity'nin `invoke_subagent` aracı yalnızca `inherit | flash_lite | flash | pro` katmanlarını kabul eder (`pro` = **Gemini 4 Argon**, `flash` = **Gemini 3.8 Flash**, `inherit` = ana oturumun aktif **Carbon / Argon / Hydrogen / `Orchestrator` / Claude** modeli).
+Antigravity'nin `invoke_subagent` aracı yalnızca `inherit | flash_lite | flash | pro` katmanlarını kabul eder (`pro` = **Gemini 4 Argon**, `flash` = **Gemini 3.8 Flash**, `inherit` = ana oturumun aktif **Carbon / Neon / Argon / Hydrogen / `Orchestrator` / Claude / custom** modeli; diğer `Gemini 4` adları varsayılan olarak `Argon` / `Argon-Low` sınıfına eşlenir).
 
 Her dinamik `invoke_subagent` çağrısından önce, işin karmaşıklığına göre `stamp-gate.sh dispatch` çalıştırarak yönlendirme kararını kaydedin:
 
@@ -68,9 +68,9 @@ Her dinamik `invoke_subagent` çağrısından önce, işin karmaşıklığına g
 
 Ana Oturum (`HOOK_INPUT.modelName`) Duyarlı Katman Eşlemesi:
 - **`trivial_lookup` (`LOW`):** Tüm ana oturumlarda `flash_lite`.
-- **`bounded_execution` (`MEDIUM` / `XHIGH`):** `Orchestrator`, **Gemini 4 Hydrogen** ve `Argon (Low)` oturumlarında `inherit` (kodlayıcılar eski 3.8 Flash'a düşmez); **Gemini 4 Carbon**, `Argon (Med/High)` ve Claude oturumlarında `pro` (**Gemini 4 Argon**); `3.8 Flash` oturumlarında `flash`.
-- **`multi_module_integration` (`HIGH`, `canon-auditor` tabanı):** `Orchestrator`, `Argon (Med/High)` ve Claude oturumlarında `inherit`; `Carbon` oturumunda varsayılan `pro` (**Argon**; açık `Model: "inherit"` verilirse Carbon korunur); `Hydrogen`, `Argon (Low)` ve `3.8 Flash` oturumlarında `pro` (**Argon**'a yükseltilir).
-- **`critical_architecture_or_audit` (`MAX`, `security-reviewer` ve `pr-auditor`):** `Carbon`, `Orchestrator`, `Argon (Med/High)` ve Claude oturumlarında `inherit` (üst seviye model asla Argon Medium'a düşürülmez); `Hydrogen`, `Argon (Low)` ve `3.8 Flash` oturumlarında `pro` (**Argon**'a yükseltilir).
+- **`bounded_execution` (`MEDIUM` / `XHIGH`):** `Orchestrator`, **Gemini 4 Hydrogen** ve `Argon (Low)` (veya `Neon Low`) oturumlarında `inherit` (kodlayıcılar eski 3.8 Flash'a düşmez); **Gemini 4 Carbon**, **Neon**, `Argon (Med/High)`, genel `Gemini 4`, Claude ve `custom` oturumlarında `pro` (**Gemini 4 Argon**); `3.8 Flash` ve `unset` oturumlarında `flash`.
+- **`multi_module_integration` (`HIGH`, `canon-auditor` tabanı):** `Orchestrator`, `Argon (Med/High)`, genel `Gemini 4`, Claude ve `custom` oturumlarında `inherit`; `Carbon` ve `Neon` oturumlarında varsayılan `pro` (**Argon**; açık `Model: "inherit"` verilirse Carbon/Neon korunur); `Hydrogen`, `Argon (Low)` ve `3.8 Flash` oturumlarında `pro` (**Argon**'a yükseltilir).
+- **`critical_architecture_or_audit` (`MAX`, `security-reviewer` ve `pr-auditor`):** `Carbon`, `Neon`, `Orchestrator`, `Argon (Med/High)`, genel `Gemini 4`, Claude ve `custom` oturumlarında `inherit` (üst seviye model asla Argon Medium'a düşürülmez); `Hydrogen`, `Argon (Low)` ve `3.8 Flash` oturumlarında `pro` (**Argon**'a yükseltilir).
 
 `pre-subagent-guard.sh` hook'u canlı `HOOK_INPUT.modelName` alanını ve dispatch kaydını okur, kaydı tek seferlik tüketir (`consumed: true`) ve Antigravity'nin yerel `overwrite` yeteneğiyle alt ajanın modelini ve `[EFFORT_PROFILE: ...]` başlığını fiziksel olarak kilitler.
 
