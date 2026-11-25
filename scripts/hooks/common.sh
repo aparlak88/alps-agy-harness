@@ -186,24 +186,63 @@ harness_branch_name() {
   fi
 }
 
-# Return filesystem-safe branch slug (<branch-with-hyphens> or detached-<7-char-sha>).
+# Convert a branch or worktree name into the canonical filesystem-safe slug.
+_harness_slugify() {
+  local raw="${1:-}"
+  local slug
+  slug="$(printf '%s' "$raw" | LC_ALL=C sed -E 's/[^A-Za-z0-9]+/-/g; s/^-+//; s/-+$//')"
+  if [ -z "$slug" ]; then
+    slug="default"
+  fi
+  printf '%s\n' "$slug"
+}
+
+# Return filesystem-safe branch slug (<branch-with-hyphens>, detached-wt-<name>, or detached-<7-char-sha>).
 harness_branch_slug() {
   local workspace="${1:-${WORKSPACE_ROOT:-$PWD}}"
   local branch=""
   if branch="$(git -C "$workspace" symbolic-ref --quiet --short HEAD 2>/dev/null)" && [ -n "$branch" ]; then
-    local slug
-    slug="$(printf '%s' "$branch" | LC_ALL=C sed -E 's/[^A-Za-z0-9]+/-/g; s/^-+//; s/-+$//')"
-    if [ -z "$slug" ]; then
-      slug="default"
+    _harness_slugify "$branch"
+    return 0
+  fi
+
+  local git_dirs="" raw_gd="" raw_cd=""
+  if git_dirs="$(git -C "$workspace" rev-parse --git-dir --git-common-dir 2>/dev/null)" && [ -n "$git_dirs" ]; then
+    {
+      IFS= read -r raw_gd || true
+      IFS= read -r raw_cd || true
+    } <<EOF
+$git_dirs
+EOF
+    if [ -n "$raw_gd" ] && [ -n "$raw_cd" ]; then
+      local gd_abs cd_abs real_gd="" real_cd=""
+      case "$raw_gd" in
+        /*) gd_abs="$raw_gd" ;;
+        *) gd_abs="$workspace/$raw_gd" ;;
+      esac
+      case "$raw_cd" in
+        /*) cd_abs="$raw_cd" ;;
+        *) cd_abs="$workspace/$raw_cd" ;;
+      esac
+      real_gd="$(unset CDPATH && cd -- "$gd_abs" 2>/dev/null && pwd -P || true)"
+      real_cd="$(unset CDPATH && cd -- "$cd_abs" 2>/dev/null && pwd -P || true)"
+      if [ -n "$real_gd" ] && [ -n "$real_cd" ] && [ "$real_gd" != "$real_cd" ]; then
+        local wt_parent wt_name
+        wt_parent="$(basename "$(dirname "$real_gd")")"
+        wt_name="$(basename "$real_gd")"
+        if [ "$wt_parent" = "worktrees" ] && [ -n "$wt_name" ]; then
+          printf 'detached-wt-%s\n' "$(_harness_slugify "$wt_name")"
+          return 0
+        fi
+      fi
     fi
-    printf '%s\n' "$slug"
+  fi
+
+  local short_sha=""
+  if short_sha="$(git -C "$workspace" rev-parse --short=7 HEAD 2>/dev/null)" && [ -n "$short_sha" ]; then
+    printf 'detached-%s\n' "$short_sha"
   else
-    local short_sha=""
-    if short_sha="$(git -C "$workspace" rev-parse --short=7 HEAD 2>/dev/null)" && [ -n "$short_sha" ]; then
-      printf 'detached-%s\n' "$short_sha"
-    else
-      printf 'detached-unknown\n'
-    fi
+    printf 'detached-unknown\n'
   fi
 }
 

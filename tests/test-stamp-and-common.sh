@@ -630,4 +630,80 @@ assert int(lines[1]) == len(payload), (lines[1], len(payload))
 PY
 }
 
+test_detached_head_linked_worktree_stable_slug_across_commits() {
+  [ -x "$COMMON_SH" ] || { echo "common.sh missing or not executable" >&2; return 1; }
+  [ -x "$STAMP_GATE" ] || { echo "stamp-gate.sh missing or not executable" >&2; return 1; }
+  # shellcheck source=/dev/null
+  source "$COMMON_SH"
+
+  local py_slug_cmd='import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.get_branch_slug(Path(sys.argv[2])))'
+
+  local repo
+  repo=$(make_temp_repo)
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+
+  # 1. Main repo detached HEAD must preserve detached-<7sha> (including via /tmp symlink)
+  git -C "$repo" checkout --detach --quiet
+  local main_sha main_slug_sh main_slug_py
+  main_sha=$(git -C "$repo" rev-parse --short=7 HEAD)
+  main_slug_sh=$(harness_branch_slug "$repo")
+  main_slug_py=$(python3 -B -c "$py_slug_cmd" "$REPO_ROOT/scripts/lib" "$repo")
+  assert_eq "detached-$main_sha" "$main_slug_sh" "Main repo detached HEAD must stay detached-<7sha> in common.sh"
+  assert_eq "$main_slug_sh" "$main_slug_py" "Main repo detached HEAD parity between common.sh and harness_core.py"
+
+  local sym_root
+  sym_root=$(mktemp -d "/tmp/harness-wt-sym.XXXXXX")
+  echo "$sym_root" >> "$_HARNESS_TEMP_TRACKER"
+  ln -s "$repo" "$sym_root/main-link"
+  assert_eq "detached-$main_sha" "$(harness_branch_slug "$sym_root/main-link")" "Symlinked main repo detached HEAD must not false-match worktree"
+  assert_eq "detached-$main_sha" "$(python3 -B -c "$py_slug_cmd" "$REPO_ROOT/scripts/lib" "$sym_root/main-link")" "Python symlinked main repo detached HEAD must stay detached-<7sha>"
+
+  # 2. Linked detached worktree must produce stable detached-wt-<name> across common.sh and harness_core.py
+  local wt_parent wt_alpha wt_dotted
+  wt_parent=$(mktemp -d "/tmp/harness-wt-detached.XXXXXX")
+  echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"
+  wt_alpha="$wt_parent/worker-alpha"
+  wt_dotted="$wt_parent/worker.v1_2"
+  git -C "$repo" worktree add --detach "$wt_alpha" --quiet
+  git -C "$repo" worktree add --detach "$wt_dotted" --quiet
+
+  assert_eq "HEAD" "$(harness_branch_name "$wt_alpha")" "Detached linked worktree branch name must remain HEAD"
+  local wt_slug_sh wt_slug_py wt_dotted_sh wt_dotted_py
+  wt_slug_sh=$(harness_branch_slug "$wt_alpha")
+  wt_slug_py=$(python3 -B -c "$py_slug_cmd" "$REPO_ROOT/scripts/lib" "$wt_alpha")
+  assert_eq "detached-wt-worker-alpha" "$wt_slug_sh" "Detached linked worktree slug in common.sh"
+  assert_eq "$wt_slug_sh" "$wt_slug_py" "Detached linked worktree slug parity between common.sh and harness_core.py"
+
+  wt_dotted_sh=$(harness_branch_slug "$wt_dotted")
+  wt_dotted_py=$(python3 -B -c "$py_slug_cmd" "$REPO_ROOT/scripts/lib" "$wt_dotted")
+  assert_eq "detached-wt-worker-v1-2" "$wt_dotted_sh" "Punctuated linked worktree name must slugify identically"
+  assert_eq "$wt_dotted_sh" "$wt_dotted_py" "Punctuated linked worktree parity"
+
+  # Symlink + subdirectory invocation inside detached linked worktree
+  mkdir -p "$wt_alpha/src"
+  ln -s "$wt_alpha" "$sym_root/wt-link"
+  assert_eq "detached-wt-worker-alpha" "$(harness_branch_slug "$wt_alpha/src")" "Subdir in detached linked worktree (common.sh)"
+  assert_eq "detached-wt-worker-alpha" "$(python3 -B -c "$py_slug_cmd" "$REPO_ROOT/scripts/lib" "$wt_alpha/src")" "Subdir in detached linked worktree (python)"
+  assert_eq "detached-wt-worker-alpha" "$(harness_branch_slug "$sym_root/wt-link")" "Symlink to detached linked worktree (common.sh)"
+  assert_eq "detached-wt-worker-alpha" "$(python3 -B -c "$py_slug_cmd" "$REPO_ROOT/scripts/lib" "$sym_root/wt-link")" "Symlink to detached linked worktree (python)"
+
+  # 3. Stamp context7, make a new commit in detached worktree, verify slug and state survive
+  "$STAMP_GATE" context7 --workspace "$wt_alpha" --package "zod" --version "3.24.0" --source "locked"
+  local state_dir_before
+  state_dir_before=$(harness_state_dir "$wt_alpha")
+  assert_eq "$wt_alpha/.harness/state/detached-wt-worker-alpha" "$state_dir_before" "State dir must use detached-wt-<name>"
+  [ -f "$state_dir_before/context7-verified.json" ] || { echo "context7-verified.json missing before commit" >&2; return 1; }
+
+  echo "export const x = 1;" > "$wt_alpha/src/index.ts"
+  git -C "$wt_alpha" add src/index.ts
+  git -C "$wt_alpha" commit -m "feat: detached commit" --quiet
+
+  assert_eq "detached-wt-worker-alpha" "$(harness_branch_slug "$wt_alpha")" "Slug must survive new commit in common.sh"
+  assert_eq "detached-wt-worker-alpha" "$(python3 -B -c "$py_slug_cmd" "$REPO_ROOT/scripts/lib" "$wt_alpha")" "Slug must survive new commit in harness_core.py"
+  assert_eq "$state_dir_before" "$(harness_state_dir "$wt_alpha")" "State dir path must stay identical after commit"
+  assert_json_field "$state_dir_before/context7-verified.json" '.packages["zod"].version' "3.24.0" "context7-verified.json must remain valid after commit"
+}
+
 run_tests "$@"

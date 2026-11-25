@@ -984,4 +984,55 @@ EOF
   assert_json_field "$out_merge_ok" ".decision" "allow" "Valid gitignored walkthrough must also allow local git merge"
 }
 
+test_detached_linked_worktree_context7_survives_commit() {
+  [ -x "$PRE_COMMAND_GUARD" ] || { echo "pre-command-guard.sh missing or not executable: $PRE_COMMAND_GUARD" >&2; return 1; }
+  [ -x "$STAMP_GATE" ] || { echo "stamp-gate.sh missing or not executable: $STAMP_GATE" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
+
+  local main_repo wt_parent wt_detached
+  main_repo=$(make_temp_repo)
+  echo "init" > "$main_repo/README.md"
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+
+  wt_parent=$(mktemp -d "/tmp/harness-wt-detached-cmd.XXXXXX")
+  echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"
+  wt_detached="$wt_parent/swarm-detached"
+  git -C "$main_repo" worktree add --detach "$wt_detached" --quiet
+
+  local p_pkg p_pkg_cross p_unstamped
+  p_pkg=$(jq -nc --arg ws "$wt_detached" --arg cmd "npm install zod@^3.24.0" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+  p_pkg_cross=$(jq -nc --arg ws "$main_repo" --arg cmd "cd \"$wt_detached\" && npm install zod@^3.24.0" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+  p_unstamped=$(jq -nc --arg ws "$wt_detached" --arg cmd "npm install express" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}')
+
+  # 1. Before stamp -> deny
+  local out_deny
+  out_deny=$(printf '%s' "$p_pkg" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_deny" ".decision" "deny" "Unverified npm install in detached linked worktree must deny"
+
+  # 2. Stamp context7 -> allow before commit
+  "$STAMP_GATE" context7 --workspace "$wt_detached" --package "zod" --version "3.24.0" --source "greenfield-latest"
+  local out_allow_before
+  out_allow_before=$(printf '%s' "$p_pkg" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_allow_before" ".decision" "allow" "Stamped npm install must allow before commit"
+
+  # 3. Make a commit on detached HEAD in the linked worktree -> context7 stamp must remain active
+  echo "export const worker = true;" > "$wt_detached/worker.ts"
+  git -C "$wt_detached" add worker.ts
+  git -C "$wt_detached" commit -m "feat: worker commit on detached worktree" --quiet
+
+  local out_allow_after out_allow_cross out_unstamped
+  out_allow_after=$(printf '%s' "$p_pkg" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_allow_after" ".decision" "allow" "Stamped npm install in detached linked worktree must stay allowed after commit"
+
+  out_allow_cross=$(printf '%s' "$p_pkg_cross" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_allow_cross" ".decision" "allow" "Cross-worktree cd into detached linked worktree must see preserved context7 stamp after commit"
+
+  out_unstamped=$(printf '%s' "$p_unstamped" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_unstamped" ".decision" "deny" "Unstamped package must still be denied after commit"
+}
+
 run_tests

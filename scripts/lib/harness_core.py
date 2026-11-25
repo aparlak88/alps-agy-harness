@@ -306,11 +306,27 @@ def slugify_branch(branch: str) -> str:
 
 
 def get_branch_slug(workspace: Path) -> str:
-    """Return canonical branch slug or ``detached-<7-char-sha>`` for detached HEAD."""
+    """Return canonical branch slug, ``detached-wt-<name>`` for linked worktrees, or ``detached-<7-char-sha>``."""
     res = _run_git(workspace, ["symbolic-ref", "--quiet", "--short", "HEAD"])
     branch = res.stdout.strip() if res.returncode == 0 else ""
     if branch:
         return slugify_branch(branch)
+
+    gd_res = _run_git(workspace, ["rev-parse", "--git-dir", "--git-common-dir"])
+    if gd_res.returncode == 0:
+        lines = [line.rstrip("\r\n") for line in gd_res.stdout.splitlines() if line.strip()]
+        if len(lines) >= 2:
+            raw_gd, raw_cd = lines[0], lines[1]
+            gd_abs = raw_gd if os.path.isabs(raw_gd) else os.path.join(str(workspace), raw_gd)
+            cd_abs = raw_cd if os.path.isabs(raw_cd) else os.path.join(str(workspace), raw_cd)
+            try:
+                real_gd = Path(os.path.realpath(gd_abs))
+                real_cd = Path(os.path.realpath(cd_abs))
+                if real_gd != real_cd and real_gd.parent.name == "worktrees" and real_gd.name:
+                    return f"detached-wt-{slugify_branch(real_gd.name)}"
+            except OSError:
+                pass
+
     sha_res = _run_git(workspace, ["rev-parse", "--short=7", "HEAD"])
     short_sha = sha_res.stdout.strip() if sha_res.returncode == 0 else ""
     return f"detached-{short_sha}" if short_sha else "detached-unknown"
