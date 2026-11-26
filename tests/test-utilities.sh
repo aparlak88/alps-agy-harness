@@ -601,4 +601,99 @@ EOF
   assert_contains "$msg_bad2" "inheritMcp" "subagent_frontmatter failure must mention inheritMcp"
 }
 
+test_harness_doctor_project_install_emits_swarm_advisory_info() {
+  local tmp_repo
+  tmp_repo="$(make_temp_repo)"
+
+  local mock_config_dir="$tmp_repo/gemini-config"
+  local mock_bin_dir="$tmp_repo/doctor-bin"
+  mkdir -p "$mock_config_dir/plugins/superpowers" "$mock_bin_dir"
+  cat <<'EOF' > "$mock_config_dir/plugins.json"
+{
+  "plugins": [{"name": "superpowers"}, {"name": "firebase"}, {"name": "postman"}, {"name": "chrome-devtools-plugin"}]
+}
+EOF
+  cat <<'EOF' > "$mock_config_dir/mcp_config.json"
+{
+  "mcpServers": {
+    "jev": {}, "context7": {}, "csharp-lsp": {}, "typescript-lsp": {},
+    "playwright": {}, "graphify": {}, "revenuecat": {}, "filesystem": {}
+  }
+}
+EOF
+  cat <<'EOF' > "$mock_bin_dir/gh"
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$mock_bin_dir/gh"
+
+  # 1. Global/standalone workspace without .agents/plugins or .agents/plugins.json must NOT emit swarm_install_advisory
+  local standalone_json
+  standalone_json=$(TYPESAFE_API_KEY="test_key" \
+                    HARNESS_CONFIG_DIR="$mock_config_dir" \
+                    HARNESS_GH_BIN="$mock_bin_dir/gh" \
+                    "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$tmp_repo" --json)
+  assert_json_field "$standalone_json" ".healthy" "true"
+  local advisory_absent
+  advisory_absent=$(printf '%s\n' "$standalone_json" | jq -r '.checks[] | select(.name=="swarm_install_advisory") | .name')
+  assert_eq "" "$advisory_absent" "swarm_install_advisory must not be emitted without project-level plugin install"
+
+  # 2. Workspace with .agents/plugins directory emits INFO swarm_install_advisory while staying healthy=true
+  local proj_ws
+  proj_ws="$(make_temp_repo)"
+  mkdir -p "$proj_ws/.agents/plugins/alps-agy-harness"
+
+  local proj_json rc_proj=0
+  proj_json=$(TYPESAFE_API_KEY="test_key" \
+              HARNESS_CONFIG_DIR="$mock_config_dir" \
+              HARNESS_GH_BIN="$mock_bin_dir/gh" \
+              "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$proj_ws" --json) || rc_proj=$?
+  assert_eq "0" "$rc_proj" "Doctor must exit 0 when swarm_install_advisory INFO is emitted"
+  assert_json_field "$proj_json" ".healthy" "true"
+  assert_json_field "$proj_json" '.checks[] | select(.name=="install_mode") | .status' "OK"
+  assert_json_field "$proj_json" '.checks[] | select(.name=="swarm_install_advisory") | .status' "INFO"
+  local advisory_msg
+  advisory_msg=$(printf '%s\n' "$proj_json" | jq -r '.checks[] | select(.name=="swarm_install_advisory") | "\(.message) \(.fix // "")"')
+  assert_contains "$advisory_msg" "Swarm" "swarm_install_advisory must mention Swarm"
+  assert_contains "$advisory_msg" "--recurse-submodules" "swarm_install_advisory must mention --recurse-submodules"
+  assert_contains "$advisory_msg" "~/.gemini/config/plugins" "swarm_install_advisory must recommend global install path"
+
+  local proj_text
+  proj_text=$(TYPESAFE_API_KEY="test_key" \
+              HARNESS_CONFIG_DIR="$mock_config_dir" \
+              HARNESS_GH_BIN="$mock_bin_dir/gh" \
+              "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$proj_ws")
+  assert_contains "$proj_text" "[INFO] swarm_install_advisory:" "Doctor text output must display [INFO] swarm_install_advisory"
+
+  # 3. Workspace with .agents/plugins.json file also emits INFO swarm_install_advisory
+  local proj_json_ws
+  proj_json_ws="$(make_temp_repo)"
+  mkdir -p "$proj_json_ws/.agents"
+  cat <<'EOF' > "$proj_json_ws/.agents/plugins.json"
+{
+  "plugins": [{"name": "alps-agy-harness", "path": "./.agents/plugins/alps-agy-harness"}]
+}
+EOF
+  local pjson_out
+  pjson_out=$(TYPESAFE_API_KEY="test_key" \
+              HARNESS_CONFIG_DIR="$mock_config_dir" \
+              HARNESS_GH_BIN="$mock_bin_dir/gh" \
+              "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$proj_json_ws" --json)
+  assert_json_field "$pjson_out" ".healthy" "true"
+  assert_json_field "$pjson_out" '.checks[] | select(.name=="swarm_install_advisory") | .status' "INFO"
+
+  # 4. .harness-ignore takes precedence and suppresses swarm_install_advisory
+  touch "$proj_json_ws/.harness-ignore"
+  local ignored_out
+  ignored_out=$(TYPESAFE_API_KEY="test_key" \
+                HARNESS_CONFIG_DIR="$mock_config_dir" \
+                HARNESS_GH_BIN="$mock_bin_dir/gh" \
+                "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$proj_json_ws" --json)
+  assert_json_field "$ignored_out" ".healthy" "true"
+  assert_json_field "$ignored_out" '.checks[] | select(.name=="install_mode") | .status' "INFO"
+  local ignored_advisory
+  ignored_advisory=$(printf '%s\n' "$ignored_out" | jq -r '.checks[] | select(.name=="swarm_install_advisory") | .name')
+  assert_eq "" "$ignored_advisory" ".harness-ignore must suppress swarm_install_advisory"
+}
+
 run_tests "test_"

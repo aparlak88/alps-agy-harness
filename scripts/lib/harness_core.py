@@ -306,11 +306,27 @@ def slugify_branch(branch: str) -> str:
 
 
 def get_branch_slug(workspace: Path) -> str:
-    """Return canonical branch slug or ``detached-<7-char-sha>`` for detached HEAD."""
+    """Return canonical branch slug, ``detached-wt-<name>`` for linked worktrees, or ``detached-<7-char-sha>``."""
     res = _run_git(workspace, ["symbolic-ref", "--quiet", "--short", "HEAD"])
     branch = res.stdout.strip() if res.returncode == 0 else ""
     if branch:
         return slugify_branch(branch)
+
+    gd_res = _run_git(workspace, ["rev-parse", "--git-dir", "--git-common-dir"])
+    if gd_res.returncode == 0:
+        lines = [line.rstrip("\r\n") for line in gd_res.stdout.splitlines() if line.strip()]
+        if len(lines) >= 2:
+            raw_gd, raw_cd = lines[0], lines[1]
+            gd_abs = raw_gd if os.path.isabs(raw_gd) else os.path.join(str(workspace), raw_gd)
+            cd_abs = raw_cd if os.path.isabs(raw_cd) else os.path.join(str(workspace), raw_cd)
+            try:
+                real_gd = Path(os.path.realpath(gd_abs))
+                real_cd = Path(os.path.realpath(cd_abs))
+                if real_gd != real_cd and real_gd.parent.name == "worktrees" and real_gd.name:
+                    return f"detached-wt-{slugify_branch(real_gd.name)}"
+            except OSError:
+                pass
+
     sha_res = _run_git(workspace, ["rev-parse", "--short=7", "HEAD"])
     short_sha = sha_res.stdout.strip() if sha_res.returncode == 0 else ""
     return f"detached-{short_sha}" if short_sha else "detached-unknown"
@@ -1106,6 +1122,11 @@ def verify_pr_stamps(workspace: Path) -> tuple[bool, str]:
     return True, ""
 
 
+def _is_low_model_variant(norm: str) -> bool:
+    """Return True when normalized model name indicates a low-effort tier variant."""
+    return norm.endswith("-low") or "(low)" in norm or " low" in norm
+
+
 def classify_parent_model(raw: str) -> str:
     """Classify parent modelName into canonical routing family."""
     trimmed = re.sub(r"\s+", "", raw or "")
@@ -1116,16 +1137,18 @@ def classify_parent_model(raw: str) -> str:
         return "orchestrator"
     if "carbon" in norm:
         return "carbon"
+    if "neon" in norm:
+        return "argon_low" if _is_low_model_variant(norm) else "neon"
     if "argon" in norm:
-        if norm.endswith("-low") or "(low)" in norm or " low" in norm:
-            return "argon_low"
-        return "argon"
+        return "argon_low" if _is_low_model_variant(norm) else "argon"
     if "hydrogen" in norm:
         return "hydrogen"
     if any(tok in norm for tok in ("claude", "opus", "sonnet")):
         return "claude"
     if "flash" in norm or "gpt-oss" in norm:
         return "flash"
+    if "gemini-4" in norm or "gemini 4" in norm:
+        return "argon_low" if _is_low_model_variant(norm) else "argon"
     return "custom"
 
 
@@ -1175,6 +1198,22 @@ def _resolve_rel_path(workspace: Path, raw_path: str) -> tuple[str, bool]:
     return rel_path, False
 
 
+def _resolve_initial_cwd(workspace: Path, hook_input: dict[str, Any]) -> Path:
+    """Resolve valid existing ``hook_input['cwd']`` realpath, falling back to ``workspace``."""
+    raw_cwd = hook_input.get("cwd") if isinstance(hook_input, dict) else None
+    if isinstance(raw_cwd, str) and raw_cwd.strip():
+        expanded = os.path.expanduser(raw_cwd.strip())
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(str(workspace), expanded)
+        try:
+            cand = Path(os.path.realpath(expanded))
+            if cand.is_dir():
+                return cand
+        except OSError:
+            pass
+    return workspace
+
+
 def evaluate_pre_edit(
     workspace: Path,
     hook_input: dict[str, Any],
@@ -1192,26 +1231,55 @@ def evaluate_pre_edit(
     if tool_name not in ("write_file", "edit_file") or not file_path:
         return {"decision": "allow"}
 
+    initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+    try:
+        real_cwd_str = os.path.realpath(str(initial_cwd))
+    except OSError:
+        real_cwd_str = os.path.normpath(str(initial_cwd))
+
+    expanded = os.path.expanduser(file_path)
+    candidate = expanded if os.path.isabs(expanded) else os.path.join(real_cwd_str, expanded)
+
     effective_ws = workspace
-    rel_path, is_external = _resolve_rel_path(workspace, file_path)
+    rel_path, is_external = _resolve_rel_path(workspace, candidate)
+    linked_wt: Optional[Path] = None
     if is_external:
-        expanded = os.path.expanduser(file_path)
-        try:
-            real_ws_str = os.path.realpath(str(workspace))
-        except OSError:
-            real_ws_str = os.path.normpath(str(workspace))
-        candidate = expanded if os.path.isabs(expanded) else os.path.join(real_ws_str, expanded)
         try:
             real_candidate = Path(os.path.realpath(candidate))
         except OSError:
             return {"decision": "allow"}
 
         linked_wt = resolve_linked_worktree(workspace, real_candidate)
-        if linked_wt is None or is_harness_ignored(linked_wt):
+        if linked_wt is None:
             return {"decision": "allow"}
+    else:
+        try:
+            real_ws = Path(os.path.realpath(str(workspace)))
+        except OSError:
+            real_ws = Path(os.path.normpath(str(workspace)))
+        try:
+            real_candidate = Path(os.path.realpath(candidate))
+        except OSError:
+            real_candidate = Path(os.path.normpath(candidate))
 
-        rel_path, is_external = _resolve_rel_path(linked_wt, str(real_candidate))
-        if is_external or not rel_path:
+        cur = _nearest_existing_dir(real_candidate)
+        while cur is not None and cur != real_ws and cur != cur.parent:
+            try:
+                has_git = (cur / ".git").exists()
+            except OSError:
+                has_git = False
+            if has_git:
+                cand_wt = resolve_linked_worktree(workspace, real_candidate)
+                if cand_wt is not None and cand_wt != real_ws:
+                    linked_wt = cand_wt
+                    break
+            cur = cur.parent
+
+    if linked_wt is not None:
+        if is_harness_ignored(linked_wt):
+            return {"decision": "allow"}
+        rel_path, wt_ext = _resolve_rel_path(linked_wt, str(real_candidate))
+        if wt_ext or not rel_path:
             return {"decision": "allow"}
         effective_ws = linked_wt
         if on_worktree_resolved is not None:
@@ -1513,7 +1581,8 @@ def evaluate_pre_command(
     if not cmd_line:
         return {"decision": "allow"}
 
-    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, workspace)
+    initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
     if not segments_with_cwd:
         return {"decision": "allow"}
 
@@ -1988,7 +2057,8 @@ def evaluate_post_command(
     if not cmd_line:
         return {}
 
-    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, workspace)
+    initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
     if not segments_with_cwd:
         return {}
 
@@ -2057,6 +2127,15 @@ EFFORT_PROFILE_HEADERS = {
     "XHIGH": "[EFFORT_PROFILE: XHIGH — Derin çok adımlı muhakeme uygula; katman sözleşmelerini, tip güvenliğini ve tüm hata/kenar yollarını uçtan uca doğrula.]",
     "MAX": "[EFFORT_PROFILE: MAX — Sıfır varsayım; tüm bağımlılık zincirini, karşı-örnekleri ve güvenlik/kanon değişmezlerini satır satır kanıtla.]",
 }
+SWARM_WORKER_CONTRACT_HEADER = (
+    "[SWARM_WORKER_CONTRACT — Koordinatör brief kapsamına sadık kal; "
+    "yeniden jev_classify, brainstorming, Spec, Walkthrough veya gh pr create çalıştırma; "
+    "docs/parking-lot.md ve docs/canon/* önerilerini panoda @coordinator'a bildir.]"
+)
+SWARM_BRANCH_GUARD_HEADER = (
+    "[SWARM_BRANCH_GUARD — Koda dokunmadan önce kendi özellik dalını aç "
+    "(git checkout -b feat/<konu>-<ad>); detached HEAD veya main üzerinde kalma.]"
+)
 TIER_DEFAULT_EFFORT = {
     "trivial_lookup": "LOW",
     "bounded_execution": "MEDIUM",
@@ -2092,19 +2171,19 @@ def resolve_subagent_model(
     if tier == "bounded_execution":
         if family in ("orchestrator", "hydrogen", "argon_low"):
             return "inherit"
-        if family in ("carbon", "argon", "claude"):
+        if family in ("carbon", "neon", "argon", "claude", "custom"):
             return "pro"
         return "flash"
     if tier == "multi_module_integration":
         if family in ("orchestrator", "argon", "claude", "custom"):
             return "inherit"
-        if family == "carbon":
+        if family in ("carbon", "neon"):
             return "inherit" if caller_model == "inherit" else "pro"
         if family in ("argon_low", "hydrogen", "flash"):
             return "pro"
         return "pro" if floor_upgraded else "inherit"
     if tier == "critical_architecture_or_audit":
-        if family in ("orchestrator", "carbon", "argon", "claude", "custom"):
+        if family in ("orchestrator", "carbon", "neon", "argon", "claude", "custom"):
             return "inherit"
         return "pro"
     raise ValueError(f"Unknown subagent dispatch tier: {tier}")
@@ -2118,17 +2197,23 @@ def dispatch_register(
     model: str,
     effort: str,
     timestamp: Optional[str] = None,
+    conversation_id: str = "",
 ) -> None:
     """Atomically register a subagent dispatch entry in ``subagent-dispatch.json`` under ``flock``."""
     state_dir = get_state_dir(workspace)
     ts = timestamp or utc_now_iso()
+    norm_conv = (conversation_id or "").strip()
     with locked_state_file(state_dir, "subagent-dispatch"):
         dispatch_path = state_dir / "subagent-dispatch.json"
         existing = read_json_file(dispatch_path)
-        if not isinstance(existing, dict) or not isinstance(existing.get("entries"), dict):
-            existing = {"entries": {}}
-        entries = dict(existing["entries"])
-        entries[role] = {
+        if not isinstance(existing, dict):
+            existing = {}
+        raw_entries = existing.get("entries")
+        entries: dict[str, Any] = dict(raw_entries) if isinstance(raw_entries, dict) else {}
+        raw_queues = existing.get("pendingQueues")
+        pending_queues: dict[str, Any] = dict(raw_queues) if isinstance(raw_queues, dict) else {}
+
+        entry: dict[str, Any] = {
             "typeName": type_name,
             "tier": tier,
             "model": model,
@@ -2136,7 +2221,28 @@ def dispatch_register(
             "consumed": False,
             "timestamp": ts,
         }
+        if norm_conv:
+            entry["conversationId"] = norm_conv
+
+        if role not in pending_queues or not isinstance(pending_queues.get(role), list):
+            prev_entry = entries.get(role)
+            if isinstance(prev_entry, dict) and prev_entry.get("consumed") is False:
+                queue: list[dict[str, Any]] = [dict(prev_entry)]
+            else:
+                queue = []
+        else:
+            queue = [dict(item) for item in pending_queues[role] if isinstance(item, dict)]
+
+        queue.append(dict(entry))
+        consumed_indices = [idx for idx, item in enumerate(queue) if item.get("consumed") is True]
+        if len(consumed_indices) > 20:
+            drop_set = set(consumed_indices[:-20])
+            queue = [item for idx, item in enumerate(queue) if idx not in drop_set]
+
+        pending_queues[role] = queue
+        entries[role] = dict(entry)
         existing["entries"] = entries
+        existing["pendingQueues"] = pending_queues
         atomic_write_json(state_dir, "subagent-dispatch.json", existing)
 
 
@@ -2285,31 +2391,168 @@ def mark_pr_audit_dispatched(
                 return
 
 
+def _sync_legacy_dispatch_entry(
+    entries: dict[str, Any],
+    queue: Optional[list[dict[str, Any]]],
+    role: str,
+    consumed_item: dict[str, Any],
+) -> None:
+    """Keep ``entries[role]`` synchronized with remaining unconsumed queue items or consumed state."""
+    if queue is not None:
+        next_unconsumed = next(
+            (item for item in queue if isinstance(item, dict) and item.get("consumed") is False),
+            None,
+        )
+        if next_unconsumed is not None:
+            entries[role] = dict(next_unconsumed)
+            return
+    entries[role] = dict(consumed_item)
+
+
+def _consume_dispatch_entry(
+    candidates: list[Path],
+    role: str,
+    *,
+    expected_type: Optional[str] = None,
+    cur_conv: str = "",
+    require_valid_model_effort: bool = False,
+) -> tuple[Optional[dict[str, Any]], Optional[Path], dict[str, Any]]:
+    """Consume oldest compatible (or conversation-exact) unconsumed dispatch entry via FIFO queue."""
+    diagnostics: dict[str, Any] = {
+        "mismatch_type": "",
+        "invalid_entry": False,
+        "saw_consumed": False,
+    }
+    if not role:
+        return None, None, diagnostics
+
+    norm_conv = cur_conv.strip()
+    passes = (True, False) if norm_conv else (False,)
+    for require_exact in passes:
+        for wt in candidates:
+            state_dir = _existing_state_dir(wt)
+            if state_dir is None:
+                continue
+            dispatch_file = state_dir / "subagent-dispatch.json"
+            if not dispatch_file.is_file():
+                continue
+            with locked_state_file(state_dir, "subagent-dispatch"):
+                data = read_json_file(dispatch_file)
+                if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+                    continue
+                entries = data["entries"]
+                pending_queues = data.get("pendingQueues")
+                queue: Optional[list[dict[str, Any]]] = None
+                if isinstance(pending_queues, dict) and isinstance(pending_queues.get(role), list) and pending_queues[role]:
+                    queue = pending_queues[role]
+                    items = [item for item in queue if isinstance(item, dict)]
+                else:
+                    legacy_entry = entries.get(role)
+                    items = [legacy_entry] if isinstance(legacy_entry, dict) else []
+
+                if not items:
+                    continue
+
+                for entry in items:
+                    matches, exact = _conversation_matches(entry, norm_conv)
+                    if not matches:
+                        continue
+                    if require_exact and not exact:
+                        continue
+                    if entry.get("consumed") is not False:
+                        diagnostics["saw_consumed"] = True
+                        continue
+                    if expected_type is not None:
+                        entry_type = str(entry.get("typeName") or "").strip()
+                        if entry_type and entry_type != expected_type:
+                            if not diagnostics["mismatch_type"]:
+                                diagnostics["mismatch_type"] = entry_type
+                            continue
+                    if require_valid_model_effort:
+                        model = str(entry.get("model") or "")
+                        effort = str(entry.get("effortProfile") or "")
+                        if not model or not is_valid_effort_profile(effort):
+                            diagnostics["invalid_entry"] = True
+                            continue
+                    entry["consumed"] = True
+                    _sync_legacy_dispatch_entry(entries, queue, role, entry)
+                    atomic_write_json(state_dir, "subagent-dispatch.json", data)
+                    return dict(entry), wt, diagnostics
+    return None, None, diagnostics
+
+
 def _try_consume_optional_dispatch(
     candidates: list[Path],
     role: str,
+    expected_type: Optional[str] = None,
+    cur_conv: str = "",
 ) -> tuple[Optional[dict[str, Any]], Optional[Path]]:
     """Consume an unconsumed ``role`` entry across candidate worktrees if present."""
-    if not role:
-        return None, None
-    for wt in candidates:
-        state_dir = _existing_state_dir(wt)
-        if state_dir is None:
-            continue
-        dispatch_file = state_dir / "subagent-dispatch.json"
-        if not dispatch_file.is_file():
-            continue
-        with locked_state_file(state_dir, "subagent-dispatch"):
-            data = read_json_file(dispatch_file)
-            if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
-                continue
-            entry = data["entries"].get(role)
-            if not isinstance(entry, dict) or entry.get("consumed") is not False:
-                continue
-            entry["consumed"] = True
-            atomic_write_json(state_dir, "subagent-dispatch.json", data)
-            return dict(entry), wt
-    return None, None
+    entry, wt, _ = _consume_dispatch_entry(
+        candidates,
+        role,
+        expected_type=expected_type,
+        cur_conv=cur_conv,
+        require_valid_model_effort=False,
+    )
+    return entry, wt
+
+
+def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate ``swarm`` PreToolUse guard with non-blocking brief enrichment."""
+    if is_harness_ignored(workspace):
+        return {"decision": "allow"}
+    if not isinstance(hook_input, dict):
+        return {"decision": "allow"}
+    tool_call = hook_input.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return {"decision": "allow"}
+    tool_name = str(tool_call.get("name") or "")
+    if tool_name and tool_name != "swarm":
+        return {"decision": "allow"}
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        return {"decision": "allow"}
+
+    action = str(args.get("action") or "").strip().lower()
+    if action != "add":
+        return {"decision": "allow"}
+
+    brief = str(args.get("brief") or "")
+    if not brief.strip():
+        return {"decision": "allow"}
+
+    worker_name = str(args.get("name") or "").strip()
+    ws_mode = str(args.get("workspace") or "inherit").strip().lower()
+
+    effort = "MEDIUM"
+    if worker_name:
+        candidates = _ordered_candidate_worktrees(workspace, brief)
+        cur_conv = str(hook_input.get("conversationId") or "").strip()
+        entry, _ = _try_consume_optional_dispatch(
+            candidates,
+            worker_name,
+            expected_type="swarm",
+            cur_conv=cur_conv,
+        )
+        if entry is not None:
+            reg_effort = str(entry.get("effortProfile") or "").strip()
+            if is_valid_effort_profile(reg_effort):
+                effort = reg_effort
+
+    headers: list[str] = []
+    if "[EFFORT_PROFILE:" not in brief:
+        headers.append(EFFORT_PROFILE_HEADERS[effort])
+    if "[SWARM_WORKER_CONTRACT" not in brief:
+        headers.append(SWARM_WORKER_CONTRACT_HEADER)
+    if ws_mode in ("share", "branch") and "[SWARM_BRANCH_GUARD" not in brief:
+        headers.append(SWARM_BRANCH_GUARD_HEADER)
+
+    if not headers:
+        return {"decision": "allow"}
+
+    new_brief = "\n".join(headers) + "\n\n" + brief
+    return {"decision": "allow", "overwrite": {"brief": new_brief}}
 
 
 def _build_subagent_overwrite(model: str, effort: str, orig_prompt: str) -> dict[str, Any]:
@@ -2320,7 +2563,7 @@ def _build_subagent_overwrite(model: str, effort: str, orig_prompt: str) -> dict
 
 
 def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate ``invoke_subagent`` PreToolUse guard with atomic locking and worktree discovery."""
+    """Evaluate ``invoke_subagent`` and ``swarm`` PreToolUse guards with atomic locking and worktree discovery."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
     if not isinstance(hook_input, dict):
@@ -2330,6 +2573,8 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     if not isinstance(tool_call, dict):
         return {"decision": "allow"}
     tool_name = str(tool_call.get("name") or "")
+    if tool_name == "swarm":
+        return evaluate_pre_swarm(workspace, hook_input)
     if tool_name and tool_name != "invoke_subagent":
         return {"decision": "allow"}
     args = tool_call.get("args")
@@ -2341,6 +2586,7 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     role = str(args.get("Role") or "")
     caller_model = str(args.get("Model") or "")
     orig_prompt = str(args.get("Prompt") or "")
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
 
     if type_name == "image-generator":
         return {"decision": "allow"}
@@ -2352,7 +2598,7 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
 
     if type_name == "security-reviewer":
         candidates = _ordered_candidate_worktrees(workspace, orig_prompt) if role else []
-        _try_consume_optional_dispatch(candidates, role)
+        _try_consume_optional_dispatch(candidates, role, cur_conv=cur_conv)
         sec_model = resolve_subagent_model(parent_model, "critical_architecture_or_audit", caller_model, False)
         return _build_subagent_overwrite(sec_model, "MAX", orig_prompt)
 
@@ -2361,7 +2607,7 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
         matched_ws: Optional[Path] = None
         if role:
             candidates = _ordered_candidate_worktrees(workspace, orig_prompt)
-            entry, matched_ws = _try_consume_optional_dispatch(candidates, role)
+            entry, matched_ws = _try_consume_optional_dispatch(candidates, role, cur_conv=cur_conv)
             if entry is not None:
                 reg_effort = str(entry.get("effortProfile") or "")
                 if reg_effort in ("MAX", "XHIGH"):
@@ -2381,44 +2627,16 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
         }
 
     candidates = _ordered_candidate_worktrees(workspace, orig_prompt)
-    matched_entry: Optional[dict[str, Any]] = None
-    matched_ws = None
-    mismatch_type = ""
-    invalid_entry = False
-    saw_consumed = False
-
-    for wt in candidates:
-        state_dir = _existing_state_dir(wt)
-        if state_dir is None:
-            continue
-        dispatch_file = state_dir / "subagent-dispatch.json"
-        if not dispatch_file.is_file():
-            continue
-        with locked_state_file(state_dir, "subagent-dispatch"):
-            data = read_json_file(dispatch_file)
-            if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
-                continue
-            entry = data["entries"].get(role)
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("consumed") is not False:
-                saw_consumed = True
-                continue
-            entry_type = str(entry.get("typeName") or "")
-            if entry_type and entry_type != type_name:
-                if not mismatch_type:
-                    mismatch_type = entry_type
-                continue
-            model = str(entry.get("model") or "")
-            effort = str(entry.get("effortProfile") or "")
-            if not model or not is_valid_effort_profile(effort):
-                invalid_entry = True
-                continue
-            entry["consumed"] = True
-            atomic_write_json(state_dir, "subagent-dispatch.json", data)
-            matched_entry = dict(entry)
-            matched_ws = wt
-            break
+    matched_entry, matched_ws, diagnostics = _consume_dispatch_entry(
+        candidates,
+        role,
+        expected_type=type_name,
+        cur_conv=cur_conv,
+        require_valid_model_effort=True,
+    )
+    mismatch_type = str(diagnostics["mismatch_type"])
+    invalid_entry = bool(diagnostics["invalid_entry"])
+    saw_consumed = bool(diagnostics["saw_consumed"])
 
     if matched_entry is None:
         if mismatch_type:
@@ -3179,6 +3397,13 @@ def run_doctor_checks(
         add_check("install_mode", "workspace", "INFO", ".harness-ignore active (harness disabled for this workspace)")
     elif (workspace / ".agents" / "plugins").is_dir() or (workspace / ".agents" / "plugins.json").is_file():
         add_check("install_mode", "workspace", "OK", "Project-level plugin installed")
+        add_check(
+            "swarm_install_advisory",
+            "workspace",
+            "INFO",
+            "Project-level plugin install detected; Swarm share/branch workspaces need global install (~/.gemini/config/plugins/alps-agy-harness) or submodule init (--recurse-submodules) so worker copies inherit hooks",
+            "Fix: Install alps-agy-harness globally in ~/.gemini/config/plugins/alps-agy-harness or run git submodule update --init --recursive in Swarm share/branch copies",
+        )
     elif (cfg_dir / "plugins" / "alps-agy-harness").is_dir():
         add_check("install_mode", "workspace", "OK", "Global plugin active")
     else:
@@ -3409,7 +3634,20 @@ def build_session_start_payload(
         "  - Parent-aware Gemini 4 / Orchestrator subagent routing is enforced by pre-subagent-guard.sh (never downgrades Carbon/Orchestrator/Argon-High audits; escalates Hydrogen/Flash audits to Argon via pro).",
         "  - Wrap high-output shell commands with scripts/run-quiet.sh.",
         "  - All documentation must conclude with a ## Teknik Terimler Sözlüğü or ## Technical Glossary section.",
+        "  - Swarm Worker Mode: When dispatched as a Swarm worker, stay strictly within your coordinator brief and branch (skip re-running jev_classify, Spec, Walkthrough, or gh pr create; report docs/parking-lot.md or docs/canon/* suggestions to @coordinator).",
     ]
+
+    live_head = get_head_oid(workspace)
+    if branch in ("main", "master") and live_head != "UNBORN":
+        lines.append(
+            f"[BRANCH GUARD] Active branch is '{branch}' (protected). "
+            "Create or switch to a feature branch/worktree (e.g. git checkout -b feat/<topic>) before modifying source files."
+        )
+    elif branch == "HEAD" and live_head != "UNBORN":
+        lines.append(
+            "[DETACHED HEAD] Repository is in detached HEAD state. "
+            "Before editing source files, create or switch to a named feature branch (git checkout -b feat/<topic>)."
+        )
 
     if missing_bins:
         lines.append(
@@ -3437,7 +3675,6 @@ def build_session_start_payload(
                     f"[DAEMON HEALTH WARNING] Cached harness-doctor failures detected ({names}). Run scripts/harness-doctor.sh for exact Fix commands."
                 )
 
-    live_head = get_head_oid(workspace)
     if isinstance(tree_state, dict) and tree_state.get("headOid") == live_head:
         stale_stamps: list[str] = []
         if tree_state.get("canonStampStatus") == "stale":
@@ -3537,6 +3774,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_disp.add_argument("--tier", required=True)
     p_disp.add_argument("--model", required=True)
     p_disp.add_argument("--effort", required=True)
+    p_disp.add_argument("--conversation-id", default="")
 
     p_c7 = sub.add_parser("context7-register")
     p_c7.add_argument("--workspace", default=".")
@@ -3615,6 +3853,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             tier=args.tier,
             model=args.model,
             effort=args.effort,
+            conversation_id=args.conversation_id,
         )
         return 0
 

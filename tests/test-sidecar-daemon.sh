@@ -1085,4 +1085,140 @@ EOF
   assert_json_field "$stop_admin_off" ".decision" "continue" "Matching conversationId must block second time under cold fallback"
 }
 
+test_swarm_cwd_detached_and_parallel_dispatch_daemon_vs_cold_parity() {
+  trap _td_cleanup EXIT INT TERM
+  local PRE_SUBAGENT_GUARD="$REPO_ROOT/scripts/hooks/pre-subagent-guard.sh"
+  local STAMP_GATE="$REPO_ROOT/scripts/stamp-gate.sh"
+  local main_repo wt_parent wt_feat wt_detached sock_dir data_dir sock_path dpid
+  main_repo=$(make_temp_repo)
+  wt_parent=$(mktemp -d "/tmp/hd-wtp16.XXXXXX")
+  sock_dir=$(mktemp -d "/tmp/hd-t16.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d16.XXXXXX")
+  _TD_DIRS+=("$wt_parent" "$sock_dir" "$data_dir")
+  sock_path="$sock_dir/d.sock"
+  wt_feat="$wt_parent/worker-feat"
+  wt_detached="$wt_parent/worker-detached"
+
+  echo "init" > "$main_repo/README.md"
+  git -C "$main_repo" add README.md
+  git -C "$main_repo" commit -m "chore: init" --quiet
+  git -C "$main_repo" remote add origin "https://github.com/example/swarm-parity.git"
+  git -C "$main_repo" worktree add "$wt_feat" -b "feat/parity-cwd" --quiet
+  git -C "$main_repo" worktree add --detach "$wt_detached" --quiet
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
+
+  # 1. swarm add brief enrichment parity (daemon ON vs cold OFF)
+  local p_swarm out_sw_on out_sw_off
+  p_swarm=$(jq -nc --arg ws "$main_repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "swarm", args: {action: "add", name: "parity-worker", workspace: "share", brief: "Implement parity task."}}
+  }')
+  out_sw_on=$(printf '%s' "$p_swarm" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" | jq -c .)
+  out_sw_off=$(printf '%s' "$p_swarm" | HARNESS_DISABLE_DAEMON="1" "$PRE_SUBAGENT_GUARD" | jq -c .)
+  assert_eq "$out_sw_off" "$out_sw_on" "swarm add response must match identically between daemon ON and cold fallback"
+  assert_contains "$(printf '%s' "$out_sw_on" | jq -r '.overwrite.brief')" "[SWARM_WORKER_CONTRACT"
+  assert_contains "$(printf '%s' "$out_sw_on" | jq -r '.overwrite.brief')" "[SWARM_BRANCH_GUARD"
+
+  # 2. HOOK_INPUT.cwd parity for pre-edit, pre-command, and post-command
+  local p_edit_rel p_edit_bad p_push_cwd out_er_on out_er_off out_eb_on out_eb_off out_pc_on out_pc_off
+  p_edit_rel=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "src/Clean.ts", Content: "export const ok = 1;"}}}')
+  p_edit_bad=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "write_file", args: {Path: "src/Bad.ts", Content: "export const x = eval(\"1\");"}}}')
+  p_push_cwd=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "git push"}}}')
+
+  out_er_on=$(printf '%s' "$p_edit_rel" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  out_er_off=$(printf '%s' "$p_edit_rel" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_er_on" ".decision" "allow" "Daemon ON must allow relative write_file in cwd sibling worktree"
+  assert_json_field "$out_er_off" ".decision" "allow" "Cold OFF must allow relative write_file in cwd sibling worktree"
+
+  out_eb_on=$(printf '%s' "$p_edit_bad" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  out_eb_off=$(printf '%s' "$p_edit_bad" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$out_eb_on" ".decision" "deny" "Daemon ON must deny eval() in cwd sibling worktree"
+  assert_json_field "$out_eb_off" ".decision" "deny" "Cold OFF must deny eval() in cwd sibling worktree"
+
+  out_pc_on=$(printf '%s' "$p_push_cwd" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
+  out_pc_off=$(printf '%s' "$p_push_cwd" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pc_on" ".decision" "allow" "Daemon ON must allow git push in cwd sibling worktree"
+  assert_json_field "$out_pc_off" ".decision" "allow" "Cold OFF must allow git push in cwd sibling worktree"
+
+  local p_post_cwd pending_cwd
+  p_post_cwd=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
+    '{workspacePaths: [$ws], cwd: $cwd, conversationId: "conv-parity", toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}, toolOutput: {output: "https://github.com/example/swarm-parity/pull/12"}}')
+  pending_cwd="$wt_feat/.harness/state/feat-parity-cwd/pr-audit-pending.json"
+  printf '%s' "$p_post_cwd" | HARNESS_DAEMON_SOCK="$sock_path" "$POST_COMMAND_HOOKS" >/dev/null
+  [ -f "$pending_cwd" ] || { echo "Daemon ON post-command with cwd must write $pending_cwd" >&2; return 1; }
+  assert_json_field "$pending_cwd" ".conversationId" "conv-parity"
+  rm -f "$pending_cwd"
+  printf '%s' "$p_post_cwd" | HARNESS_DISABLE_DAEMON="1" "$POST_COMMAND_HOOKS" >/dev/null
+  [ -f "$pending_cwd" ] || { echo "Cold OFF post-command with cwd must write $pending_cwd" >&2; return 1; }
+  assert_json_field "$pending_cwd" ".conversationId" "conv-parity"
+  rm -f "$pending_cwd"
+
+  # 3. detached-wt-* parity across commits (daemon ON vs cold OFF)
+  "$STAMP_GATE" context7 --workspace "$wt_detached" --package "zod" --version "3.24.0" --source "locked"
+  echo "export const det = 1;" > "$wt_detached/det.ts"
+  git -C "$wt_detached" add det.ts
+  git -C "$wt_detached" commit -m "feat: detached commit" --quiet
+
+  local p_det_pkg p_det_unstamped out_dp_on out_dp_off out_du_on out_du_off
+  p_det_pkg=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_detached" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "npm install zod"}}}')
+  p_det_unstamped=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_detached" \
+    '{workspacePaths: [$ws], cwd: $cwd, toolCall: {name: "run_command", args: {CommandLine: "npm install express"}}}')
+
+  out_dp_on=$(printf '%s' "$p_det_pkg" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
+  out_dp_off=$(printf '%s' "$p_det_pkg" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_dp_on" ".decision" "allow" "Daemon ON must preserve detached-wt-* context7 stamp across commit"
+  assert_json_field "$out_dp_off" ".decision" "allow" "Cold OFF must preserve detached-wt-* context7 stamp across commit"
+
+  out_du_on=$(printf '%s' "$p_det_unstamped" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
+  out_du_off=$(printf '%s' "$p_det_unstamped" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_du_on" ".decision" "deny" "Daemon ON must deny unstamped pkg in detached-wt-*"
+  assert_json_field "$out_du_off" ".decision" "deny" "Cold OFF must deny unstamped pkg in detached-wt-*"
+
+  # 4. Parallel same-role dispatch parity (1st consumed via daemon ON, 2nd via cold OFF, 3rd denied on both)
+  "$STAMP_GATE" dispatch --role "Daemon Queue Role" --type "self" --tier "bounded_execution" --conversation-id "conv-d1" --workspace "$main_repo"
+  "$STAMP_GATE" dispatch --role "Daemon Queue Role" --type "self" --tier "multi_module_integration" --conversation-id "conv-d2" --workspace "$main_repo"
+
+  local out_dq1 out_dq2 out_dq3_on out_dq3_off
+  out_dq1=$(jq -nc --arg ws "$main_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-d1",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Daemon Queue Role", Prompt: "Q1"}}
+  }' | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_dq1" ".decision" "allow"
+  assert_json_field "$out_dq1" ".overwrite.Model" "flash"
+
+  out_dq2=$(jq -nc --arg ws "$main_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-d2",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Daemon Queue Role", Prompt: "Q2"}}
+  }' | HARNESS_DISABLE_DAEMON="1" "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_dq2" ".decision" "allow"
+  assert_json_field "$out_dq2" ".overwrite.Model" "inherit"
+
+  out_dq3_on=$(jq -nc --arg ws "$main_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-d1",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Daemon Queue Role", Prompt: "Q3"}}
+  }' | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD")
+  out_dq3_off=$(jq -nc --arg ws "$main_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-d1",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Daemon Queue Role", Prompt: "Q3"}}
+  }' | HARNESS_DISABLE_DAEMON="1" "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_dq3_on" ".decision" "deny" "Daemon ON must deny after queue exhausted"
+  assert_json_field "$out_dq3_off" ".decision" "deny" "Cold OFF must deny after queue exhausted"
+}
+
 run_tests "$@"

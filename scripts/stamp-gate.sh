@@ -30,7 +30,7 @@ Usage:
   stamp-gate.sh canon --verdict PASS|FAIL [--plan <path>] [--allow-file <relpath> ...] [--workspace <dir>]
   stamp-gate.sh security --verdict PASS|FAIL --critical <n> --important <n> [--workspace <dir>]
   stamp-gate.sh context7 --package <name> --version <ver> --source locked|greenfield-latest [--workspace <dir>]
-  stamp-gate.sh dispatch --role <role> --type <typeName> --tier <tier> [--parent-model <modelName>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--workspace <dir>]
+  stamp-gate.sh dispatch --role <role> --type <typeName> --tier <tier> [--parent-model <modelName>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--conversation-id <id>] [--workspace <dir>]
   stamp-gate.sh select-model --tier <tier> [--parent-model <modelName>] [--caller-model <tier>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--workspace <dir>]
   stamp-gate.sh verify-pr-stamps [--workspace <dir>]
   stamp-gate.sh clear-pr-audit [--workspace <dir>]
@@ -313,6 +313,7 @@ cmd_dispatch() {
   local tier=""
   local parent_model="${HARNESS_PARENT_MODEL:-}"
   local explicit_effort=""
+  local conversation_id="${HARNESS_CONVERSATION_ID:-}"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -361,6 +362,15 @@ cmd_dispatch() {
         explicit_effort="${1#--effort=}"
         shift
         ;;
+      --conversation-id)
+        [ $# -ge 2 ] || { echo "Error: --conversation-id requires a conversation id" >&2; exit 1; }
+        conversation_id="$2"
+        shift 2
+        ;;
+      --conversation-id=*)
+        conversation_id="${1#--conversation-id=}"
+        shift
+        ;;
       *)
         echo "Error: unknown argument for dispatch: $1" >&2
         exit 1
@@ -396,7 +406,8 @@ cmd_dispatch() {
     --type "$type_name" \
     --tier "$tier" \
     --model "$model" \
-    --effort "$effort"
+    --effort "$effort" \
+    --conversation-id="$conversation_id"
 }
 
 cmd_select_model() {

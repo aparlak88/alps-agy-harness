@@ -93,6 +93,8 @@ test_all_eleven_skills_frontmatter_and_folder_match() {
   assert_contains "$pre_pr_content" "git diff" "pre-pr-readiness must compare docs/parking-lot.md against git diff"
   assert_contains "$pre_pr_content" "codeTreeSha" "pre-pr-readiness must explain docs/parking-lot.md exclusion from codeTreeSha"
   assert_contains "$pre_pr_content" "çözülmüş" "pre-pr-readiness must instruct cleaning resolved parking-lot items"
+  assert_contains "$pre_pr_content" "Swarm Entegrasyon Dalı Kuralı" "pre-pr-readiness must document Swarm integration branch rule"
+  assert_contains "$pre_pr_content" "entegrasyon dalında birleştirilir" "pre-pr-readiness must require merging Swarm worker branches into coordinator integration branch first"
 
   assert_contains "$entropy_content" "docs/parking-lot.md" "entropy-sweep must inspect docs/parking-lot.md"
   assert_contains "$entropy_content" "stale check" "entropy-sweep must perform stale check before jev_score"
@@ -196,6 +198,16 @@ test_templates_and_readme_glossary_and_mermaid_contracts() {
   assert_contains "$readme_content" ".agents/plugins" "README.md must document Project-based installation path"
   assert_contains "$readme_content" "superpowers" "README.md must document superpowers prerequisite"
   assert_contains "$readme_content" "run-jev-mcp.sh" "README.md must document TYPESAFE wrapper script"
+  assert_contains "$readme_content" "Antigravity Swarm ile Kullanım" "README.md must document Antigravity Swarm usage subsection"
+  assert_contains "$readme_content" 'workspace: "share"' "README.md must document Swarm workspace: \"share\" mode"
+  assert_contains "$readme_content" "invoke_subagent|swarm" "README.md must document invoke_subagent|swarm hook matcher"
+  assert_contains "$readme_content" "detached-wt-*" "README.md must document detached-wt-* stable worktree slug"
+  assert_contains "$readme_content" "Swarm (Antigravity Swarm)" "README.md glossary must include Swarm (Antigravity Swarm)"
+
+  local pre_subagent_row
+  pre_subagent_row=$(grep 'pre-subagent-guard.sh' "$readme" || true)
+  assert_contains "$pre_subagent_row" "invoke_subagent" "README.md components table row for pre-subagent-guard.sh must reference invoke_subagent"
+  assert_contains "$pre_subagent_row" "swarm" "README.md components table row for pre-subagent-guard.sh must reference swarm"
 
   # Zero real secret patterns in README.md
   if grep -Eq 'ts_live_[a-zA-Z0-9]{16,}|sk-[a-zA-Z0-9]{16,}|ghp_[a-zA-Z0-9]{20,}|AIza[0-9A-Za-z-_]{35}' "$readme"; then

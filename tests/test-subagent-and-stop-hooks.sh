@@ -15,6 +15,8 @@ EXPECTED_MEDIUM="[EFFORT_PROFILE: MEDIUM — Standart TDD döngüsü uygula; yal
 EXPECTED_HIGH="[EFFORT_PROFILE: HIGH — Katman sınırlarını, LSP tanılamalarını ve kenar durumları çapraz doğrula; her iddiayı dosya/satır kanıtına bağla.]"
 EXPECTED_XHIGH="[EFFORT_PROFILE: XHIGH — Derin çok adımlı muhakeme uygula; katman sözleşmelerini, tip güvenliğini ve tüm hata/kenar yollarını uçtan uca doğrula.]"
 EXPECTED_MAX="[EFFORT_PROFILE: MAX — Sıfır varsayım; tüm bağımlılık zincirini, karşı-örnekleri ve güvenlik/kanon değişmezlerini satır satır kanıtla.]"
+EXPECTED_SWARM_CONTRACT="[SWARM_WORKER_CONTRACT — Koordinatör brief kapsamına sadık kal; yeniden jev_classify, brainstorming, Spec, Walkthrough veya gh pr create çalıştırma; docs/parking-lot.md ve docs/canon/* önerilerini panoda @coordinator'a bildir.]"
+EXPECTED_SWARM_BRANCH_GUARD="[SWARM_BRANCH_GUARD — Koda dokunmadan önce kendi özellik dalını aç (git checkout -b feat/<konu>-<ad>); detached HEAD veya main üzerinde kalma.]"
 EXPECTED_STOP_REASON="PR açıldı; oturumu kapatmadan önce review-pr skill'ini kullanarak pr-auditor değerlendirmesini çalıştır."
 
 test_security_and_pr_auditor_auto_overwrite_to_pro() {
@@ -902,6 +904,7 @@ test_stop_gate_allows_async_wait_when_pr_auditor_dispatched() {
 }
 
 test_parallel_subagent_dispatch_locking_and_sibling_worktree_discovery() {
+  export HARNESS_DISABLE_DAEMON=1
   local main_repo wt_parent wt_backend wt_ios
   main_repo=$(make_temp_repo)
   echo "init" > "$main_repo/README.md"
@@ -1064,6 +1067,527 @@ test_conversation_id_isolated_pr_audit_and_stop_gate() {
   # 5. clear-pr-audit clears dispatched sibling pending file cleanly
   "$STAMP_GATE" clear-pr-audit --workspace "$main_repo"
   [ ! -f "$pending_be" ] || { echo "clear-pr-audit must remove dispatched sibling pr-audit-pending.json" >&2; return 1; }
+}
+
+test_swarm_pre_tool_use_brief_enrichment_and_passthrough() {
+  [ -x "$PRE_SUBAGENT_GUARD" ] || { echo "pre-subagent-guard.sh missing or not executable: $PRE_SUBAGENT_GUARD" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
+
+  local repo
+  repo=$(make_temp_repo)
+
+  # 1. Non-add actions (status, models, title, model, kill) pass through without overwrite
+  local act p_pass out_pass
+  for act in status models title model kill; do
+    p_pass=$(jq -nc --arg ws "$repo" --arg act "$act" '{
+      workspacePaths: [$ws],
+      toolCall: {
+        name: "swarm",
+        args: {
+          action: $act,
+          name: "worker-1",
+          workspace: "share",
+          brief: "Should not be overwritten."
+        }
+      }
+    }')
+    out_pass=$(printf '%s\n' "$p_pass" | "$PRE_SUBAGENT_GUARD")
+    assert_json_field "$out_pass" ".decision" "allow" "swarm action=$act must allow"
+    assert_json_field "$out_pass" "has(\"overwrite\")" "false" "swarm action=$act must not overwrite"
+  done
+
+  # Empty brief on action=add also passes through without overwrite
+  local p_empty out_empty
+  p_empty=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {action: "add", name: "empty-worker", workspace: "share", brief: ""}
+    }
+  }')
+  out_empty=$(printf '%s\n' "$p_empty" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_empty" ".decision" "allow" "swarm add with empty brief must allow"
+  assert_json_field "$out_empty" "has(\"overwrite\")" "false" "swarm add with empty brief must not overwrite"
+
+  # 2. action=add + workspace=share + tasks + multiline UTF-8 + trailing \n\n
+  local p_share out_share
+  p_share=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "api-worker",
+        workspace: "share",
+        tasks: ["src/auth.py", "tests/test_auth.py"],
+        model: "pro",
+        fork: "coordinator",
+        brief: "Görev: Türkçe UTF-8 (ğüşiöçİĞÜŞÖÇ) & `code()` & $HOME.\nSatır 2: Birim testlerini çalıştır.\n\n"
+      }
+    }
+  }')
+  out_share=$(printf '%s\n' "$p_share" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_MEDIUM" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    --arg grd "$EXPECTED_SWARM_BRANCH_GUARD" \
+    --argjson req "$p_share" \
+    '.decision == "allow"
+     and (.overwrite | keys) == ["brief"]
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n" + $grd + "\n\n" + $req.toolCall.args.brief)
+     and (.overwrite.brief | endswith("Birim testlerini çalıştır.\n\n"))' \
+    <<< "$out_share" >/dev/null || {
+      echo "swarm add with share+tasks failed brief enrichment check: $out_share" >&2
+      return 1
+    }
+
+  # 3. action=add + workspace=inherit omits SWARM_BRANCH_GUARD
+  local p_inherit out_inherit
+  p_inherit=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "reader-1",
+        workspace: "inherit",
+        brief: "Inspect repository architecture."
+      }
+    }
+  }')
+  out_inherit=$(printf '%s\n' "$p_inherit" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_MEDIUM" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    '.decision == "allow"
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n\nInspect repository architecture.")' \
+    <<< "$out_inherit" >/dev/null || {
+      echo "swarm add with inherit failed expected brief check: $out_inherit" >&2
+      return 1
+    }
+  assert_not_contains "$(printf '%s\n' "$out_inherit" | jq -r '.overwrite.brief')" "[SWARM_BRANCH_GUARD" "inherit mode must not inject SWARM_BRANCH_GUARD"
+
+  # 4. Idempotency: re-submitting already-enriched brief produces allow without overwrite
+  local p_idem out_idem
+  p_idem=$(jq -nc --arg ws "$repo" --argjson prev "$out_share" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "api-worker",
+        workspace: "share",
+        brief: $prev.overwrite.brief
+      }
+    }
+  }')
+  out_idem=$(printf '%s\n' "$p_idem" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_idem" ".decision" "allow" "Idempotent swarm add must allow"
+  assert_json_field "$out_idem" "has(\"overwrite\")" "false" "Idempotent swarm add must not re-overwrite brief"
+
+  # 5. Optional swarm dispatch consumption (typeName == "swarm") uses registered effortProfile
+  "$STAMP_GATE" dispatch --role "swarm-arch" --type "swarm" --tier "multi_module_integration" --workspace "$repo"
+  local p_disp out_disp
+  p_disp=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "swarm-arch",
+        workspace: "branch",
+        brief: "Design module boundaries."
+      }
+    }
+  }')
+  out_disp=$(printf '%s\n' "$p_disp" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_HIGH" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    --arg grd "$EXPECTED_SWARM_BRANCH_GUARD" \
+    '.decision == "allow"
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n" + $grd + "\n\nDesign module boundaries.")' \
+    <<< "$out_disp" >/dev/null || {
+      echo "Optional swarm dispatch failed HIGH effort + branch guard check: $out_disp" >&2
+      return 1
+    }
+  assert_json_field "$repo/.harness/state/main/subagent-dispatch.json" '.entries["swarm-arch"].consumed' "true" "Matching swarm dispatch entry must be marked consumed"
+
+  # 6. A "self" or "research" dispatch entry with the same name must NOT be consumed by swarm
+  "$STAMP_GATE" dispatch --role "shared-role" --type "self" --tier "critical_architecture_or_audit" --workspace "$repo"
+  local p_self_guard out_self_guard
+  p_self_guard=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "shared-role",
+        workspace: "inherit",
+        brief: "Swarm task sharing a role name."
+      }
+    }
+  }')
+  out_self_guard=$(printf '%s\n' "$p_self_guard" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_MEDIUM" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    '.decision == "allow"
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n\nSwarm task sharing a role name.")' \
+    <<< "$out_self_guard" >/dev/null || {
+      echo "swarm must ignore self dispatch entry and fall back to MEDIUM: $out_self_guard" >&2
+      return 1
+    }
+  assert_json_field "$repo/.harness/state/main/subagent-dispatch.json" '.entries["shared-role"].consumed' "false" "swarm must NOT consume self dispatch entry"
+
+  local p_sub_after out_sub_after
+  p_sub_after=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "invoke_subagent",
+      args: {
+        TypeName: "self",
+        Role: "shared-role",
+        Prompt: "Run invoke_subagent after swarm."
+      }
+    }
+  }')
+  out_sub_after=$(printf '%s\n' "$p_sub_after" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_sub_after" ".decision" "allow" "Unconsumed self dispatch entry must remain valid for invoke_subagent"
+  assert_json_field "$repo/.harness/state/main/subagent-dispatch.json" '.entries["shared-role"].consumed' "true" "invoke_subagent must consume self entry"
+
+  # 7. "research" entry is NOT consumed, typeName == "" IS consumed, conversationId is respected, and partial header is idempotent
+  "$STAMP_GATE" dispatch --role "shared-res" --type "research" --tier "trivial_lookup" --workspace "$repo"
+  local p_res_guard out_res_guard
+  p_res_guard=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "swarm", args: {action: "add", name: "shared-res", workspace: "inherit", brief: "Check research guard."}}
+  }')
+  out_res_guard=$(printf '%s\n' "$p_res_guard" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$repo/.harness/state/main/subagent-dispatch.json" '.entries["shared-res"].consumed' "false" "swarm must NOT consume research dispatch entry"
+  assert_contains "$(printf '%s\n' "$out_res_guard" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: MEDIUM" "swarm ignoring research entry must use MEDIUM"
+
+  local dispatch_json="$repo/.harness/state/main/subagent-dispatch.json"
+  local updated_disp
+  updated_disp=$(jq '
+    .entries["empty-type-worker"] = {typeName: "", tier: "trivial_lookup", model: "flash_lite", effortProfile: "LOW", consumed: false, timestamp: "2026-11-26T00:00:00Z"}
+    | .entries["conv-worker"] = {typeName: "swarm", tier: "critical_architecture_or_audit", model: "pro", effortProfile: "MAX", consumed: false, conversationId: "conv-alpha", timestamp: "2026-11-26T00:00:00Z"}
+  ' "$dispatch_json")
+  printf '%s\n' "$updated_disp" > "$dispatch_json"
+
+  local p_empty_type out_empty_type
+  p_empty_type=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "swarm", args: {action: "add", name: "empty-type-worker", workspace: "inherit", brief: "Quick check."}}
+  }')
+  out_empty_type=$(printf '%s\n' "$p_empty_type" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$dispatch_json" '.entries["empty-type-worker"].consumed' "true" "swarm must consume entry with empty typeName"
+  assert_contains "$(printf '%s\n' "$out_empty_type" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: LOW" "empty typeName dispatch must apply registered LOW effort"
+
+  local p_wrong_conv out_wrong_conv p_right_conv out_right_conv
+  p_wrong_conv=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-beta",
+    toolCall: {name: "swarm", args: {action: "add", name: "conv-worker", workspace: "inherit", brief: "Cross-conv task."}}
+  }')
+  out_wrong_conv=$(printf '%s\n' "$p_wrong_conv" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$dispatch_json" '.entries["conv-worker"].consumed' "false" "swarm from different conversationId must NOT consume conv-alpha dispatch"
+  assert_contains "$(printf '%s\n' "$out_wrong_conv" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: MEDIUM" "mismatched conversationId must fall back to MEDIUM"
+
+  p_right_conv=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-alpha",
+    toolCall: {name: "swarm", args: {action: "add", name: "conv-worker", workspace: "inherit", brief: "Same-conv task."}}
+  }')
+  out_right_conv=$(printf '%s\n' "$p_right_conv" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$dispatch_json" '.entries["conv-worker"].consumed' "true" "swarm from matching conversationId must consume dispatch"
+  assert_contains "$(printf '%s\n' "$out_right_conv" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: MAX" "matching conversationId must apply MAX effort"
+
+  local p_partial out_partial
+  p_partial=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "partial-worker",
+        workspace: "share",
+        brief: "[EFFORT_PROFILE: XHIGH — custom]\n\nExisting effort header."
+      }
+    }
+  }')
+  out_partial=$(printf '%s\n' "$p_partial" | "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    --arg grd "$EXPECTED_SWARM_BRANCH_GUARD" \
+    '.decision == "allow"
+     and .overwrite.brief == ($ctr + "\n" + $grd + "\n\n[EFFORT_PROFILE: XHIGH — custom]\n\nExisting effort header.")' \
+    <<< "$out_partial" >/dev/null || {
+      echo "Partial pre-existing EFFORT_PROFILE header was duplicated: $out_partial" >&2
+      return 1
+    }
+}
+
+test_parallel_same_role_dispatch_queue_and_conversation_affinity() {
+  [ -x "$PRE_SUBAGENT_GUARD" ] || { echo "pre-subagent-guard.sh missing or not executable: $PRE_SUBAGENT_GUARD" >&2; return 1; }
+  [ -x "$STAMP_GATE" ] || { echo "stamp-gate.sh missing or not executable: $STAMP_GATE" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
+
+  local repo dispatch_file
+  repo=$(make_temp_repo)
+  dispatch_file="$repo/.harness/state/main/subagent-dispatch.json"
+
+  # 1. Two dispatches for the SAME Role -> FIFO consumption + 3rd deny + .entries[role] sync
+  "$STAMP_GATE" dispatch --role "Parallel Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
+  "$STAMP_GATE" dispatch --role "Parallel Worker" --type "self" --tier "multi_module_integration" --workspace "$repo"
+
+  assert_json_field "$dispatch_file" '.pendingQueues["Parallel Worker"] | length' "2" "Two dispatches for same role must queue 2 items"
+  assert_json_field "$dispatch_file" '.entries["Parallel Worker"].consumed' "false" "entries[role] must remain unconsumed"
+
+  local p_pw out_pw1 out_pw2 out_pw3
+  p_pw=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "invoke_subagent",
+      args: {TypeName: "self", Role: "Parallel Worker", Prompt: "Execute parallel task."}
+    }
+  }')
+  out_pw1=$(printf '%s\n' "$p_pw" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_pw1" ".decision" "allow" "1st parallel same-role invocation must be allowed"
+  assert_json_field "$out_pw1" ".overwrite.Model" "flash" "1st FIFO entry (bounded_execution) must use flash"
+  assert_contains "$(printf '%s\n' "$out_pw1" | jq -r '.overwrite.Prompt')" "[EFFORT_PROFILE: MEDIUM" "1st FIFO entry must inject MEDIUM"
+  assert_json_field "$dispatch_file" '.entries["Parallel Worker"].consumed' "false" "entries[role] must sync to remaining unconsumed entry"
+  assert_json_field "$dispatch_file" '.entries["Parallel Worker"].effortProfile' "HIGH" "entries[role] must reflect next queued entry"
+
+  out_pw2=$(printf '%s\n' "$p_pw" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_pw2" ".decision" "allow" "2nd parallel same-role invocation must be allowed"
+  assert_json_field "$out_pw2" ".overwrite.Model" "inherit" "2nd FIFO entry (multi_module_integration) must use inherit"
+  assert_contains "$(printf '%s\n' "$out_pw2" | jq -r '.overwrite.Prompt')" "[EFFORT_PROFILE: HIGH" "2nd FIFO entry must inject HIGH"
+  assert_json_field "$dispatch_file" '.entries["Parallel Worker"].consumed' "true" "entries[role] must sync to consumed=true when queue empty"
+
+  out_pw3=$(printf '%s\n' "$p_pw" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_pw3" ".decision" "deny" "3rd invocation after both queued entries consumed must deny"
+  assert_contains "$(printf '%s\n' "$out_pw3" | jq -r '.reason')" "consumed == true" "Deny reason must preserve saw_consumed semantics"
+
+  # 2. Legacy entries[role] seeding when pendingQueues[role] is absent
+  local legacy_json
+  legacy_json=$(jq 'del(.pendingQueues) | .entries["Legacy Role"] = {typeName: "self", tier: "trivial_lookup", model: "flash_lite", effortProfile: "LOW", consumed: false, timestamp: "2026-11-26T00:00:00Z"}' "$dispatch_file")
+  printf '%s\n' "$legacy_json" > "$dispatch_file"
+  "$STAMP_GATE" dispatch --role "Legacy Role" --type "self" --tier "critical_architecture_or_audit" --workspace "$repo"
+  assert_json_field "$dispatch_file" '.pendingQueues["Legacy Role"] | length' "2" "Existing unconsumed legacy entry must seed pendingQueues before appending"
+
+  local p_leg out_leg1 out_leg2 out_leg3
+  p_leg=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Legacy Role", Prompt: "Legacy task."}}
+  }')
+  out_leg1=$(printf '%s\n' "$p_leg" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_leg1" ".overwrite.Model" "flash_lite" "Seeded legacy entry must be consumed first (FIFO)"
+  out_leg2=$(printf '%s\n' "$p_leg" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_leg2" ".overwrite.Model" "pro" "Newly appended entry must be consumed second"
+  out_leg3=$(printf '%s\n' "$p_leg" | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_leg3" ".decision" "deny" "3rd legacy queue call must deny"
+
+  # 3. conversationId affinity across parallel same-role dispatches (--conversation-id, --conversation-id=, HARNESS_CONVERSATION_ID)
+  "$STAMP_GATE" dispatch --role "Conv Worker" --type "self" --tier "bounded_execution" --conversation-id "conv-1" --workspace "$repo"
+  "$STAMP_GATE" dispatch --role "Conv Worker" --type "self" --tier "critical_architecture_or_audit" --conversation-id="conv-2" --workspace "$repo"
+  HARNESS_CONVERSATION_ID="conv-3" "$STAMP_GATE" dispatch --role "Conv Worker" --type "self" --tier "trivial_lookup" --workspace "$repo"
+
+  local out_c2 out_c3 out_c1 out_c_other
+  out_c2=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-2",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Conv Worker", Prompt: "Run conv-2."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_c2" ".decision" "allow" "conv-2 must match its queued entry"
+  assert_json_field "$out_c2" ".overwrite.Model" "pro" "conv-2 must receive MAX/pro entry regardless of queue position"
+  assert_contains "$(printf '%s\n' "$out_c2" | jq -r '.overwrite.Prompt')" "[EFFORT_PROFILE: MAX"
+  assert_json_field "$dispatch_file" '.entries["Conv Worker"].consumed' "false" "Remaining conv-1 and conv-3 entries must keep entries[role] unconsumed"
+
+  out_c_other=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-unrelated",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Conv Worker", Prompt: "Wrong conv."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_c_other" ".decision" "deny" "Unrelated conversationId must not steal conv-1 or conv-3 entries"
+
+  out_c3=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-3",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Conv Worker", Prompt: "Run conv-3."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_c3" ".overwrite.Model" "flash_lite" "conv-3 must receive trivial_lookup entry"
+
+  out_c1=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-1",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Conv Worker", Prompt: "Run conv-1."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_c1" ".overwrite.Model" "flash" "conv-1 must receive bounded_execution entry"
+  assert_json_field "$dispatch_file" '.entries["Conv Worker"].consumed' "true" "After all conv entries consumed, entries[role].consumed must be true"
+
+  # 4. Exact conversationId beats generic (empty conversationId) entry even when generic is older in queue
+  "$STAMP_GATE" dispatch --role "Affinity Order" --type "self" --tier "trivial_lookup" --workspace "$repo"
+  "$STAMP_GATE" dispatch --role "Affinity Order" --type "self" --tier "critical_architecture_or_audit" --conversation-id "conv-vip" --workspace "$repo"
+  local out_vip out_vip_fallback
+  out_vip=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-vip",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Affinity Order", Prompt: "VIP first."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_vip" ".overwrite.Model" "pro" "Exact conversationId entry must beat older generic entry"
+  out_vip_fallback=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-vip",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Affinity Order", Prompt: "VIP fallback."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_vip_fallback" ".overwrite.Model" "flash_lite" "Second call falls back to older generic entry"
+
+  # 5. Error semantics (mismatch_type & invalid_entry) preserved on queued entries without consuming
+  "$STAMP_GATE" dispatch --role "Type Guard" --type "research" --tier "trivial_lookup" --workspace "$repo"
+  local out_mismatch
+  out_mismatch=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Type Guard", Prompt: "Mismatch."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_mismatch" ".decision" "deny" "Type mismatch in queue must deny"
+  assert_contains "$(printf '%s\n' "$out_mismatch" | jq -r '.reason')" "research" "Mismatch reason must cite registered typeName"
+  assert_json_field "$dispatch_file" '.entries["Type Guard"].consumed' "false" "Type mismatch must not consume queued entry"
+
+  local bad_queue_json
+  bad_queue_json=$(jq '.pendingQueues["Invalid Role"] = [{typeName: "self", tier: "bounded_execution", model: "", effortProfile: "BAD", consumed: false}] | .entries["Invalid Role"] = {typeName: "self", tier: "bounded_execution", model: "", effortProfile: "BAD", consumed: false}' "$dispatch_file")
+  printf '%s\n' "$bad_queue_json" > "$dispatch_file"
+  local out_invalid
+  out_invalid=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Invalid Role", Prompt: "Invalid."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_invalid" ".decision" "deny" "Invalid queued entry must deny"
+  assert_contains "$(printf '%s\n' "$out_invalid" | jq -r '.reason')" "geçersiz model veya effortProfile" "Invalid queued entry must preserve invalid_entry reason"
+
+  # 6. Queue pruning keeps at most 20 consumed items while retaining new unconsumed entry
+  local prune_json
+  prune_json=$(jq '
+    .pendingQueues["Pruned Role"] = [range(0; 23) | {typeName: "self", tier: "trivial_lookup", model: "flash_lite", effortProfile: "LOW", consumed: true, timestamp: "2026-11-26T00:00:00Z"}]
+    | .entries["Pruned Role"] = {typeName: "self", tier: "trivial_lookup", model: "flash_lite", effortProfile: "LOW", consumed: true, timestamp: "2026-11-26T00:00:00Z"}
+  ' "$dispatch_file")
+  printf '%s\n' "$prune_json" > "$dispatch_file"
+  "$STAMP_GATE" dispatch --role "Pruned Role" --type "self" --tier "bounded_execution" --workspace "$repo"
+  assert_json_field "$dispatch_file" '[.pendingQueues["Pruned Role"][] | select(.consumed == true)] | length' "20" "Pruning must retain at most 20 consumed items"
+  assert_json_field "$dispatch_file" '[.pendingQueues["Pruned Role"][] | select(.consumed == false)] | length' "1" "Pruning must retain newly registered unconsumed item"
+
+  # 7. Swarm add consumes matching pendingQueues entry with conversationId affinity
+  "$STAMP_GATE" dispatch --role "swarm-shard" --type "swarm" --tier "trivial_lookup" --conversation-id "conv-s1" --workspace "$repo"
+  "$STAMP_GATE" dispatch --role "swarm-shard" --type "swarm" --tier "bounded_execution" --effort "XHIGH" --conversation-id "conv-s2" --workspace "$repo"
+  local out_sw2 out_sw1 out_sw3
+  out_sw2=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-s2",
+    toolCall: {name: "swarm", args: {action: "add", name: "swarm-shard", workspace: "inherit", brief: "Shard 2."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_contains "$(printf '%s\n' "$out_sw2" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: XHIGH" "Swarm add must consume conv-s2 queue entry"
+  out_sw1=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-s1",
+    toolCall: {name: "swarm", args: {action: "add", name: "swarm-shard", workspace: "inherit", brief: "Shard 1."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_contains "$(printf '%s\n' "$out_sw1" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: LOW" "Swarm add must consume conv-s1 queue entry"
+  out_sw3=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-s1",
+    toolCall: {name: "swarm", args: {action: "add", name: "swarm-shard", workspace: "inherit", brief: "Shard 3."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_contains "$(printf '%s\n' "$out_sw3" | jq -r '.overwrite.brief')" "[EFFORT_PROFILE: MEDIUM" "After queue exhausted, swarm add falls back to MEDIUM"
+}
+
+test_neon_gemini4_and_custom_parent_model_routing() {
+  [ -x "$PRE_SUBAGENT_GUARD" ] || { echo "pre-subagent-guard.sh missing or not executable: $PRE_SUBAGENT_GUARD" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
+
+  local repo
+  repo=$(make_temp_repo)
+
+  # 1. Neon High routes identically to Carbon frontier family
+  local out_neon_sec out_neon_pr out_neon_self out_neon_canon_def out_neon_canon_inh
+  out_neon_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-neon-high",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Neon Sec", Model: "pro", Prompt: "Audit Neon."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_neon_sec" ".overwrite.Model" "inherit" "Neon parent keeps security-reviewer on inherit"
+
+  out_neon_pr=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Gemini 4 Neon (Medium)",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "pr-auditor", Role: "Neon PR", Prompt: "Audit PR on Neon."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_neon_pr" ".overwrite.Model" "inherit" "Neon parent keeps pr-auditor on inherit"
+
+  "$STAMP_GATE" dispatch --role "Neon Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
+  out_neon_self=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-neon-high",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Neon Worker", Prompt: "Implement Neon module."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_neon_self" ".overwrite.Model" "pro" "Neon bounded_execution steps down to pro (Argon)"
+
+  "$STAMP_GATE" dispatch --role "Neon Canon Def" --type "canon-auditor" --tier "multi_module_integration" --workspace "$repo"
+  out_neon_canon_def=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-neon-high",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "canon-auditor", Role: "Neon Canon Def", Model: "pro", Prompt: "Canon Argon."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_neon_canon_def" ".overwrite.Model" "pro" "Neon multi_module defaults to pro"
+
+  "$STAMP_GATE" dispatch --role "Neon Canon Inh" --type "canon-auditor" --tier "multi_module_integration" --workspace "$repo"
+  out_neon_canon_inh=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-neon-high",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "canon-auditor", Role: "Neon Canon Inh", Model: "inherit", Prompt: "Canon Neon."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_neon_canon_inh" ".overwrite.Model" "inherit" "Neon multi_module preserves explicit inherit"
+
+  # 2. Neon Low -> argon_low
+  local out_neon_low_sec out_neon_low_self
+  out_neon_low_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "gemini-4-neon-low",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Neon Low Sec", Prompt: "Audit Neon Low."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_neon_low_sec" ".overwrite.Model" "pro" "Neon Low (argon_low) escalates security-reviewer to pro"
+
+  "$STAMP_GATE" dispatch --role "Neon Low Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
+  out_neon_low_self=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Gemini 4 Neon (Low)",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Neon Low Worker", Prompt: "Bounded Neon Low."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_neon_low_self" ".overwrite.Model" "inherit" "Neon Low bounded_execution keeps inherit"
+
+  # 3. Custom parent model -> bounded_execution routes to pro, multi_module & critical stay inherit
+  "$STAMP_GATE" dispatch --role "Custom Bounded" --type "self" --tier "bounded_execution" --workspace "$repo"
+  local out_custom_bounded out_custom_multi out_custom_sec
+  out_custom_bounded=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "enterprise-tuned-v1",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Custom Bounded", Prompt: "Custom bounded."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_custom_bounded" ".overwrite.Model" "pro" "custom bounded_execution must route to pro instead of flash"
+
+  "$STAMP_GATE" dispatch --role "Custom Multi" --type "self" --tier "multi_module_integration" --workspace "$repo"
+  out_custom_multi=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "enterprise-tuned-v1",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Custom Multi", Prompt: "Custom multi."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_custom_multi" ".overwrite.Model" "inherit" "custom multi_module_integration keeps inherit"
+
+  out_custom_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "enterprise-tuned-v1",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Custom Sec", Prompt: "Custom audit."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_custom_sec" ".overwrite.Model" "inherit" "custom critical_architecture_or_audit keeps inherit"
 }
 
 run_tests

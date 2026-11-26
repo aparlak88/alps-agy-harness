@@ -84,6 +84,8 @@ test_agents_md_no_frontmatter_and_under_8kb() {
   assert_contains "$content" "security-reviewer" "AGENTS.md must reference security-reviewer"
   assert_contains "$content" "review-pr" "AGENTS.md must reference review-pr"
   assert_contains "$content" "pr-auditor" "AGENTS.md must reference pr-auditor"
+  assert_contains "$content" "Swarm" "AGENTS.md must document Swarm Coordinator/Worker mode"
+  assert_contains "$content" 'workspace: "share"' "AGENTS.md must mandate workspace: \"share\" for writing Swarm workers"
 }
 
 assert_platform_rule_contract() {
