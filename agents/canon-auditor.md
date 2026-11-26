@@ -33,6 +33,7 @@ Execute the steps below in strict sequence. Do **not** read the PR title, Spec `
 
 ### Step 2: Three-Part Domain Canon Audit (`docs/canon/`)
 Use `jev_triage` (via `call_mcp_tool` -> `ServerName: "jev"`, `ToolName: "jev_triage"`) when scanning large diffs (`> 8` files, up to 50 files per batch) so clean files do not pollute your context; inspect flagged files (`>= 0.50` violation probability, `yes` or `uncertain`) and all boundary files directly with `read_file`. For small diffs (`<= 8` files), inspect the full diff directly.
+- **`jev_triage` Payload Guard:** Never call `jev_triage` with an empty `items: []` or empty/null `questions`. Every `items` entry must include a unique `id` and prefer `path` (do not inline raw file contents into `text`), skipping oversized/minified bundle files; every `questions` entry must be a non-null object with required `id`, `type` (`check` | `score` | `classify`), and `question` fields to avoid MCP `-32602` / `400 INVALID_ARGUMENT` errors.
 
 1. **`docs/canon/glossary.md` (Ubiquitous Language):**
    - Every domain entity, value object, use-case, DTO field, database column, and English docstring (`XMLDoc` / `TSDoc` / `Swift DocC` / `KDoc`) must use the exact **Canonical Code/Type Name** and **Canonical API/Data Field**.
@@ -47,6 +48,7 @@ Use `jev_triage` (via `call_mcp_tool` -> `ServerName: "jev"`, `ToolName: "jev_tr
 
 ### Step 3: Anti-Overengineering, Rule of Three & Scope Lock via `jev_ask`
 Evaluate the Plan's Complexity Budget and/or code diff in a single `jev_ask` pass (`ServerName: "jev"`, `ToolName: "jev_ask"`):
+- **`jev_ask` Payload Guard:** Always pass at least 1 valid non-null question object (`id`, `type`, `question`) in `questions` (never `[]` or `[null]`). Never embed large raw bundle files (e.g., `index.html`, compiled JS/CSS bundles, lockfiles) directly in `state`; pass a concise structured summary of changes and candidate findings with `file:line` references instead.
 - Query `jev_ask` (`type: "check"` / `"score"`) on:
   1. `overengineering_bloat`: Does the Plan or diff introduce speculative abstractions, single-implementation `IFooHelper` interfaces outside true architectural boundaries (repositories / 3rd-party SDK gateways), `AbstractBase` classes, `Factory` wrappers, future-proofing flags, or unnecessary pass-through layers on `quick_fix` / `small_change` tasks?
   2. `canon_and_scope_drift`: Does the Plan or diff violate `glossary.md` aliases, `flows.md` step ordering, or modify neighbor files outside `allowedFiles` (*drive-by refactoring*)?

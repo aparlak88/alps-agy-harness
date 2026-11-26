@@ -1784,4 +1784,143 @@ agent(prompt="Scan", model=m)' \
   assert_json_field "$out_wf_ext" ".decision" "deny" "run_workflow ScriptPath outside workspace denied"
 }
 
+test_swarm_system_roles_exempt_and_leading_header_block_only() {
+  [ -x "$PRE_SUBAGENT_GUARD" ] || { echo "pre-subagent-guard.sh missing or not executable: $PRE_SUBAGENT_GUARD" >&2; return 1; }
+  [ -x "$STAMP_GATE" ] || { echo "stamp-gate.sh missing or not executable: $STAMP_GATE" >&2; return 1; }
+  local DAEMON_PY="$REPO_ROOT/sidecars/harness-daemon/daemon.py"
+  [ -x "$DAEMON_PY" ] || { echo "daemon.py missing or not executable: $DAEMON_PY" >&2; return 1; }
+
+  local repo dispatch_file
+  repo=$(make_temp_repo)
+  dispatch_file="$repo/.harness/state/main/subagent-dispatch.json"
+
+  # Pre-register swarm dispatches for system role names to verify they are NOT consumed
+  "$STAMP_GATE" dispatch --role "monitor" --type "swarm" --tier "critical_architecture_or_audit" --workspace "$repo"
+  "$STAMP_GATE" dispatch --role "narrator" --type "swarm" --tier "critical_architecture_or_audit" --workspace "$repo"
+  "$STAMP_GATE" dispatch --role "monitor-2" --type "swarm" --tier "multi_module_integration" --workspace "$repo"
+  "$STAMP_GATE" dispatch --role "narrator-1" --type "swarm" --tier "multi_module_integration" --workspace "$repo"
+
+  # 1. Cold fallback: system roles (monitor, monitor-2, narrator, narrator-1) return plain allow without overwrite or dispatch consumption
+  local role_name p_sys out_sys
+  for role_name in monitor monitor-2 narrator narrator-1; do
+    p_sys=$(jq -nc --arg ws "$repo" --arg name "$role_name" '{
+      workspacePaths: [$ws],
+      toolCall: {
+        name: "swarm",
+        args: {
+          action: "add",
+          name: $name,
+          workspace: "inherit",
+          brief: "System role brief. Never call post_message."
+        }
+      }
+    }')
+    out_sys=$(printf '%s\n' "$p_sys" | HARNESS_DISABLE_DAEMON=1 "$PRE_SUBAGENT_GUARD")
+    assert_json_field "$out_sys" ".decision" "allow" "System role $role_name must be allowed"
+    assert_json_field "$out_sys" "has(\"overwrite\")" "false" "System role $role_name must NOT overwrite brief"
+    assert_json_field "$dispatch_file" ".entries[\"$role_name\"].consumed" "false" "System role $role_name must NOT consume dispatch"
+  done
+
+  # 2. Non-system roles starting with monitor/narrator prefix (e.g. monitor-worker) still get enriched
+  local p_non_sys out_non_sys
+  p_non_sys=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "monitor-worker",
+        workspace: "inherit",
+        brief: "Implement metrics endpoint."
+      }
+    }
+  }')
+  out_non_sys=$(printf '%s\n' "$p_non_sys" | HARNESS_DISABLE_DAEMON=1 "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_non_sys" ".decision" "allow" "Non-system role monitor-worker must be allowed"
+  assert_contains "$(printf '%s\n' "$out_non_sys" | jq -r '.overwrite.brief')" "[SWARM_WORKER_CONTRACT" "monitor-worker must receive SWARM_WORKER_CONTRACT"
+
+  # 3. Body text mentioning [SWARM_WORKER_CONTRACT], [EFFORT_PROFILE: ...], [SWARM_BRANCH_GUARD] must STILL inject leading headers
+  local body_mention_brief p_body out_body
+  body_mention_brief=$'Verify harness injection behavior.\n\nEnsure [EFFORT_PROFILE: HIGH] and [SWARM_WORKER_CONTRACT] and [SWARM_BRANCH_GUARD] are checked properly.'
+  p_body=$(jq -nc --arg ws "$repo" --arg br "$body_mention_brief" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "swarm",
+      args: {
+        action: "add",
+        name: "qa-worker",
+        workspace: "share",
+        brief: $br
+      }
+    }
+  }')
+  out_body=$(printf '%s\n' "$p_body" | HARNESS_DISABLE_DAEMON=1 "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_MEDIUM" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    --arg grd "$EXPECTED_SWARM_BRANCH_GUARD" \
+    --arg br "$body_mention_brief" \
+    '.decision == "allow"
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n" + $grd + "\n\n" + $br)' \
+    <<< "$out_body" >/dev/null || {
+      echo "Body mentions skipped leading header injection: $out_body" >&2
+      return 1
+    }
+
+  # 4. Warm daemon parity for both system role exemption and leading header block detection
+  _SWARM_SYS_SOCK_DIR=$(mktemp -d "/tmp/hd-swarmsys.XXXXXX")
+  _SWARM_SYS_DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hd-swarmsys-data.XXXXXX")
+  _SWARM_SYS_DAEMON_PID=""
+  local sock_path="$_SWARM_SYS_SOCK_DIR/d.sock"
+  _swarm_sys_cleanup() {
+    if [ -n "${_SWARM_SYS_DAEMON_PID:-}" ]; then
+      kill "$_SWARM_SYS_DAEMON_PID" 2>/dev/null || true
+      wait "$_SWARM_SYS_DAEMON_PID" 2>/dev/null || true
+      _SWARM_SYS_DAEMON_PID=""
+    fi
+    rm -rf "${_SWARM_SYS_SOCK_DIR:-}" "${_SWARM_SYS_DATA_DIR:-}" 2>/dev/null || true
+  }
+  trap _swarm_sys_cleanup EXIT INT TERM
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$_SWARM_SYS_DATA_DIR" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  _SWARM_SYS_DAEMON_PID=$!
+
+  local tries=0 ready=0
+  while [ "$tries" -lt 40 ]; do
+    if [ -S "$sock_path" ] && curl -fsS --max-time 0.2 --unix-socket "$sock_path" "http://localhost/health" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  [ "$ready" -eq 1 ] || { echo "Ephemeral daemon did not start for swarm system role test" >&2; return 1; }
+
+  local d_narrator d_body
+  d_narrator=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "swarm", args: {action: "add", name: "narrator", workspace: "inherit", brief: "Narrate progress. Never call post_message."}}
+  }' | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$d_narrator" ".decision" "allow" "Warm daemon must allow narrator"
+  assert_json_field "$d_narrator" "has(\"overwrite\")" "false" "Warm daemon must NOT overwrite narrator brief"
+  assert_json_field "$dispatch_file" '.entries["narrator"].consumed' "false" "Warm daemon must NOT consume narrator dispatch"
+
+  d_body=$(printf '%s\n' "$p_body" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD")
+  jq -e \
+    --arg eff "$EXPECTED_MEDIUM" \
+    --arg ctr "$EXPECTED_SWARM_CONTRACT" \
+    --arg grd "$EXPECTED_SWARM_BRANCH_GUARD" \
+    --arg br "$body_mention_brief" \
+    '.decision == "allow"
+     and .overwrite.brief == ($eff + "\n" + $ctr + "\n" + $grd + "\n\n" + $br)' \
+    <<< "$d_body" >/dev/null || {
+      echo "Warm daemon failed leading header block injection: $d_body" >&2
+      return 1
+    }
+}
+
 run_tests

@@ -25,6 +25,7 @@ You are the **Pre-PR Security & Exploitability Auditor** for `alps-agy-harness`.
 ### Step 1: Diff Discovery & `jev_triage` Risk Pre-Screening
 1. Resolve the base branch (`origin/main`, `origin/master`, `main`, or `master`) and list changed files (`git diff --name-only <base>..HEAD`).
 2. Call `jev_triage` (`ServerName: "jev"`, `ToolName: "jev_triage"`) over changed production, configuration, and security-rule files (in batches of up to 50 items using `path` so clean boilerplate stays out of context) with typed check/score questions covering auth bypass, untrusted input sinks, secret exposure, and storage/rules misconfiguration.
+   - **`jev_triage` Payload Guard:** Never invoke `jev_triage` with `items: []` or empty/null `questions`. Supply at least 1 valid item (`id` + `path` preferred; do not inline raw file contents into `text`, and skip oversized/minified bundle files) and at least 1 valid non-null question (`id`, `type`, `question`) to avoid MCP `-32602` / `400 INVALID_ARGUMENT` errors.
 3. Read every file flagged by `jev_triage` (`>= 0.50` risk / `yes` or `uncertain`) **plus** all changed auth, API controller/endpoint, persistence, serialization, Firebase rule, mobile storage, local container files (`docker-compose*.yml`), and CI/CD workflow files (`.github/workflows/*`, `.gitlab-ci.yml`, pipeline definitions) directly with `read_file` and `git diff <base>..HEAD -- <file>`. For small PRs (`<= 8` changed files), read the entire diff directly in addition to `jev_triage`.
 
 ### Step 2: Mandatory 7-Surface Deep Security Inspection
@@ -64,6 +65,7 @@ Audit every changed hunk and its immediate call chain across all seven mandatory
 
 ### Step 3: Exploitability & Severity Calibration via `jev_score`
 Before finalizing your report, pass **every** candidate security finding through `jev_score` (`ServerName: "jev"`, `ToolName: "jev_score"`) with concrete ordered `levels`:
+- **`jev_score` Payload Guard:** Never embed large raw bundle files (e.g., `index.html`, compiled JS/CSS bundles, lockfiles) directly inside `state`; pass a concise finding summary, exploit path, and `file:line` context with at least 2 concrete `levels`.
 - `Minor`: Defense-in-depth hardening note with no realistic exploit path under current trust boundaries (non-blocking).
 - `Important`: Exploitable weakness under authenticated/adjacent preconditions, missing authorization/validation boundary, plaintext token in `UserDefaults`/`SharedPreferences`, or overly broad `firestore.rules`/`storage.rules` (blocks PR).
 - `Critical`: Remotely exploitable Authz bypass/IDOR, SQL/command/XSS injection, leaked secret/credential (`TYPESAFE_API_KEY`, private key, API token), or arbitrary cross-tenant read/write (blocks PR).

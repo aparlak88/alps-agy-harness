@@ -795,6 +795,102 @@ PY
   [ "$active_cnt" -ge 2 ] || { echo "Expected nested worktree auto-registered in daemon (activeWorkspaces=$active_cnt)" >&2; return 1; }
 }
 
+test_git_submodule_pre_edit_resolves_submodule_branch_independently() {
+  [ -x "$PRE_EDIT_GUARD" ] || { echo "pre-edit-guard.sh missing or not executable: $PRE_EDIT_GUARD" >&2; return 1; }
+  local DAEMON_PY="$REPO_ROOT/sidecars/harness-daemon/daemon.py"
+  [ -x "$DAEMON_PY" ] || { echo "daemon.py missing or not executable: $DAEMON_PY" >&2; return 1; }
+
+  local super_repo sub_origin sub_path
+  super_repo=$(make_temp_repo)
+  echo "super" > "$super_repo/README.md"
+  git -C "$super_repo" add README.md
+  git -C "$super_repo" commit -m "chore: init super" --quiet
+
+  sub_origin=$(make_temp_repo)
+  echo "sub" > "$sub_origin/README.md"
+  git -C "$sub_origin" add README.md
+  git -C "$sub_origin" commit -m "chore: init sub" --quiet
+
+  git -C "$super_repo" -c protocol.file.allow=always submodule add --quiet "$sub_origin" libs/submod
+  git -C "$super_repo" commit -m "chore: add submodule" --quiet
+  sub_path="$super_repo/libs/submod"
+
+  # Case A: superproject on main, submodule on fix/sub-task -> edits inside submodule ALLOWED, superproject main still DENIED
+  git -C "$sub_path" checkout -b "fix/sub-task" --quiet
+
+  local p_sub_clean p_sub_eval p_super_main out_sub_clean out_sub_eval out_super_main
+  p_sub_clean=$(jq -nc --arg ws "$super_repo" --arg path "$sub_path/src/Sub.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const ok = 1;"}}}')
+  out_sub_clean=$(printf '%s' "$p_sub_clean" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_sub_clean" ".decision" "allow" "Clean write in submodule on fix/* must be allowed while superproject is on main"
+
+  p_sub_eval=$(jq -nc --arg ws "$super_repo" --arg path "$sub_path/src/BadSub.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const bad = eval(\"1\");"}}}')
+  out_sub_eval=$(printf '%s' "$p_sub_eval" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_sub_eval" ".decision" "deny" "eval() in submodule must still be denied by Rule 3"
+  assert_contains "$(printf '%s' "$out_sub_eval" | jq -r '.reason')" "eval()"
+
+  p_super_main=$(jq -nc --arg ws "$super_repo" --arg path "$super_repo/src/Super.ts" \
+    '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: $path, Content: "export const x = 1;"}}}')
+  out_super_main=$(printf '%s' "$p_super_main" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_super_main" ".decision" "deny" "Direct write in superproject on main must remain denied"
+
+  # Case B: superproject on feat/super-task, submodule on main -> edits inside submodule DENIED (submodule main lock!), superproject ALLOWED
+  git -C "$super_repo" checkout -b "feat/super-task" --quiet
+  git -C "$sub_path" checkout main --quiet
+
+  local out_sub_locked out_super_feat
+  out_sub_locked=$(printf '%s' "$p_sub_clean" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_sub_locked" ".decision" "deny" "Write inside submodule on main must be denied even when superproject is on feat/*"
+  assert_contains "$(printf '%s' "$out_sub_locked" | jq -r '.reason')" "branch 'main'"
+
+  out_super_feat=$(printf '%s' "$p_super_main" | HARNESS_DISABLE_DAEMON=1 "$PRE_EDIT_GUARD")
+  assert_json_field "$out_super_feat" ".decision" "allow" "Write in superproject on feat/* must be allowed"
+
+  # Case C: Warm daemon parity
+  _SUBMOD_SOCK_DIR=$(mktemp -d "/tmp/hd-submod.XXXXXX")
+  _SUBMOD_DATA_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hd-submod-data.XXXXXX")
+  _SUBMOD_DAEMON_PID=""
+  local sock_path="$_SUBMOD_SOCK_DIR/d.sock"
+  _submod_cleanup() {
+    if [ -n "${_SUBMOD_DAEMON_PID:-}" ]; then
+      kill "$_SUBMOD_DAEMON_PID" 2>/dev/null || true
+      wait "$_SUBMOD_DAEMON_PID" 2>/dev/null || true
+      _SUBMOD_DAEMON_PID=""
+    fi
+    rm -rf "${_SUBMOD_SOCK_DIR:-}" "${_SUBMOD_DATA_DIR:-}" 2>/dev/null || true
+  }
+  trap _submod_cleanup EXIT INT TERM
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$_SUBMOD_DATA_DIR" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  _SUBMOD_DAEMON_PID=$!
+
+  local tries=0 ready=0
+  while [ "$tries" -lt 40 ]; do
+    if [ -S "$sock_path" ] && curl -fsS --max-time 0.2 --unix-socket "$sock_path" "http://localhost/health" >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  [ "$ready" -eq 1 ] || { echo "Ephemeral daemon did not start for submodule test" >&2; return 1; }
+
+  local d_sub_locked d_sub_allowed
+  d_sub_locked=$(printf '%s' "$p_sub_clean" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$d_sub_locked" ".decision" "deny" "Warm daemon must deny write in submodule on main"
+
+  git -C "$super_repo" checkout main --quiet
+  git -C "$sub_path" checkout "fix/sub-task" --quiet
+
+  d_sub_allowed=$(printf '%s' "$p_sub_clean" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  assert_json_field "$d_sub_allowed" ".decision" "allow" "Warm daemon must allow write in submodule on fix/* while superproject is on main"
+}
+
 test_session_start_swarm_protocol_branch_guard_and_detached_head() {
   [ -x "$SESSION_START" ] || { echo "session-start.sh missing or not executable: $SESSION_START" >&2; return 1; }
   export HARNESS_DISABLE_DAEMON=1

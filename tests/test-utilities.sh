@@ -758,4 +758,73 @@ EOF
   assert_json_field "$ok_json" '.checks[] | select(.name=="impeccable_ui") | .status' "OK"
 }
 
+test_harness_doctor_plugins_json_entries_schema_and_autodiscovery() {
+  local tmp_repo mock_cfg mock_bin_dir shared_plugins_dir
+  tmp_repo="$(make_temp_repo)"
+  mock_cfg="$tmp_repo/gemini-config"
+  mock_bin_dir="$tmp_repo/doctor-bin"
+  shared_plugins_dir="$tmp_repo/vendor/team-plugins"
+  mkdir -p "$mock_cfg" "$mock_bin_dir" \
+    "$shared_plugins_dir/superpowers" \
+    "$shared_plugins_dir/firebase" \
+    "$shared_plugins_dir/postman" \
+    "$tmp_repo/.agents/plugins/chrome-devtools-plugin"
+
+  cat <<'EOF' > "$mock_cfg/mcp_config.json"
+{
+  "mcpServers": {
+    "jev": {}, "context7": {}, "csharp-lsp": {}, "typescript-lsp": {},
+    "playwright": {}, "graphify": {}, "revenuecat": {}, "filesystem": {}
+  }
+}
+EOF
+  cat <<'EOF' > "$mock_bin_dir/gh"
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$mock_bin_dir/gh"
+
+  # 1. Antigravity plugins.json {"entries": [{"path": "..."}]} + .agents/plugins/ auto-discovery -> all 4 plugins OK
+  mkdir -p "$tmp_repo/.agents"
+  cat <<'EOF' > "$tmp_repo/.agents/plugins.json"
+{
+  "entries": [
+    { "path": "vendor/team-plugins" }
+  ]
+}
+EOF
+
+  local ok_json rc_ok=0
+  ok_json=$(TYPESAFE_API_KEY="test_key" \
+            HARNESS_CONFIG_DIR="$mock_cfg" \
+            HARNESS_GH_BIN="$mock_bin_dir/gh" \
+            "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$tmp_repo" --json) || rc_ok=$?
+  assert_eq "0" "$rc_ok" "Doctor must accept Antigravity plugins.json entries schema + .agents/plugins auto-discovery"
+  assert_json_field "$ok_json" ".healthy" "true"
+  assert_json_field "$ok_json" '.checks[] | select(.name=="superpowers") | .status' "OK"
+  assert_json_field "$ok_json" '.checks[] | select(.name=="firebase") | .status' "OK"
+  assert_json_field "$ok_json" '.checks[] | select(.name=="postman") | .status' "OK"
+  assert_json_field "$ok_json" '.checks[] | select(.name=="chrome-devtools-plugin") | .status' "OK"
+
+  # 2. exclude pattern in entries hides excluded plugin -> firebase FAIL
+  cat <<'EOF' > "$tmp_repo/.agents/plugins.json"
+{
+  "entries": [
+    { "path": "vendor/team-plugins", "exclude": ["firebase"] }
+  ]
+}
+EOF
+  set +e
+  local excl_json
+  excl_json=$(TYPESAFE_API_KEY="test_key" \
+              HARNESS_CONFIG_DIR="$mock_cfg" \
+              HARNESS_GH_BIN="$mock_bin_dir/gh" \
+              "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$tmp_repo" --json)
+  local rc_excl=$?
+  set -e
+  assert_eq "1" "$rc_excl" "Excluded plugin in entries must fail doctor check"
+  assert_json_field "$excl_json" '.checks[] | select(.name=="firebase") | .status' "FAIL"
+  assert_json_field "$excl_json" '.checks[] | select(.name=="postman") | .status' "OK"
+}
+
 run_tests "test_"
