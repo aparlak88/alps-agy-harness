@@ -1364,6 +1364,13 @@ EOF
   assert_eq "DO_NOT_OVERWRITE" "$(cat "$outside_target")" "Atomic report write must not follow symlink target"
   [ ! -L "$state_dir/tdd-review.md" ] || { echo "Report symlink should be atomically replaced" >&2; return 1; }
 
+  # Narrow --target review must not auto-stamp the entire branch
+  rm -f "$state_dir/tdd-pass.json"
+  local out_narrow_auto
+  out_narrow_auto=$(HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd --target "README.md" --auto-stamp)
+  assert_json_field "$out_narrow_auto" ".stamped" "false" "Narrow --target review must not auto-stamp full branch"
+  [ ! -f "$state_dir/tdd-pass.json" ] || { echo "Narrow --target review must not write tdd-pass.json" >&2; return 1; }
+
   # 12. C4 & C5: dotfile/dot-dir exemptions & deletion-only code branch still requires TDD stamp
   local dot_chk
   dot_chk=$(python3 -B -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import harness_core; req, files = harness_core.requires_tdd_stamp(harness_core.Path("."), [".gitignore", ".harness-ignore", ".impeccable/cfg.json", ".superpowers/s.json", ".harness/state/x.json", "./docs/a.md", "./.github/workflows/ci.yml"]); print(json.dumps({"req": req, "files": files}))' "$REPO_ROOT/scripts/lib")

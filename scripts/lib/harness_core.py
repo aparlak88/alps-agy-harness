@@ -4120,9 +4120,14 @@ def run_external_review(
         "timestamp": utc_now_iso(),
     }
 
+    _, branch_code_files = requires_tdd_stamp(workspace)
+    norm_targets = {_normalize_rel_path(t) for t in (targets or []) if _normalize_rel_path(t)}
+    covers_branch = (not norm_targets) or all(cf in norm_targets for cf in branch_code_files)
+
     if (
         auto_stamp
         and kind == "tdd"
+        and covers_branch
         and not stale_during_review
         and verdict_val == "PASS"
         and crit_gaps == 0
