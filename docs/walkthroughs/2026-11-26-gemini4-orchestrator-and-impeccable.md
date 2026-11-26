@@ -93,7 +93,7 @@ sequenceDiagram
 
 ## 3. Dosya Bazlı Değişiklik Analizi
 
-`git diff --name-status origin/main..HEAD` çıktısındaki tüm 30 dosya aşağıda eksiksiz olarak analiz edilmiştir:
+`git diff --name-status origin/main..HEAD` çıktısındaki (bu mühendislik rehberi hariç) tüm 30 dosya aşağıda eksiksiz olarak analiz edilmiştir:
 
 ### `README.md` — GÜNCELLENDİ (`Documentation Layer`)
 - **Ne Değişti / Ne Üretildi?:** Belge başlığı ile `§1 Neden "Engineering Harness"?`, `§3 Ön Gereksinimler`, `§7 Yaşam Döngüsü / Swarm`, `§8 Bileşenler Özeti` ve `## Teknik Terimler Sözlüğü` bölümleri güncellendi. Yeni iki fazlı `Orchestrator (Neon / Carbon)` Planner/Executor ayrımı, `2026-11-30` tarihinde emekliye ayrılacak modeller (`Argon`, `3.8 Flash`, `GPT-OSS`, `Claude 4.6`), `Extra` (`xhigh`) efor eşlemesi, `invoke_subagent|swarm|run_workflow` matcher genişlemesi ve koşullu `impeccable` UI kapısı (`.impeccable/` ile `DO_NOT_TRACK=1`) dokümana işlendi; sözlüğe `Orchestrator (Two-Phase Planner/Executor)` ve `run_workflow` maddeleri eklendi.
@@ -186,7 +186,7 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** PR inceleme becerisinin dokümantasyonunu `pre-subagent-guard.sh` çalışma zamanı zorlamasıyla birebir eşleştirmek için güncellendi.
 
 ### `tests/test-command-hooks.sh` — GÜNCELLENDİ (`Test Suite Layer`)
-- **Ne Değişti / Ne Üretildi?:** `test_conditional_ui_pr_and_local_merge_gates_and_live_mode_guard` testi eklenerek saf backend vs UI+impeccable PR/yerel merge kapısı blokajı/açılışı, sahte detector `exit 2` reddi ve `impeccable live` komutunun `DO_NOT_TRACK=1 IMPECCABLE_LIVE_COPY_AGENT=chat|off` olmadan engellenmesi doğrulandı.
+- **Ne Değişti / Ne Üretildi?:** `test_conditional_ui_pr_and_local_merge_gates_and_live_mode_guard` testi eklenerek UI+Impeccable yokken/varken `gh pr create` davranışı, eksik veya boş `scannedWebFiles` içeren `ui-pass.json` ile yerel `git merge` engellemesi, temiz damga sonrası `git merge` izni ve `impeccable live` komutunun (`npx -p`, `npm exec`, `pnpm dlx`, `unset`, `env -u`, `env -i` dahil) `DO_NOT_TRACK=1 IMPECCABLE_LIVE_COPY_AGENT=chat|off` olmadan engellenmesi doğrulandı (saf backend atlama ve `exit 2` detector reddi `tests/test-stamp-and-common.sh` içindedir).
 - **Neden Değişti / Neden Üretildi?:** Komut seviyesindeki UI kapısı ve gizlilik/ajan kalkanının regresyona karşı otomatik kanıtlanması için eklendi.
 
 ### `tests/test-edit-and-session-hooks.sh` — GÜNCELLENDİ (`Test Suite Layer`)
@@ -250,7 +250,7 @@ sequenceDiagram
 ### Çalıştırılan Komutlar ve Çıktı Özetleri
 - **Tam Birim ve Entegrasyon Paketi:**
   - Komut: `./scripts/run-quiet.sh full-tests -- bash tests/run-all.sh`
-  - Gerçek Çıktı Özeti: `✅ PASS [full-tests] (süre: 225.0s, warnings: 0 — log: .harness/logs/last.log)` — 9 paket, 97 testin tamamı geçti (`0 failed`).
+  - Gerçek Çıktı Özeti: `✅ PASS [full-tests] (süre: 211.6s, warnings: 0 — log: .harness/logs/last.log)` — 9 paket, 97 testin tamamı geçti (`0 failed`).
 - **Sözleşme ve Boyut Kontrolleri:**
   - `wc -c rules/AGENTS.md` -> `7624` bayt (`< 8192`).
   - Çekirdek eklenti dosya sayısı -> `53`.

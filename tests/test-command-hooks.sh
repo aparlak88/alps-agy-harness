@@ -1257,6 +1257,19 @@ EOF
   assert_json_field "$out_pr_allow" ".decision" "allow" "gh pr create must allow after ui-pass.json stamp"
 
   git -C "$repo" checkout main --quiet
+  # Incomplete scannedWebFiles must be caught even on main checkout where Card.tsx only exists on target branch
+  local ui_stamp_file ui_stamp_tmp out_merge_incomplete
+  ui_stamp_file="$repo/.harness/state/feat-ui-card/ui-pass.json"
+  ui_stamp_tmp=$(jq -c '.scannedWebFiles = []' "$ui_stamp_file")
+  printf '%s\n' "$ui_stamp_tmp" > "$ui_stamp_file"
+  out_merge_incomplete=$(printf '%s' "$p_merge" | HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_incomplete" ".decision" "deny" "Local merge into main must deny incomplete scannedWebFiles on newly added target-branch UI file"
+  assert_contains "$(printf '%s' "$out_merge_incomplete" | jq -r '.reason')" "scannedWebFiles"
+
+  git -C "$repo" checkout feat/ui-card --quiet
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0
+  git -C "$repo" checkout main --quiet
   out_merge_allow=$(printf '%s' "$p_merge" | HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" "$PRE_COMMAND_GUARD")
   assert_json_field "$out_merge_allow" ".decision" "allow" "Local merge into main must allow after ui-pass.json stamp"
 

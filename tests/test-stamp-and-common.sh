@@ -1018,6 +1018,12 @@ EOF
     echo "Non-executable .agent/skills/impeccable/scripts/impeccable must not be executed via /bin/sh" >&2
     return 1
   fi
+
+  # 9. Angular .component.ts files classify as webFiles (not nativeFiles)
+  local comp_cls
+  comp_cls=$(python3 -B -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(json.dumps(harness_core.classify_ui_files(["src/app/hero.component.ts"])))' "$REPO_ROOT/scripts/lib")
+  assert_json_field "$comp_cls" ".webFiles[0]" "src/app/hero.component.ts" ".component.ts classifies into webFiles"
+  assert_eq "0" "$(printf '%s\n' "$comp_cls" | jq '.nativeFiles | length')" ".component.ts must not fall into nativeFiles"
 }
 
 run_tests "$@"

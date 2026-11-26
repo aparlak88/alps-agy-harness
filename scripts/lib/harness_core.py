@@ -59,7 +59,7 @@ AUDITOR_BASENAMES = frozenset(("canon-auditor.md", "security-reviewer.md", "pr-a
 PBXPROJ_BUNDLE_RE = re.compile(r"PRODUCT_BUNDLE_IDENTIFIER\s*=\s*\"?([^;\n\"]+)\"?\s*;")
 
 WEB_UI_EXTENSIONS = frozenset(
-    (".html", ".htm", ".tsx", ".jsx", ".vue", ".svelte", ".astro", ".css", ".scss", ".sass", ".less")
+    (".html", ".htm", ".tsx", ".jsx", ".vue", ".svelte", ".astro", ".css", ".scss", ".sass", ".less", ".component.ts")
 )
 WEB_CONFIG_FILENAMES = frozenset(
     (
@@ -1232,7 +1232,8 @@ def verify_pr_stamps(
                 f"Error: verify-pr-stamps failed: ui-pass.json codeTreeSha ({ui_sha}) does not match current HEAD codeTreeSha ({current_sha})",
             )
         req_web = [f for f in ui_info_chk["webFiles"] if (workspace / f).is_file()]
-        scanned_web = {str(p) for p in (ui_data.get("scannedWebFiles") or []) if isinstance(p, str)}
+        raw_scanned = ui_data.get("scannedWebFiles")
+        scanned_web = {str(p) for p in raw_scanned if isinstance(p, str)} if isinstance(raw_scanned, list) else set()
         missing_web = [f for f in req_web if f not in scanned_web]
         if missing_web:
             return (
@@ -1747,7 +1748,7 @@ def evaluate_pre_command(
     doc_cache: Optional[dict[str, Any]] = None,
     worktree_cache_getter: Optional[Callable[[Path], dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    """Evaluate all 4 PreToolUse command gates deterministically across worktree contexts."""
+    """Evaluate all 5 PreToolUse command gates deterministically across worktree contexts."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
 
@@ -2015,9 +2016,16 @@ def evaluate_pre_command(
                                     "decision": "deny",
                                     "reason": f"Local merge ui-pass.json for '{target_branch}' does not match target branch codeTreeSha ({target_tree_sha}) or has non-PASS/non-zero findings",
                                 }
-                            content_root = wt_for_branch or seg_ws
-                            req_web = [f for f in seg_ui_info["webFiles"] if (content_root / f).is_file()]
-                            scanned_web = {str(p) for p in (ui_data.get("scannedWebFiles") or []) if isinstance(p, str)}
+                            if wt_for_branch is not None:
+                                req_web = [f for f in seg_ui_info["webFiles"] if (wt_for_branch / f).is_file()]
+                            else:
+                                req_web = [
+                                    f
+                                    for f in seg_ui_info["webFiles"]
+                                    if _run_git(seg_ws, ["cat-file", "-e", f"{target_branch}:{f}"]).returncode == 0
+                                ]
+                            raw_scanned = ui_data.get("scannedWebFiles")
+                            scanned_web = {str(p) for p in raw_scanned if isinstance(p, str)} if isinstance(raw_scanned, list) else set()
                             missing_web = [f for f in req_web if f not in scanned_web]
                             if missing_web:
                                 return {
@@ -2866,7 +2874,6 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
         }
 
     os_aliases: set[str] = {"os"}
-    asyncio_aliases: set[str] = {"asyncio"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -2881,8 +2888,6 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
                     }
                 if root == "os":
                     os_aliases.add(alias.asname or root)
-                elif root == "asyncio":
-                    asyncio_aliases.add(alias.asname or root)
         elif isinstance(node, ast.ImportFrom):
             mod = node.module or ""
             root = mod.split(".", 1)[0]
@@ -3276,7 +3281,6 @@ def classify_ui_files(file_paths: list[str]) -> dict[str, Any]:
             web_files.add(norm)
         elif (
             lower.endswith(".xaml")
-            or lower.endswith(".component.ts")
             or (
                 lower.endswith(".swift")
                 and (

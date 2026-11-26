@@ -7,7 +7,7 @@ description: "PR açılışı öncesi son doğrulama orkestratörü: sessiz derl
 
 Bu skill, bir geliştirme dalında tüm görevler tamamlandığında ve PR açılmadan hemen önce (`finishing-a-development-branch` aşamasında) çalıştırılan zorunlu kontrol merkezidir.
 
-`pre-command-guard.sh` içindeki 5 maddelik sert PR açma kapısının (dosya bazlı tam walkthrough kapsama kontrolü dahil) sorunsuz geçilmesini sağlar.
+sert PR açma kapısının (koşullu UI damgası ve dosya bazlı tam walkthrough kapsama kontrolü dahil) sorunsuz geçilmesini sağlar.
 
 ---
 

@@ -17,7 +17,7 @@
 
 ## Karmaşıklık Bütçesi ve Kapsam (`allowedFiles` & `Out-of-Scope`)
 
-- **Dosya Bütçesi:** `0` yeni çekirdek dosya; `16` güncellenen mevcut dosya + `3` yaşam döngüsü dokümanı (`Spec`, `Plan`, `Walkthrough`).
+- **Dosya Bütçesi:** `0` yeni çekirdek dosya; `18` güncellenen mevcut dosya + `3` yaşam döngüsü dokümanı (`Spec`, `Plan`, `Walkthrough`).
 - **`allowedFiles`:**
   - `README.md`
   - `hooks.json`
