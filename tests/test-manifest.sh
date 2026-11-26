@@ -26,7 +26,7 @@ test_hooks_json_root_wiring() {
   [ -f "$REPO_ROOT/hooks.json" ] || { echo "hooks.json does not exist" >&2; return 1; }
   jq -e '
     .["alps-agy-harness"].SessionStart[0].command == "./scripts/hooks/session-start.sh" and
-    (.["alps-agy-harness"].PreToolUse | map(.matcher) == ["write_file|edit_file","run_command","invoke_subagent|swarm"]) and
+    (.["alps-agy-harness"].PreToolUse | map(.matcher) == ["write_file|edit_file","run_command","invoke_subagent|swarm|run_workflow"]) and
     .["alps-agy-harness"].PostToolUse[0].matcher == "run_command" and
     .["alps-agy-harness"].Stop[0].command == "./scripts/hooks/stop-gate.sh"
   ' "$REPO_ROOT/hooks.json" >/dev/null

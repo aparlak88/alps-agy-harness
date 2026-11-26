@@ -476,17 +476,23 @@ cmd_select_model() {
     effort="$explicit_effort"
   fi
 
-  local family model
+  local family model effort_hint deprecated_flag="false"
   family="$(harness_classify_parent_model "$parent_model")"
   model="$(harness_resolve_subagent_model "$parent_model" "$tier" "$caller_model" "false")"
+  effort_hint="$(harness_detect_parent_effort_hint "$parent_model")"
+  if harness_is_deprecated_model "$parent_model"; then
+    deprecated_flag="true"
+  fi
 
   jq -nc \
     --arg tier "$tier" \
     --arg parentModel "$parent_model" \
     --arg parentFamily "$family" \
+    --arg parentEffortHint "$effort_hint" \
+    --argjson deprecated "$deprecated_flag" \
     --arg model "$model" \
     --arg effort "$effort" \
-    '{tier: $tier, parentModel: $parentModel, parentFamily: $parentFamily, model: $model, effortProfile: $effort}'
+    '{tier: $tier, parentModel: $parentModel, parentFamily: $parentFamily, parentEffortHint: $parentEffortHint, deprecated: $deprecated, model: $model, effortProfile: $effort}'
 }
 
 cmd_verify_pr_stamps() {

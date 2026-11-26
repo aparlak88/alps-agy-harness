@@ -89,6 +89,9 @@ test_agents_md_no_frontmatter_and_under_8kb() {
   assert_contains "$content" "impeccable" "AGENTS.md must document conditional Impeccable UI gate"
   assert_contains "$content" "ui-pass.json" "AGENTS.md must document ui-pass.json stamp"
   assert_contains "$content" "stamp-gate.sh ui" "AGENTS.md must document stamp-gate.sh ui command"
+  assert_contains "$content" "exit_plan_mode" "AGENTS.md must document two-phase Orchestrator exit_plan_mode handoff"
+  assert_contains "$content" "run_workflow" "AGENTS.md must document run_workflow guard and model tiers"
+  assert_contains "$content" "2026-11-30" "AGENTS.md must document 2026-11-30 model deprecation window"
 }
 
 assert_platform_rule_contract() {

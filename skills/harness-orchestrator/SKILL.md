@@ -54,7 +54,7 @@ Kodlama aşamasına geçmeden önce `main` dalında doğrudan kod yazımı `pre-
 
 ## 4. Hibrit `jev` ve Gemini 4 / `Orchestrator` Duyarlı Alt Ajan Yönlendirme
 
-Antigravity'nin `invoke_subagent` aracı yalnızca `inherit | flash_lite | flash | pro` katmanlarını kabul eder (`pro` = **Gemini 4 Argon**, `flash` = **Gemini 3.8 Flash**, `inherit` = ana oturumun aktif **Carbon / Neon / Argon / Hydrogen / `Orchestrator` / Claude / custom** modeli; diğer `Gemini 4` adları varsayılan olarak `Argon` / `Argon-Low` sınıfına eşlenir).
+Antigravity'nin `invoke_subagent` ve `run_workflow` (`agent(model=...)`) araçları yalnızca `inherit | flash_lite | flash | pro` katmanlarını kabul eder (`pro` = frontier Gemini 4 katmanı, `flash` = hızlı yürütme katmanı, `inherit` = ana oturumun aktif modeli). **Not:** `Gemini 4 Argon`, `Gemini 3.8 Flash`, `GPT-OSS-120b` ve `Claude 4.6` modelleri **30 Kasım 2026**'da emekliye ayrılır (`SessionStart` uyarısı verilir).
 
 Her dinamik `invoke_subagent` çağrısından önce, işin karmaşıklığına göre `stamp-gate.sh dispatch` çalıştırarak yönlendirme kararını kaydedin:
 
@@ -68,11 +68,20 @@ Her dinamik `invoke_subagent` çağrısından önce, işin karmaşıklığına g
 
 Ana Oturum (`HOOK_INPUT.modelName`) Duyarlı Katman Eşlemesi:
 - **`trivial_lookup` (`LOW`):** Tüm ana oturumlarda `flash_lite`.
-- **`bounded_execution` (`MEDIUM` / `XHIGH`):** `Orchestrator`, **Gemini 4 Hydrogen** ve `Argon (Low)` (veya `Neon Low`) oturumlarında `inherit` (kodlayıcılar eski 3.8 Flash'a düşmez); **Gemini 4 Carbon**, **Neon**, `Argon (Med/High)`, genel `Gemini 4`, Claude ve `custom` oturumlarında `pro` (**Gemini 4 Argon**); `3.8 Flash` ve `unset` oturumlarında `flash`.
-- **`multi_module_integration` (`HIGH`, `canon-auditor` tabanı):** `Orchestrator`, `Argon (Med/High)`, genel `Gemini 4`, Claude ve `custom` oturumlarında `inherit`; `Carbon` ve `Neon` oturumlarında varsayılan `pro` (**Argon**; açık `Model: "inherit"` verilirse Carbon/Neon korunur); `Hydrogen`, `Argon (Low)` ve `3.8 Flash` oturumlarında `pro` (**Argon**'a yükseltilir).
-- **`critical_architecture_or_audit` (`MAX`, `security-reviewer` ve `pr-auditor`):** `Carbon`, `Neon`, `Orchestrator`, `Argon (Med/High)`, genel `Gemini 4`, Claude ve `custom` oturumlarında `inherit` (üst seviye model asla Argon Medium'a düşürülmez); `Hydrogen`, `Argon (Low)` ve `3.8 Flash` oturumlarında `pro` (**Argon**'a yükseltilir).
+- **`bounded_execution` (`MEDIUM` / `XHIGH`):** `Orchestrator` (`Neon`/`Carbon`), **Gemini 4 Hydrogen**, `Claude Sonnet 5.5` ve `frontier_low` (`Neon/Carbon/Opus Low`) oturumlarında `inherit`; **Gemini 4 Neon**, **Gemini 4 Carbon**, `Claude Opus 5.5` ve `custom` oturumlarında `pro`; eski `3.8 Flash` ve `unset` oturumlarında `flash`.
+- **`multi_module_integration` (`HIGH`, `canon-auditor` tabanı):** `Orchestrator`, **Gemini 4 Hydrogen**, `Claude Sonnet 5.5`, `frontier_low` ve `Flash` oturumlarında `pro` (yürütme turundaki Executor'ın miras alınmasını önler); `Neon` ve `Carbon` oturumlarında varsayılan `pro` (açık `Model: "inherit"` verilirse korunur); `Claude Opus 5.5` ve `custom` oturumlarında `inherit`.
+- **`critical_architecture_or_audit` (`MAX`, `security-reviewer` ve `pr-auditor`):** `Neon`, `Carbon`, `Claude Opus 5.5` ve `custom` oturumlarında `inherit` (tekil frontier oturumlarda düşürülmez; `Neon/Hydrogen (Extra)` için `pr-auditor` varsayılan eforu `XHIGH` olur); **`Orchestrator`**, `Hydrogen`, `Claude Sonnet 5.5`, `frontier_low` ve `Flash` oturumlarında `pro` (Executor turundaki denetimler frontier `pro` katmanına kilitlenir).
 
 `pre-subagent-guard.sh` hook'u canlı `HOOK_INPUT.modelName` alanını ve dispatch kaydını okur, kaydı tek seferlik tüketir (`consumed: true`) ve Antigravity'nin yerel `overwrite` yeteneğiyle alt ajanın modelini ve `[EFFORT_PROFILE: ...]` başlığını fiziksel olarak kilitler.
+
+---
+
+## 9. İki Fazlı `Orchestrator` (`Planner ↔ Executor`) ve `run_workflow` Modu
+
+- **İki Fazlı `Orchestrator` (`Neon`/`Carbon`/`Opus 5.5` Planner ↔ `Hydrogen`/`Sonnet 5.5` Executor):**
+  1. **Planner Fazı (Salt-Okunur):** `jev_classify`, kod tabanı keşfi, `jev_check` (`ADR`), `context7` doküman sorguları ve `ask_question` kararlarını tamamlayıp `Re-plan if:` tetikleyicileriyle `exit_plan_mode` üzerinden yürütmeye devredin.
+  2. **Executor Fazı:** İzole `feat/*` dalı/worktree açıp Spec/Plan/kod yazın, `stamp-gate.sh` ve `run-quiet.sh` doğrulamalarını çalıştırın; başarısız doğrulama veya plan dışı karar gereksiniminde `enter_plan_mode` ile Planner'a dönün.
+- **`run_workflow` Koruması:** `hooks.json` (`invoke_subagent|swarm|run_workflow`) dinamik Python iş akışı betiklerinde doğrudan `subprocess`/`os.system` kabuk atlatmalarını, gömülü gizli anahtarları ve geçersiz `agent(model=...)` katmanlarını fiziksel olarak reddeder.
 
 ---
 

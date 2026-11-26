@@ -375,8 +375,56 @@ _harness_is_low_model_variant() {
   [[ "$norm" == *-low ]] || [[ "$norm" == *"(low)"* ]] || [[ "$norm" == *" low"* ]]
 }
 
+# Return 0 when normalized model name indicates an Extra / XHigh reasoning tier variant.
+_harness_is_extra_effort_model() {
+  local norm="${1:-}"
+  [[ "$norm" == *-xhigh ]] || [[ "$norm" == *-extra ]] || [[ "$norm" == *"(xhigh)"* ]] || [[ "$norm" == *" xhigh"* ]] || [[ "$norm" == *"(extra)"* ]] || [[ "$norm" == *" extra"* ]]
+}
+
+# Extract parent session reasoning effort hint (LOW | MEDIUM | HIGH | XHIGH | "") from modelName.
+harness_detect_parent_effort_hint() {
+  local raw="${1:-}"
+  local norm
+  norm="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  if [ -z "$norm" ]; then
+    printf '\n'
+    return 0
+  fi
+  if _harness_is_extra_effort_model "$norm"; then
+    printf 'XHIGH\n'
+  elif [[ "$norm" == *-high ]] || [[ "$norm" == *"(high)"* ]] || [[ "$norm" == *" high"* ]]; then
+    printf 'HIGH\n'
+  elif [[ "$norm" == *-medium ]] || [[ "$norm" == *"(medium)"* ]] || [[ "$norm" == *" medium"* ]]; then
+    printf 'MEDIUM\n'
+  elif _harness_is_low_model_variant "$norm"; then
+    printf 'LOW\n'
+  else
+    printf '\n'
+  fi
+}
+
+# Return 0 if modelName matches a model retiring on 2026-11-30, 1 otherwise.
+harness_is_deprecated_model() {
+  local raw="${1:-}"
+  local norm
+  norm="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  [ -n "$norm" ] || return 1
+  case "$norm" in
+    *argon*|*3.8-flash*|*"3.8 flash"*|*gpt-oss*)
+      return 0
+      ;;
+    *claude*|*sonnet*|*opus*)
+      case "$norm" in
+        *4-6*|*4.6*) return 0 ;;
+      esac
+      ;;
+  esac
+  return 1
+}
+
 # Classify a parent session modelName (slug or display label) into a canonical routing family:
-#   unset | orchestrator | carbon | neon | argon_low | argon | hydrogen | claude | flash | custom
+#   unset | orchestrator_neon | orchestrator_carbon | orchestrator_argon | orchestrator |
+#   neon | carbon | argon | frontier_low | hydrogen | claude_opus | claude_sonnet | flash | custom
 harness_classify_parent_model() {
   local raw="${1:-}"
   case "$raw" in
@@ -387,26 +435,38 @@ harness_classify_parent_model() {
       ;;
   esac
 
-  local norm
+  local norm trimmed
   norm="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]')"
+  trimmed="$(printf '%s' "$norm" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+  if [[ "$norm" == *orchestrator* ]] || [ "$trimmed" = "auto" ]; then
+    case "$norm" in
+      *neon*) printf 'orchestrator_neon\n' ;;
+      *argon*) printf 'orchestrator_argon\n' ;;
+      *carbon*) printf 'orchestrator_carbon\n' ;;
+      *) printf 'orchestrator\n' ;;
+    esac
+    return 0
+  fi
 
   case "$norm" in
-    *orchestrator*|auto)
-      printf 'orchestrator\n'
-      ;;
-    *carbon*)
-      printf 'carbon\n'
-      ;;
     *neon*)
       if _harness_is_low_model_variant "$norm"; then
-        printf 'argon_low\n'
+        printf 'frontier_low\n'
       else
         printf 'neon\n'
       fi
       ;;
+    *carbon*)
+      if _harness_is_low_model_variant "$norm"; then
+        printf 'frontier_low\n'
+      else
+        printf 'carbon\n'
+      fi
+      ;;
     *argon*)
       if _harness_is_low_model_variant "$norm"; then
-        printf 'argon_low\n'
+        printf 'frontier_low\n'
       else
         printf 'argon\n'
       fi
@@ -414,17 +474,24 @@ harness_classify_parent_model() {
     *hydrogen*)
       printf 'hydrogen\n'
       ;;
-    *claude*|*opus*|*sonnet*)
-      printf 'claude\n'
+    *sonnet*)
+      printf 'claude_sonnet\n'
+      ;;
+    *opus*|*claude*)
+      if _harness_is_low_model_variant "$norm"; then
+        printf 'frontier_low\n'
+      else
+        printf 'claude_opus\n'
+      fi
       ;;
     *flash*|*gpt-oss*)
       printf 'flash\n'
       ;;
     *gemini-4*|*"gemini 4"*)
       if _harness_is_low_model_variant "$norm"; then
-        printf 'argon_low\n'
+        printf 'frontier_low\n'
       else
-        printf 'argon\n'
+        printf 'neon\n'
       fi
       ;;
     *)
@@ -468,10 +535,10 @@ harness_resolve_subagent_model() {
       ;;
     bounded_execution)
       case "$family" in
-        orchestrator|hydrogen|argon_low)
+        orchestrator|orchestrator_neon|orchestrator_carbon|orchestrator_argon|hydrogen|frontier_low|claude_sonnet)
           printf 'inherit\n'
           ;;
-        carbon|neon|argon|claude|custom)
+        neon|carbon|argon|claude_opus|custom)
           printf 'pro\n'
           ;;
         *)
@@ -481,17 +548,20 @@ harness_resolve_subagent_model() {
       ;;
     multi_module_integration)
       case "$family" in
-        orchestrator|argon|claude|custom)
-          printf 'inherit\n'
+        orchestrator|orchestrator_neon|orchestrator_carbon|orchestrator_argon)
+          printf 'pro\n'
           ;;
-        carbon|neon)
+        neon|carbon)
           if [ "$caller_model" = "inherit" ]; then
             printf 'inherit\n'
           else
             printf 'pro\n'
           fi
           ;;
-        argon_low|hydrogen|flash)
+        argon|claude_opus|custom)
+          printf 'inherit\n'
+          ;;
+        frontier_low|hydrogen|claude_sonnet|flash)
           printf 'pro\n'
           ;;
         unset)
@@ -505,7 +575,7 @@ harness_resolve_subagent_model() {
       ;;
     critical_architecture_or_audit)
       case "$family" in
-        orchestrator|carbon|neon|argon|claude|custom)
+        neon|carbon|argon|claude_opus|custom)
           printf 'inherit\n'
           ;;
         *)

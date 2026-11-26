@@ -244,47 +244,73 @@ test_gemini4_and_orchestrator_parent_model_classification_and_selector() {
   assert_eq "orchestrator" "$(harness_classify_parent_model "gemini-pro-orchestrator")" "Orchestrator slug -> orchestrator"
   assert_eq "orchestrator" "$(harness_classify_parent_model "Orchestrator")" "Orchestrator display -> orchestrator"
   assert_eq "orchestrator" "$(harness_classify_parent_model "auto")" "auto -> orchestrator"
+  assert_eq "orchestrator_neon" "$(harness_classify_parent_model "gemini-pro-orchestrator-neon")" "Orchestrator Neon slug -> orchestrator_neon"
+  assert_eq "orchestrator_neon" "$(harness_classify_parent_model "Orchestrator (Neon)")" "Orchestrator Neon display -> orchestrator_neon"
+  assert_eq "orchestrator_carbon" "$(harness_classify_parent_model "Orchestrator (Carbon)")" "Orchestrator Carbon display -> orchestrator_carbon"
+  assert_eq "orchestrator_argon" "$(harness_classify_parent_model "Orchestrator (Argon)")" "Orchestrator Argon display -> orchestrator_argon"
   assert_eq "argon" "$(harness_classify_parent_model "gemini-4-argon-high")" "Argon High -> argon"
   assert_eq "argon" "$(harness_classify_parent_model "Gemini 4 Argon (Medium)")" "Argon Medium -> argon"
-  assert_eq "argon_low" "$(harness_classify_parent_model "gemini-4-argon-low")" "Argon Low slug -> argon_low"
-  assert_eq "argon_low" "$(harness_classify_parent_model "Gemini 4 Argon (Low)")" "Argon Low display -> argon_low"
+  assert_eq "frontier_low" "$(harness_classify_parent_model "gemini-4-argon-low")" "Argon Low slug -> frontier_low"
+  assert_eq "frontier_low" "$(harness_classify_parent_model "Gemini 4 Argon (Low)")" "Argon Low display -> frontier_low"
   assert_eq "hydrogen" "$(harness_classify_parent_model "gemini-4-hydrogen-xhigh")" "Hydrogen XHigh -> hydrogen"
-  assert_eq "claude" "$(harness_classify_parent_model "claude-opus-5-5-high")" "Claude Opus -> claude"
+  assert_eq "claude_opus" "$(harness_classify_parent_model "claude-opus-5-5-high")" "Claude Opus -> claude_opus"
+  assert_eq "claude_sonnet" "$(harness_classify_parent_model "Claude Sonnet 5.5")" "Claude Sonnet -> claude_sonnet"
   assert_eq "flash" "$(harness_classify_parent_model "gemini-3.8-flash-low")" "Gemini 3.8 Flash -> flash"
   assert_eq "flash" "$(harness_classify_parent_model "gpt-oss-120b-medium")" "GPT-OSS -> flash"
   assert_eq "custom" "$(harness_classify_parent_model "enterprise-tuned-v1")" "Unknown non-empty -> custom"
+
+  assert_eq "XHIGH" "$(harness_detect_parent_effort_hint "Gemini 4 Neon (Extra)")" "Extra effort label -> XHIGH"
+  assert_eq "XHIGH" "$(harness_detect_parent_effort_hint "gemini-4-hydrogen-xhigh")" "xhigh effort slug -> XHIGH"
+  assert_eq "LOW" "$(harness_detect_parent_effort_hint "Gemini 4 Carbon (Low)")" "Low effort label -> LOW"
+  assert_eq "HIGH" "$(harness_detect_parent_effort_hint "gemini-4-neon-high")" "High effort label -> HIGH"
+  assert_eq "" "$(harness_detect_parent_effort_hint "gemini-4-pro")" "Unmarked model -> empty effort hint"
+
+  harness_is_deprecated_model "gemini-4-argon-high" || { echo "Argon should be deprecated" >&2; return 1; }
+  harness_is_deprecated_model "Orchestrator (Argon)" || { echo "Orchestrator (Argon) should be deprecated" >&2; return 1; }
+  harness_is_deprecated_model "Claude Sonnet 4.6" || { echo "Claude 4.6 should be deprecated" >&2; return 1; }
+  if harness_is_deprecated_model "Gemini 4 Neon (High)"; then echo "Neon should not be deprecated" >&2; return 1; fi
+  if harness_is_deprecated_model "Orchestrator (Neon)"; then echo "Orchestrator (Neon) should not be deprecated" >&2; return 1; fi
 
   local repo state_dir
   repo=$(make_temp_repo)
   state_dir=$(harness_state_dir "$repo")
 
-  # Verify select-model CLI subcommand across Carbon, Orchestrator, Hydrogen, Argon, and Flash
-  local sel_carbon_bounded sel_carbon_crit sel_carbon_multi_default sel_carbon_multi_inherit sel_orch_bounded sel_hyd_bounded sel_hyd_crit sel_flash_multi
+  # Verify select-model CLI subcommand across Carbon, Orchestrator, Hydrogen, Argon, Neon Extra, Claude, and Flash
+  local sel_carbon_bounded sel_carbon_crit sel_carbon_multi_default sel_carbon_multi_inherit sel_orch_bounded sel_orch_crit sel_hyd_bounded sel_hyd_crit sel_flash_multi sel_neon_extra
   sel_carbon_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-carbon-high" --workspace "$repo")
-  assert_json_field "$sel_carbon_bounded" ".model" "pro" "Carbon bounded_execution steps down to pro (Argon)"
+  assert_json_field "$sel_carbon_bounded" ".model" "pro" "Carbon bounded_execution steps down to pro"
   assert_json_field "$sel_carbon_bounded" ".parentFamily" "carbon" "Carbon family reported"
+  assert_json_field "$sel_carbon_bounded" ".deprecated" "false" "Carbon is not deprecated"
 
   sel_carbon_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "gemini-4-carbon-high" --workspace "$repo")
   assert_json_field "$sel_carbon_crit" ".model" "inherit" "Carbon critical audit stays on inherit (Carbon)"
 
   sel_carbon_multi_default=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-4-carbon-medium" --workspace "$repo")
-  assert_json_field "$sel_carbon_multi_default" ".model" "pro" "Carbon multi_module defaults to pro (Argon)"
+  assert_json_field "$sel_carbon_multi_default" ".model" "pro" "Carbon multi_module defaults to pro"
 
   sel_carbon_multi_inherit=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-4-carbon-medium" --caller-model "inherit" --workspace "$repo")
   assert_json_field "$sel_carbon_multi_inherit" ".model" "inherit" "Carbon multi_module preserves explicit inherit"
 
-  sel_orch_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-pro-orchestrator" --workspace "$repo")
+  sel_orch_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-pro-orchestrator-neon" --workspace "$repo")
+  assert_json_field "$sel_orch_bounded" ".parentFamily" "orchestrator_neon" "Orchestrator Neon family reported"
   assert_json_field "$sel_orch_bounded" ".model" "inherit" "Orchestrator bounded_execution uses inherit (-> Hydrogen)"
+
+  sel_orch_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "Orchestrator (Neon)" --workspace "$repo")
+  assert_json_field "$sel_orch_crit" ".model" "pro" "Orchestrator critical audit escalates to pro"
+
+  sel_neon_extra=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "Gemini 4 Neon (Extra)" --workspace "$repo")
+  assert_json_field "$sel_neon_extra" ".parentEffortHint" "XHIGH" "Extra effort label emits XHIGH parentEffortHint"
 
   sel_hyd_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-hydrogen-xhigh" --effort "XHIGH" --workspace "$repo")
   assert_json_field "$sel_hyd_bounded" ".model" "inherit" "Hydrogen bounded_execution keeps inherit (Hydrogen)"
   assert_json_field "$sel_hyd_bounded" ".effortProfile" "XHIGH" "select-model supports explicit XHIGH effort"
 
   sel_hyd_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "gemini-4-hydrogen-xhigh" --workspace "$repo")
-  assert_json_field "$sel_hyd_crit" ".model" "pro" "Hydrogen critical audit escalates to pro (Argon)"
+  assert_json_field "$sel_hyd_crit" ".model" "pro" "Hydrogen critical audit escalates to pro"
 
   sel_flash_multi=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-3.8-flash-low" --workspace "$repo")
-  assert_json_field "$sel_flash_multi" ".model" "pro" "Flash multi_module escalates to pro (Argon)"
+  assert_json_field "$sel_flash_multi" ".model" "pro" "Flash multi_module escalates to pro"
+  assert_json_field "$sel_flash_multi" ".deprecated" "true" "Gemini 3.8 Flash reports deprecated: true"
 
   # Verify dispatch with --parent-model and --effort XHIGH
   "$STAMP_GATE" dispatch --role "Hydrogen Worker" --type "self" --tier "bounded_execution" --parent-model "gemini-4-hydrogen-xhigh" --effort "XHIGH" --workspace "$repo"
@@ -725,14 +751,20 @@ test_neon_gemini4_and_custom_model_classification_parity() {
   local cases=(
     "gemini-4-neon-high|neon"
     "Gemini 4 Neon (Medium)|neon"
-    "gemini-4-neon-low|argon_low"
-    "Gemini 4 Neon (Low)|argon_low"
-    "gemini-4-neon low|argon_low"
-    "Orchestrator (Neon)|orchestrator"
-    "gemini-4-pro|argon"
-    "Gemini 4 Ultra (High)|argon"
-    "gemini-4-pro-low|argon_low"
-    "Gemini 4 (Low)|argon_low"
+    "Gemini 4 Neon (Extra)|neon"
+    "gemini-4-neon-low|frontier_low"
+    "Gemini 4 Neon (Low)|frontier_low"
+    "gemini-4-neon low|frontier_low"
+    "Gemini 4 Carbon (Low)|frontier_low"
+    "Orchestrator (Neon)|orchestrator_neon"
+    "Orchestrator (Carbon)|orchestrator_carbon"
+    "Orchestrator (Argon)|orchestrator_argon"
+    "gemini-4-pro|neon"
+    "Gemini 4 Ultra (High)|neon"
+    "gemini-4-pro-low|frontier_low"
+    "Gemini 4 (Low)|frontier_low"
+    "Claude Opus 5.5 (Thinking)|claude_opus"
+    "Claude Sonnet 5.5|claude_sonnet"
     "gemini-4-flash|flash"
     "gemini-4-flash-low|flash"
     "enterprise-tuned-v1|custom"
@@ -751,7 +783,7 @@ test_neon_gemini4_and_custom_model_classification_parity() {
   # 2. Bash vs Python resolve_subagent_model parity across all tiers, caller_model, and floor_upgraded
   local py_res='import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.resolve_subagent_model(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "true"))'
   local tier caller floor sh_res py_res_out
-  local m_list=("gemini-4-neon-high" "gemini-4-neon-low" "gemini-4-pro" "gemini-4-flash" "enterprise-tuned-v1" "")
+  local m_list=("gemini-4-neon-high" "gemini-4-neon-low" "Orchestrator (Neon)" "Orchestrator (Carbon)" "Claude Opus 5.5" "Claude Sonnet 5.5" "gemini-4-hydrogen-xhigh" "gemini-4-pro" "gemini-4-flash" "enterprise-tuned-v1" "")
   local t_list=("trivial_lookup" "bounded_execution" "multi_module_integration" "critical_architecture_or_audit")
   for model in "${m_list[@]}"; do
     for tier in "${t_list[@]}"; do
@@ -763,6 +795,20 @@ test_neon_gemini4_and_custom_model_classification_parity() {
         done
       done
     done
+  done
+
+  # 2b. Bash vs Python detect_parent_effort_hint & is_deprecated_parent_model parity
+  local py_eff='import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.detect_parent_effort_hint(sys.argv[2]))'
+  local py_dep='import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print("true" if harness_core.is_deprecated_parent_model(sys.argv[2]) else "false")'
+  local meta_models=("Gemini 4 Neon (Extra)" "gemini-4-hydrogen-xhigh" "Gemini 4 Neon (Low)" "gemini-4-argon-high" "Orchestrator (Argon)" "gemini-3.8-flash-low" "gpt-oss-120b-medium" "Claude 4.6 Sonnet" "Orchestrator (Neon)" "Claude Opus 5.5" "")
+  for model in "${meta_models[@]}"; do
+    local sh_eff py_eff_out sh_dep py_dep_out
+    sh_eff=$(harness_detect_parent_effort_hint "$model")
+    py_eff_out=$(python3 -B -c "$py_eff" "$REPO_ROOT/scripts/lib" "$model")
+    assert_eq "$py_eff_out" "$sh_eff" "Effort hint parity failed for '$model'"
+    if harness_is_deprecated_model "$model"; then sh_dep="true"; else sh_dep="false"; fi
+    py_dep_out=$(python3 -B -c "$py_dep" "$REPO_ROOT/scripts/lib" "$model")
+    assert_eq "$py_dep_out" "$sh_dep" "Deprecation parity failed for '$model'"
   done
 
   # 3. Specific routing contracts via stamp-gate.sh select-model
@@ -791,8 +837,8 @@ test_neon_gemini4_and_custom_model_classification_parity() {
   assert_json_field "$sel_flash_bounded" ".model" "flash" "flash bounded_execution remains flash"
 
   sel_g4_pro_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-pro" --workspace "$repo")
-  assert_json_field "$sel_g4_pro_bounded" ".parentFamily" "argon"
-  assert_json_field "$sel_g4_pro_bounded" ".model" "pro" "unmatched gemini-4-pro classifies as argon and routes bounded_execution -> pro"
+  assert_json_field "$sel_g4_pro_bounded" ".parentFamily" "neon"
+  assert_json_field "$sel_g4_pro_bounded" ".model" "pro" "unmatched gemini-4-pro classifies as neon and routes bounded_execution -> pro"
 }
 
 test_ui_stamp_web_detect_enforcement_and_native_p0_p1_validation() {

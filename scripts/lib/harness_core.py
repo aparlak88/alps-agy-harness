@@ -1239,28 +1239,76 @@ def _is_low_model_variant(norm: str) -> bool:
     return norm.endswith("-low") or "(low)" in norm or " low" in norm
 
 
+def is_extra_effort_model(norm: str) -> bool:
+    """Return True when normalized model name indicates an Extra / XHigh reasoning tier."""
+    return (
+        norm.endswith("-xhigh")
+        or norm.endswith("-extra")
+        or "(xhigh)" in norm
+        or " xhigh" in norm
+        or "(extra)" in norm
+        or " extra" in norm
+    )
+
+
+def detect_parent_effort_hint(raw: str) -> str:
+    """Extract parent reasoning effort hint (LOW|MEDIUM|HIGH|XHIGH|'') from ``modelName``."""
+    norm = (raw or "").strip().lower()
+    if not norm:
+        return ""
+    if is_extra_effort_model(norm):
+        return "XHIGH"
+    if norm.endswith("-high") or "(high)" in norm or " high" in norm:
+        return "HIGH"
+    if norm.endswith("-medium") or "(medium)" in norm or " medium" in norm:
+        return "MEDIUM"
+    if _is_low_model_variant(norm):
+        return "LOW"
+    return ""
+
+
+def is_deprecated_parent_model(raw: str) -> bool:
+    """Return True when ``raw`` identifies a model retiring on 2026-11-30."""
+    norm = (raw or "").strip().lower()
+    if not norm:
+        return False
+    if "argon" in norm or "3.8-flash" in norm or "3.8 flash" in norm or "gpt-oss" in norm:
+        return True
+    if ("claude" in norm or "sonnet" in norm or "opus" in norm) and ("4-6" in norm or "4.6" in norm):
+        return True
+    return False
+
+
 def classify_parent_model(raw: str) -> str:
     """Classify parent modelName into canonical routing family."""
     trimmed = re.sub(r"\s+", "", raw or "")
     if not trimmed:
         return "unset"
     norm = (raw or "").lower()
-    if "orchestrator" in norm or norm == "auto":
+    if "orchestrator" in norm or norm.strip() == "auto":
+        if "neon" in norm:
+            return "orchestrator_neon"
+        if "argon" in norm:
+            return "orchestrator_argon"
+        if "carbon" in norm:
+            return "orchestrator_carbon"
         return "orchestrator"
-    if "carbon" in norm:
-        return "carbon"
     if "neon" in norm:
-        return "argon_low" if _is_low_model_variant(norm) else "neon"
+        return "frontier_low" if _is_low_model_variant(norm) else "neon"
+    if "carbon" in norm:
+        return "frontier_low" if _is_low_model_variant(norm) else "carbon"
     if "argon" in norm:
-        return "argon_low" if _is_low_model_variant(norm) else "argon"
+        return "frontier_low" if _is_low_model_variant(norm) else "argon"
     if "hydrogen" in norm:
         return "hydrogen"
-    if any(tok in norm for tok in ("claude", "opus", "sonnet")):
-        return "claude"
+    if "sonnet" in norm:
+        return "claude_sonnet"
+    if "opus" in norm or "claude" in norm:
+        return "frontier_low" if _is_low_model_variant(norm) else "claude_opus"
     if "flash" in norm or "gpt-oss" in norm:
         return "flash"
     if "gemini-4" in norm or "gemini 4" in norm:
-        return "argon_low" if _is_low_model_variant(norm) else "argon"
+        return "frontier_low" if _is_low_model_variant(norm) else "neon"
     return "custom"
 
 
@@ -2311,6 +2359,16 @@ def default_effort_for_tier(tier: str) -> Optional[str]:
     return TIER_DEFAULT_EFFORT.get(tier)
 
 
+ORCHESTRATOR_FAMILIES = frozenset(
+    ("orchestrator", "orchestrator_neon", "orchestrator_carbon", "orchestrator_argon")
+)
+WORKFLOW_SUBPROCESS_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9_])(?:subprocess\s*\.|os\s*\.\s*(?:system|popen|exec[lv]?p?e?|spawn[lv]?p?e?)\s*\()"
+)
+WORKFLOW_AGENT_MODEL_RE = re.compile(r"\bmodel\s*=\s*(['\"])([^'\"]*)\1")
+VALID_SUBAGENT_MODEL_TIERS = frozenset(("inherit", "flash_lite", "flash", "pro"))
+
+
 def resolve_subagent_model(
     parent_model: str,
     tier: str,
@@ -2322,21 +2380,23 @@ def resolve_subagent_model(
     if tier == "trivial_lookup":
         return "flash_lite"
     if tier == "bounded_execution":
-        if family in ("orchestrator", "hydrogen", "argon_low"):
+        if family in (*ORCHESTRATOR_FAMILIES, "hydrogen", "frontier_low", "claude_sonnet"):
             return "inherit"
-        if family in ("carbon", "neon", "argon", "claude", "custom"):
+        if family in ("neon", "carbon", "argon", "claude_opus", "custom"):
             return "pro"
         return "flash"
     if tier == "multi_module_integration":
-        if family in ("orchestrator", "argon", "claude", "custom"):
-            return "inherit"
-        if family in ("carbon", "neon"):
+        if family in ORCHESTRATOR_FAMILIES:
+            return "pro"
+        if family in ("neon", "carbon"):
             return "inherit" if caller_model == "inherit" else "pro"
-        if family in ("argon_low", "hydrogen", "flash"):
+        if family in ("claude_opus", "argon", "custom"):
+            return "inherit"
+        if family in ("frontier_low", "hydrogen", "claude_sonnet", "flash"):
             return "pro"
         return "pro" if floor_upgraded else "inherit"
     if tier == "critical_architecture_or_audit":
-        if family in ("orchestrator", "carbon", "neon", "argon", "claude", "custom"):
+        if family in ("neon", "carbon", "claude_opus", "argon", "custom"):
             return "inherit"
         return "pro"
     raise ValueError(f"Unknown subagent dispatch tier: {tier}")
@@ -2715,8 +2775,79 @@ def _build_subagent_overwrite(model: str, effort: str, orig_prompt: str) -> dict
     return {"decision": "allow", "overwrite": {"Model": model, "Prompt": new_prompt}}
 
 
+def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate ``run_workflow`` PreToolUse guard for secrets, shell bypasses, and invalid model tiers."""
+    if is_harness_ignored(workspace):
+        return {"decision": "allow"}
+    if not isinstance(hook_input, dict):
+        return {"decision": "allow"}
+    tool_call = hook_input.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return {"decision": "allow"}
+    if str(tool_call.get("name") or "") != "run_workflow":
+        return {"decision": "allow"}
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        return {"decision": "allow"}
+
+    initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+    raw_cwd = args.get("Cwd")
+    wf_cwd = _resolve_dir_arg(initial_cwd, raw_cwd.strip()) if isinstance(raw_cwd, str) and raw_cwd.strip() else initial_cwd
+    linked_wt = resolve_linked_worktree(workspace, wf_cwd)
+    if linked_wt is not None and is_harness_ignored(linked_wt):
+        return {"decision": "allow"}
+
+    script_parts: list[str] = []
+    inline_script = args.get("Script")
+    if isinstance(inline_script, str) and inline_script:
+        script_parts.append(inline_script)
+
+    script_path_raw = str(args.get("ScriptPath") or "").strip()
+    if script_path_raw:
+        sp = _resolve_dir_arg(wf_cwd, script_path_raw)
+        if not sp.is_file():
+            return {
+                "decision": "deny",
+                "reason": f"Workflow ScriptPath '{script_path_raw}' does not exist or is not a file.",
+            }
+        try:
+            script_parts.append(sp.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            return {
+                "decision": "deny",
+                "reason": f"Unable to read workflow ScriptPath '{script_path_raw}': {exc}",
+            }
+
+    full_script = "\n".join(script_parts)
+    if PRIVATE_KEY_RE.search(full_script):
+        return {
+            "decision": "deny",
+            "reason": "Plain private key detected in workflow script; secrets must never be embedded.",
+        }
+    if WORKFLOW_SUBPROCESS_RE.search(full_script):
+        return {
+            "decision": "deny",
+            "reason": (
+                "Direct subprocess/os.system shell execution inside run_workflow scripts is blocked because "
+                "it bypasses pre-command-guard.sh. Delegate shell commands to workflow agent() steps instead."
+            ),
+        }
+    for m in WORKFLOW_AGENT_MODEL_RE.finditer(full_script):
+        m_val = m.group(2).strip()
+        if m_val and m_val not in VALID_SUBAGENT_MODEL_TIERS:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"Invalid workflow agent model tier '{m_val}'. "
+                    "run_workflow agent(model=...) only accepts 'inherit', 'flash_lite', 'flash', or 'pro'."
+                ),
+            }
+
+    return {"decision": "allow"}
+
+
 def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate ``invoke_subagent`` and ``swarm`` PreToolUse guards with atomic locking and worktree discovery."""
+    """Evaluate ``invoke_subagent``, ``swarm``, and ``run_workflow`` PreToolUse guards."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
     if not isinstance(hook_input, dict):
@@ -2728,6 +2859,8 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     tool_name = str(tool_call.get("name") or "")
     if tool_name == "swarm":
         return evaluate_pre_swarm(workspace, hook_input)
+    if tool_name == "run_workflow":
+        return evaluate_pre_workflow(workspace, hook_input)
     if tool_name and tool_name != "invoke_subagent":
         return {"decision": "allow"}
     args = tool_call.get("args")
@@ -2756,7 +2889,7 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
         return _build_subagent_overwrite(sec_model, "MAX", orig_prompt)
 
     if type_name == "pr-auditor":
-        pr_effort = "HIGH"
+        pr_effort = "XHIGH" if detect_parent_effort_hint(parent_model) == "XHIGH" else "HIGH"
         matched_ws: Optional[Path] = None
         if role:
             candidates = _ordered_candidate_worktrees(workspace, orig_prompt)
@@ -4275,11 +4408,17 @@ def build_session_start_payload(
         ui_gate_line,
         "- Protocols:",
         "  - Use jev_classify, jev_check, and jev_ask for intent, architecture trade-offs, and verification.",
-        "  - Parent-aware Gemini 4 / Orchestrator subagent routing is enforced by pre-subagent-guard.sh (never downgrades Carbon/Orchestrator/Argon-High audits; escalates Hydrogen/Flash audits to Argon via pro).",
+        "  - Parent-aware Gemini 4 / Orchestrator subagent & workflow routing is enforced by pre-subagent-guard.sh (keeps Neon/Carbon/Opus audits on inherit; escalates Orchestrator/Hydrogen/Sonnet/frontier_low audits to frontier pro).",
         "  - Wrap high-output shell commands with scripts/run-quiet.sh.",
         "  - All documentation must conclude with a ## Teknik Terimler Sözlüğü or ## Technical Glossary section.",
         "  - Swarm Worker Mode: When dispatched as a Swarm worker, stay strictly within your coordinator brief and branch (skip re-running jev_classify, Spec, Walkthrough, or gh pr create; report docs/parking-lot.md or docs/canon/* suggestions to @coordinator).",
     ]
+
+    if is_deprecated_parent_model(parent_model):
+        lines.append(
+            f"[MODEL DEPRECATION WARNING] Active model '{parent_model_display}' retires on 2026-11-30. "
+            "Migrate to Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Hydrogen, Claude 5.5, or Orchestrator (Neon/Carbon)."
+        )
 
     live_head = get_head_oid(workspace)
     if branch in ("main", "master") and live_head != "UNBORN":

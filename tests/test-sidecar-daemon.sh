@@ -1288,4 +1288,53 @@ EOF
     || { echo "tree-state.json did not transition uiStampStatus to stale" >&2; return 1; }
 }
 
+test_daemon_run_workflow_and_deprecation_parity() {
+  trap _td_cleanup EXIT INT TERM
+  local repo sock_dir data_dir sock_path dpid
+  repo=$(make_temp_repo)
+  git -C "$repo" checkout -b "feat/daemon-5layer" --quiet
+  sock_dir=$(mktemp -d "/tmp/hd-5l.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d5l.XXXXXX")
+  _TD_DIRS+=("$sock_dir" "$data_dir")
+  sock_path="$sock_dir/d.sock"
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.2" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
+
+  # 1. SessionStart deprecation warning parity (Argon vs Neon)
+  local p_dep on_dep off_dep p_act on_act off_act
+  p_dep=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], modelName: "Orchestrator (Argon)"}')
+  on_dep=$(printf '%s' "$p_dep" | HARNESS_DAEMON_SOCK="$sock_path" "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  off_dep=$(printf '%s' "$p_dep" | HARNESS_DISABLE_DAEMON=1 "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$on_dep" "[MODEL DEPRECATION WARNING]" "Daemon SessionStart warns on Orchestrator (Argon)"
+  assert_contains "$off_dep" "[MODEL DEPRECATION WARNING]" "Fallback SessionStart warns on Orchestrator (Argon)"
+
+  p_act=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], modelName: "Gemini 4 Neon (Extra)"}')
+  on_act=$(printf '%s' "$p_act" | HARNESS_DAEMON_SOCK="$sock_path" "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  off_act=$(printf '%s' "$p_act" | HARNESS_DISABLE_DAEMON=1 "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_not_contains "$on_act" "[MODEL DEPRECATION WARNING]" "Daemon SessionStart silent on Neon Extra"
+  assert_not_contains "$off_act" "[MODEL DEPRECATION WARNING]" "Fallback SessionStart silent on Neon Extra"
+
+  # 2. run_workflow pre-subagent guard parity (allow vs deny)
+  local pre_subagent_guard="$REPO_ROOT/scripts/hooks/pre-subagent-guard.sh"
+  local p_wf_deny p_wf_allow on_wf_deny off_wf_deny on_wf_allow off_wf_allow
+  p_wf_deny=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_workflow", args: {Description: "Bad tier", Script: "agent(prompt=\"x\", model=\"sonnet\")"}}}')
+  on_wf_deny=$(printf '%s' "$p_wf_deny" | HARNESS_DAEMON_SOCK="$sock_path" "$pre_subagent_guard")
+  off_wf_deny=$(printf '%s' "$p_wf_deny" | HARNESS_DISABLE_DAEMON=1 "$pre_subagent_guard")
+  assert_json_field "$on_wf_deny" ".decision" "deny" "Daemon denies invalid run_workflow model tier"
+  assert_json_field "$off_wf_deny" ".decision" "deny" "Fallback denies invalid run_workflow model tier"
+
+  p_wf_allow=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_workflow", args: {Description: "Good workflow", Script: "agent(prompt=\"x\", model=\"pro\")"}}}')
+  on_wf_allow=$(printf '%s' "$p_wf_allow" | HARNESS_DAEMON_SOCK="$sock_path" "$pre_subagent_guard")
+  off_wf_allow=$(printf '%s' "$p_wf_allow" | HARNESS_DISABLE_DAEMON=1 "$pre_subagent_guard")
+  assert_json_field "$on_wf_allow" ".decision" "allow" "Daemon allows valid run_workflow"
+  assert_json_field "$off_wf_allow" ".decision" "allow" "Fallback allows valid run_workflow"
+}
+
 run_tests "$@"

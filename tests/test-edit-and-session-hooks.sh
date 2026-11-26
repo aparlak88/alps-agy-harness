@@ -910,4 +910,25 @@ test_impeccable_workspace_paths_and_session_start_ui_status() {
   assert_not_contains "$msg_active" "[UI ADVISORY]"
 }
 
+test_session_start_model_deprecation_warnings() {
+  local repo
+  repo=$(make_temp_repo)
+
+  local m
+  for m in "gemini-4-argon-high" "Orchestrator (Argon)" "gemini-3.8-flash-low" "gpt-oss-120b-medium" "Claude 4.6 Sonnet"; do
+    local out msg
+    out=$(jq -nc --arg ws "$repo" --arg mn "$m" '{workspacePaths: [$ws], modelName: $mn}' | "$SESSION_START")
+    msg=$(printf '%s\n' "$out" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+    assert_contains "$msg" "[MODEL DEPRECATION WARNING]" "SessionStart warns on deprecated model: $m"
+    assert_contains "$msg" "2026-11-30" "SessionStart includes retirement date for: $m"
+  done
+
+  for m in "Gemini 4 Neon (Extra)" "gemini-4-carbon-high" "gemini-4-hydrogen-xhigh" "Orchestrator (Neon)" "Claude Opus 5.5 (Thinking)"; do
+    local out_ok msg_ok
+    out_ok=$(jq -nc --arg ws "$repo" --arg mn "$m" '{workspacePaths: [$ws], modelName: $mn}' | "$SESSION_START")
+    msg_ok=$(printf '%s\n' "$out_ok" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+    assert_not_contains "$msg_ok" "[MODEL DEPRECATION WARNING]" "SessionStart does not warn on active model: $m"
+  done
+}
+
 run_tests "$@"

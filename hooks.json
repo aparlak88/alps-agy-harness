@@ -29,7 +29,7 @@
         ]
       },
       {
-        "matcher": "invoke_subagent|swarm",
+        "matcher": "invoke_subagent|swarm|run_workflow",
         "hooks": [
           {
             "type": "command",
