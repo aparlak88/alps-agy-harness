@@ -1490,4 +1490,78 @@ EOF
   assert_json_field "$out_doc_pr" ".decision" "allow" "Doc-only PR must allow without tdd-pass.json"
 }
 
+test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
+  export HARNESS_DISABLE_DAEMON=1
+  local PRE_SUBAGENT_GUARD="$REPO_ROOT/scripts/hooks/pre-subagent-guard.sh"
+  local repo
+  repo=$(make_temp_repo)
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/coord-cmd" --quiet
+
+  # Register conv-coord as active Coordinator via swarm(action="title")
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "swarm", args: {action: "title", title: "Cmd Guard"}}}')" \
+    | "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  # 1. Allowed read-only inspection and coordination CLI commands
+  local allowed_cmd
+  for allowed_cmd in \
+    "git status" \
+    "git branch --show-current" \
+    "git log -n 5" \
+    "git diff main..HEAD" \
+    "git worktree list" \
+    "ls -la && cat README.md" \
+    "./scripts/stamp-gate.sh swarm-quota status --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-coordinator status --workspace \"$repo\"" \
+    "./scripts/harness-doctor.sh --json" \
+    "gh pr list" \
+    "find . -maxdepth 2 -name '*.md'" \
+    "git status >/dev/null 2>&1"
+  do
+    local out_ok
+    out_ok=$(jq -nc --arg ws "$repo" --arg cmd "$allowed_cmd" \
+      '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_ok" ".decision" "allow" "Coordinator must allow read-only/coordination command: $allowed_cmd"
+  done
+
+  # 2. Denied work, mutation, shell bypass, and PR/stamp commands
+  local denied_cmd
+  for denied_cmd in \
+    "npm test" \
+    "./scripts/run-quiet.sh tests -- ./tests/run-all.sh" \
+    "git checkout -b feat/new" \
+    "git commit -m 'msg'" \
+    "git merge feat/worker" \
+    "git push origin feat/coord-cmd" \
+    "git branch -D old-branch" \
+    "git branch new-branch" \
+    "gh pr create --fill" \
+    "rm -rf src" \
+    "echo bad > README.md" \
+    'echo $(touch /tmp/pwned)' \
+    "echo \`id\`" \
+    "find . -name '*.tmp' -delete" \
+    "./scripts/stamp-gate.sh canon --verdict PASS" \
+    "./scripts/stamp-gate.sh security --verdict PASS --critical 0 --important 0" \
+    "python3 -c 'print(1)'"
+  do
+    local out_bad
+    out_bad=$(jq -nc --arg ws "$repo" --arg cmd "$denied_cmd" \
+      '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_bad" ".decision" "deny" "Coordinator-Only guard must deny: $denied_cmd"
+    assert_contains "$(printf '%s' "$out_bad" | jq -r '.reason')" "Coordinator-Only"
+  done
+
+  # 3. Worker (distinct conversationId) is NOT blocked from running tests or git commits
+  local out_worker
+  out_worker=$(jq -nc --arg ws "$repo" \
+    '{workspacePaths: [$ws], conversationId: "conv-worker", lastUserInput: "[SWARM_WORKER_CONTRACT] run tests", toolCall: {name: "run_command", args: {CommandLine: "git status && npm test"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_worker" ".decision" "allow" "Swarm worker must be allowed to run tests and normal commands"
+}
+
 run_tests

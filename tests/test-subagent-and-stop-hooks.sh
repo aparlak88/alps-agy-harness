@@ -1923,4 +1923,165 @@ test_swarm_system_roles_exempt_and_leading_header_block_only() {
     }
 }
 
+test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure_wait() {
+  export HARNESS_DISABLE_DAEMON=1
+  local repo
+  repo=$(make_temp_repo)
+
+  # 1. Register conv-coord via swarm(action="title") and add workers (implementer + integrator)
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "swarm", args: {action: "title", title: "Full Delegation"}}}')" \
+    | "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  local out_impl out_int
+  out_impl=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "swarm", args: {action: "add", name: "implementer-1", workspace: "share", brief: "Implement feature."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_impl" ".decision" "allow"
+  assert_contains "$(printf '%s' "$out_impl" | jq -r '.overwrite.brief')" "[SWARM_WORKER_CONTRACT"
+
+  out_int=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "swarm", args: {action: "add", name: "integrator", workspace: "share", brief: "Merge branches and open PR."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_int" ".decision" "allow"
+  assert_contains "$(printf '%s' "$out_int" | jq -r '.overwrite.brief')" "[SWARM_INTEGRATOR_CONTRACT"
+  assert_not_contains "$(printf '%s' "$out_int" | jq -r '.overwrite.brief')" "[SWARM_WORKER_CONTRACT"
+  assert_contains "$(printf '%s' "$out_int" | jq -r '.overwrite.brief')" "[SWARM_BRANCH_GUARD"
+
+  # 2. Coordinator is DENIED invoke_subagent (including security-reviewer/pr-auditor/canon-auditor/self) and run_workflow
+  local tname out_den
+  for tname in "self" "research" "canon-auditor" "security-reviewer" "pr-auditor"; do
+    out_den=$(jq -nc --arg ws "$repo" --arg tn "$tname" '{
+      workspacePaths: [$ws],
+      conversationId: "conv-coord",
+      toolCall: {name: "invoke_subagent", args: {TypeName: $tn, Role: "Coord Direct", Prompt: "Do work directly."}}
+    }' | "$PRE_SUBAGENT_GUARD")
+    assert_json_field "$out_den" ".decision" "deny" "Active coordinator must be denied invoke_subagent($tname)"
+    assert_contains "$(printf '%s' "$out_den" | jq -r '.reason')" "Coordinator-Only"
+  done
+
+  local out_wf_den
+  out_wf_den=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "run_workflow", args: {Description: "Direct fanout", Script: "agent(prompt=\"Scan\", model=\"pro\")"}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_den" ".decision" "deny" "Active coordinator must be denied run_workflow"
+
+  # 3. Worker (e.g. integrator) calling swarm(action="add") must NOT register itself as Coordinator, and CAN invoke_subagent
+  printf '%s' "$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-integrator",
+    toolCall: {name: "swarm", args: {action: "add", name: "helper-1", workspace: "inherit", brief: "Help integrate."}}
+  }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-integrator"] == null' "true" "Helper-adding worker must not be registered as Coordinator"
+
+  "$STAMP_GATE" dispatch --role "Integrator Sec" --type "security-reviewer" --tier "critical_architecture_or_audit" --conversation-id "conv-integrator" --workspace "$repo"
+  local out_int_sec
+  out_int_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-integrator",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Integrator Sec", Prompt: "Audit integrated branch."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_int_sec" ".decision" "allow" "Integrator worker must be allowed to invoke_subagent(security-reviewer)"
+
+  # 4. Pure-Wait Quota Policy: swarm(action="model"|"kill") returns force_ask while swarm-quota-wait is waiting, then allow after resume
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 600 --buffer-seconds 0 --window 5h --reason "5-hour quota exhausted" >/dev/null
+  local out_model_ask out_kill_ask out_model_ok
+  out_model_ask=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "swarm", args: {action: "model", name: "implementer-1", model: "gemini-4-hydrogen-high"}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_model_ask" ".decision" "force_ask" "swarm(model) during active quota wait must require force_ask"
+
+  out_kill_ask=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "swarm", args: {action: "kill", name: "implementer-1"}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_kill_ask" ".decision" "force_ask" "swarm(kill) during active quota wait must require force_ask"
+
+  "$STAMP_GATE" swarm-quota resume --workspace "$repo" >/dev/null
+  out_model_ok=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "swarm", args: {action: "model", name: "implementer-1", model: "gemini-4-hydrogen-high"}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_model_ok" ".decision" "allow" "swarm(model) allowed again after quota resume"
+}
+
+test_stop_gate_detects_coordinator_quota_error_without_looping() {
+  export HARNESS_DISABLE_DAEMON=1
+  local repo quota_file
+  repo=$(make_temp_repo)
+  quota_file="$repo/.harness/state/swarm/swarm-quota-wait.json"
+
+  # Register Coordinator + 2 workers
+  "$STAMP_GATE" swarm-coordinator on --workspace "$repo" --conversation-id "conv-q" --title "Long Swarm" >/dev/null
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-q", toolCall: {name: "swarm", args: {action: "add", name: "api-worker", workspace: "share", brief: "API."}}}')" \
+    | "$PRE_SUBAGENT_GUARD" >/dev/null
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-q", toolCall: {name: "swarm", args: {action: "add", name: "ui-worker", workspace: "share", brief: "UI."}}}')" \
+    | "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  # 1. Non-quota ERROR must return {} without creating swarm-quota-wait.json
+  local out_net
+  out_net=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-q",
+    terminationReason: "ERROR",
+    error: "TCP connection reset by peer"
+  }' | "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$out_net"
+  [ ! -f "$quota_file" ] || { echo "Non-quota error must not create swarm-quota-wait.json" >&2; return 1; }
+
+  # 2. Worker quota ERROR (non-coordinator) must NOT create swarm-quota-wait.json
+  local out_wk
+  out_wk=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-worker",
+    lastUserInput: "[SWARM_WORKER_CONTRACT] work",
+    terminationReason: "ERROR",
+    error: "429 RESOURCE_EXHAUSTED: quota exceeded"
+  }' | "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$out_wk"
+  [ ! -f "$quota_file" ] || { echo "Worker quota error must not create coordinator swarm-quota-wait.json" >&2; return 1; }
+
+  # 3. Coordinator 5-hour quota ERROR with ISO reset timestamp -> returns {} and writes swarm-quota-wait.json
+  local out_5h
+  out_5h=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-q",
+    modelName: "gemini-4-neon-high",
+    terminationReason: "ERROR",
+    error: "RESOURCE_EXHAUSTED: 5-hour quota exceeded. Resets at 2030-11-27T04:00:00Z"
+  }' | "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$out_5h" "Stop gate must return {} on quota ERROR (never loop immediately)"
+  [ -f "$quota_file" ] || { echo "Expected swarm-quota-wait.json after Coordinator quota ERROR" >&2; return 1; }
+  assert_json_field "$quota_file" ".status" "waiting"
+  assert_json_field "$quota_file" ".window" "5h"
+  assert_json_field "$quota_file" ".conversationId" "conv-q"
+  assert_json_field "$quota_file" ".model" "gemini-4-neon-high"
+  assert_json_field "$quota_file" ".resumeAt" "2030-11-27T04:01:00Z" "ISO reset timestamp must include +60s buffer"
+  assert_json_field "$quota_file" '.pausedMembers | sort | join(",")' "api-worker,ui-worker"
+
+  # 4. Weekly quota ERROR with relative duration ("3d 4h") -> classifies window == "weekly"
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  local out_wkly
+  out_wkly=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-q",
+    modelName: "gemini-4-carbon-high",
+    terminationReason: "ERROR",
+    error: "Weekly usage limit reached; resets in 3d 4h"
+  }' | "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$out_wkly"
+  assert_json_field "$quota_file" ".status" "waiting"
+  assert_json_field "$quota_file" ".window" "weekly"
+  assert_json_field "$quota_file" ".source" "stop-error"
+}
+
 run_tests

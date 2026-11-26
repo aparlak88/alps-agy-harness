@@ -1344,4 +1344,126 @@ test_daemon_run_workflow_and_deprecation_parity() {
   assert_json_field "$off_wf_allow" ".decision" "allow" "Fallback allows valid run_workflow"
 }
 
+test_daemon_swarm_coordinator_parity_and_quota_auto_resume_watchdog() {
+  trap _td_cleanup EXIT INT TERM
+  local PRE_SUBAGENT_GUARD="$REPO_ROOT/scripts/hooks/pre-subagent-guard.sh"
+  local STOP_GATE="$REPO_ROOT/scripts/hooks/stop-gate.sh"
+  local STAMP_GATE="$REPO_ROOT/scripts/stamp-gate.sh"
+  local repo sock_dir data_dir sock_path dpid mock_dir mock_agy calls_log attempt_file
+  repo=$(make_temp_repo)
+  sock_dir=$(mktemp -d "/tmp/hd-swq.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-swq-d.XXXXXX")
+  mock_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-swq-m.XXXXXX")
+  _TD_DIRS+=("$sock_dir" "$data_dir" "$mock_dir")
+  sock_path="$sock_dir/d.sock"
+  mock_agy="$mock_dir/mock-agy"
+  calls_log="$mock_dir/agy-calls.log"
+  attempt_file="$mock_dir/attempt.count"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/daemon-quota" --quiet
+
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+count=0
+if [ -f "$attempt_file" ]; then
+  count=\$(cat "$attempt_file")
+fi
+count=\$((count + 1))
+echo "\$count" > "$attempt_file"
+printf 'ATTEMPT=%s TYPESAFE=%s ARGS=%s\n' "\$count" "\${TYPESAFE_API_KEY:-}" "\$*" >> "$calls_log"
+if [ "\$count" -eq 1 ]; then
+  echo "429 RESOURCE_EXHAUSTED: quota still exhausted" >&2
+  exit 1
+fi
+echo "Resumed coordinator successfully."
+exit 0
+EOF
+  chmod +x "$mock_agy"
+
+  TYPESAFE_API_KEY="ts_live_must_be_scrubbed" \
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  HARNESS_DAEMON_WORKSPACE_TTL_SEC="0.4" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.25" \
+  HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="0.5" \
+  HARNESS_AGY_BIN="$mock_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
+
+  # 1. Parity: Coordinator-Only pre-edit, pre-command, and pre-subagent under daemon ON vs cold OFF
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "swarm", args: {action: "title", title: "Quota Swarm"}}}')" \
+    | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  local p_ed p_cmd p_sub on_ed off_ed on_cmd off_cmd on_sub off_sub
+  p_ed=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "write_file", args: {Path: "src/X.ts", Content: "export const x=1;"}}}')
+  p_cmd=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "run_command", args: {CommandLine: "npm test"}}}')
+  p_sub=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "invoke_subagent", args: {TypeName: "research", Role: "R", Prompt: "Scan"}}}')
+
+  on_ed=$(printf '%s' "$p_ed" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  off_ed=$(printf '%s' "$p_ed" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$on_ed" ".decision" "deny"
+  assert_json_field "$off_ed" ".decision" "deny"
+
+  on_cmd=$(printf '%s' "$p_cmd" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
+  off_cmd=$(printf '%s' "$p_cmd" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
+  assert_json_field "$on_cmd" ".decision" "deny"
+  assert_json_field "$off_cmd" ".decision" "deny"
+
+  on_sub=$(printf '%s' "$p_sub" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD")
+  off_sub=$(printf '%s' "$p_sub" | HARNESS_DISABLE_DAEMON="1" "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$on_sub" ".decision" "deny"
+  assert_json_field "$off_sub" ".decision" "deny"
+
+  # 2. Trigger Coordinator Stop(ERROR) quota wait via daemon, verify workspace survives >0.4s TTL,
+  #    /health reports quotaWaits >= 1, attempt 1 backs off, and attempt 2 auto-resumes via agy --conversation!
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "swarm", args: {action: "add", name: "worker-1", workspace: "share", brief: "Work."}}}')" \
+    | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  # Wait > TTL (0.5s) first? No, arm quota wait with a short future wait (0.6s > TTL 0.4s) via Stop hook -> stop_err with no explicit reset uses DEFAULT_PROBE_SEC=0.25s,
+  # so let's first pause with 0.6s via stamp-gate.sh so we can assert /health quotaWaits >= 1 and survival past 0.4s TTL!
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-dq" --wait-seconds 0.6 --buffer-seconds 0 --window 5h --model "gemini-4-neon-high" --reason "5-hour quota" >/dev/null
+  local evt_resp health_json
+  evt_resp=$(jq -nc --arg ws "$repo" '{workspace: $ws}' | curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST --data-binary @- "http://localhost/event/swarm-quota-wait")
+  assert_json_field "$evt_resp" ".armed" "true"
+
+  sleep 0.45
+  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
+  assert_json_field "$health_json" ".activeWorkspaces" "1" "Workspace with active quota wait must survive TTL eviction"
+  assert_json_field "$health_json" ".quotaWaits" "1" "Health endpoint must report active quotaWaits == 1"
+
+  # Wait for attempt 1 (fails with 429 -> backoff) and attempt 2 (succeeds -> status=resumed)
+  local quota_file="$repo/.harness/state/swarm/swarm-quota-wait.json"
+  _wait_for_file_jq "$quota_file" '.status == "resumed" and .attemptCount == 2' 60 \
+    || { echo "Daemon quota watchdog failed to auto-resume on attempt 2: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
+
+  local agy_log
+  agy_log=$(cat "$calls_log")
+  assert_contains "$agy_log" "--conversation conv-dq"
+  assert_contains "$agy_log" "[SWARM_QUOTA_AUTO_RESUME]"
+  assert_contains "$agy_log" "@worker-1"
+  assert_not_contains "$agy_log" "ts_live_must_be_scrubbed" "Daemon must scrub TYPESAFE_API_KEY before invoking agy"
+
+  # 3. Verify Stop hook over daemon /hook/stop-gate also arms quota wait cleanly
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  local stop_out
+  stop_out=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-dq",
+    modelName: "gemini-4-neon-high",
+    terminationReason: "ERROR",
+    error: "RESOURCE_EXHAUSTED: 5-hour quota exceeded"
+  }' | HARNESS_DAEMON_SOCK="$sock_path" "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$stop_out"
+  assert_json_field "$quota_file" ".source" "stop-error"
+  _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
+    || { echo "Daemon did not auto-resume Stop(ERROR) quota wait: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
+}
+
 run_tests "$@"

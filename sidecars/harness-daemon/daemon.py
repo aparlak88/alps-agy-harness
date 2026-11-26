@@ -180,6 +180,7 @@ class HarnessDaemonState:
         self._caches: dict[str, dict[str, Any]] = {}
         self._dirty_workspaces: set[str] = set()
         self._graphify_queue: dict[str, dict[str, Any]] = {}
+        self._quota_resume_inflight: set[str] = set()
 
         self.poll_interval_sec = max(0.05, float(os.environ.get("HARNESS_DAEMON_POLL_INTERVAL_SEC", "1.5")))
         self.workspace_ttl_sec = max(0.1, float(os.environ.get("HARNESS_DAEMON_WORKSPACE_TTL_SEC", "1800")))
@@ -204,7 +205,8 @@ class HarnessDaemonState:
                 continue
             ws_path = Path(ws_str)
             last_seen = float(meta.get("lastSeenAt", 0))
-            if (now - last_seen) > self.workspace_ttl_sec or not ws_path.is_dir() or harness_core.is_harness_ignored(ws_path):
+            has_quota_wait = ws_path.is_dir() and harness_core.has_active_swarm_quota_wait(ws_path)
+            if ((now - last_seen) > self.workspace_ttl_sec and not has_quota_wait) or not ws_path.is_dir() or harness_core.is_harness_ignored(ws_path):
                 continue
             self._workspaces[ws_str] = {
                 "registeredAt": float(meta.get("registeredAt", last_seen or now)),
@@ -291,6 +293,34 @@ class HarnessDaemonState:
         """Return count of pending or active graphify jobs across workspaces."""
         with self._lock:
             return sum(1 for item in self._graphify_queue.values() if item.get("queued") or item.get("running"))
+
+    def active_quota_wait_count(self) -> int:
+        """Return count of registered workspaces with an active Swarm quota wait."""
+        with self._lock:
+            ws_keys = list(self._workspaces.keys())
+        return sum(1 for k in ws_keys if harness_core.has_active_swarm_quota_wait(Path(k)))
+
+    def notify_swarm_quota_wait(self, ws_path: Path) -> dict[str, Any]:
+        """Mark workspace active for Swarm quota watchdog and wake the watcher loop."""
+        reg_ws, ignored = self.register_workspace(str(ws_path), warm_now=False)
+        if ignored or reg_ws is None:
+            return {}
+        self.mark_dirty(reg_ws)
+        return harness_core.get_swarm_quota_state(reg_ws)
+
+    def _run_swarm_quota_resume(self, ws_key: str) -> None:
+        """Invoke ``agy --conversation`` via ``harness_core.attempt_swarm_quota_resume`` in background."""
+        try:
+            ensure_startup_path_enriched()
+            res = harness_core.attempt_swarm_quota_resume(Path(ws_key))
+            status = str(res.get("status") or "unknown")
+            self.logger.log("INFO", f"Swarm quota resume probe for {ws_key}: status={status} attempt={res.get('attemptCount', 0)}")
+        except Exception as exc:
+            self.logger.log("WARN", f"Swarm quota resume error for {ws_key}: {exc}")
+        finally:
+            with self._lock:
+                self._quota_resume_inflight.discard(ws_key)
+            self.wake_event.set()
 
     def get_caches(self, ws_path: Path, allow_disk_hydration: bool = True) -> dict[str, Any]:
         """Return shallow copy of in-memory caches for ``ws_path``, optionally hydrating missing keys."""
@@ -661,8 +691,9 @@ class HarnessDaemonState:
                 for ws_key in list(self._workspaces.keys()):
                     ws_path = Path(ws_key)
                     meta = self._workspaces[ws_key]
+                    has_quota_wait = ws_path.is_dir() and harness_core.has_active_swarm_quota_wait(ws_path)
                     if (
-                        (now - float(meta.get("lastSeenAt", 0))) > self.workspace_ttl_sec
+                        ((now - float(meta.get("lastSeenAt", 0))) > self.workspace_ttl_sec and not has_quota_wait)
                         or not ws_path.is_dir()
                         or harness_core.is_harness_ignored(ws_path)
                     ):
@@ -683,7 +714,25 @@ class HarnessDaemonState:
                         job["running"] = True
                         due_graphify.append((ws_key, str(job.get("reason", "queued"))))
 
+                due_quota_resumes: list[str] = []
+                for ws_key in to_refresh:
+                    if ws_key in self._quota_resume_inflight:
+                        continue
+                    q_state = harness_core.get_swarm_quota_state(Path(ws_key))
+                    if q_state.get("status") == "waiting" and float(q_state.get("nextProbeEpoch") or 0) <= now:
+                        self._quota_resume_inflight.add(ws_key)
+                        due_quota_resumes.append(ws_key)
+
                 dirty_snapshot = set(self._dirty_workspaces)
+
+            for ws_key in due_quota_resumes:
+                qt = threading.Thread(
+                    target=self._run_swarm_quota_resume,
+                    args=(ws_key,),
+                    name=f"quota-{os.path.basename(ws_key)}",
+                    daemon=True,
+                )
+                qt.start()
 
             for ws_key, reason in due_graphify:
                 t = threading.Thread(
@@ -793,6 +842,7 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
                     "uptimeSec": round(time.time() - state.started_at, 2),
                     "activeWorkspaces": state.active_workspace_count(),
                     "queueDepth": state.queue_depth(),
+                    "quotaWaits": state.active_quota_wait_count(),
                 },
             )
             return
@@ -936,8 +986,31 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
             if ignored:
                 self._send_json(200, {})
                 return
-            resp = harness_core.evaluate_stop_gate(ws_path, body)
+            resp = harness_core.evaluate_stop_gate(
+                ws_path,
+                body,
+                on_swarm_quota_wait=lambda wt: state.notify_swarm_quota_wait(wt),
+            )
             self._send_json(200, resp)
+            return
+
+        if self.path == "/event/swarm-quota-wait":
+            ws_path, ignored = state.register_workspace(raw_ws, warm_now=False)
+            if ws_path is None:
+                self._send_json(400, {"error": "invalid_workspace"})
+                return
+            if ignored:
+                self._send_json(200, {"armed": False, "ignored": True})
+                return
+            q_state = state.notify_swarm_quota_wait(ws_path)
+            self._send_json(
+                202,
+                {
+                    "armed": str(q_state.get("status") or "") in ("waiting", "resuming"),
+                    "status": q_state.get("status") or "",
+                    "nextProbeEpoch": q_state.get("nextProbeEpoch"),
+                },
+            )
             return
 
         if self.path == "/event/graphify":

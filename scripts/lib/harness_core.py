@@ -438,6 +438,21 @@ def get_head_oid(workspace: Path) -> str:
     return oid or "UNBORN"
 
 
+# Pre-edit guard and Coordinator-Only check follow worktree/external path resolution.
+def get_swarm_state_dir(workspace: Path) -> Path:
+    """Ensure branch-independent ``.harness/state/swarm`` exists and is git-excluded."""
+    state_dir = workspace / ".harness" / "state" / "swarm"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    ensure_harness_git_exclude(workspace)
+    return state_dir
+
+
+def _existing_swarm_state_dir(workspace: Path) -> Optional[Path]:
+    """Return ``.harness/state/swarm`` only if it already exists on disk."""
+    state_dir = workspace / ".harness" / "state" / "swarm"
+    return state_dir if state_dir.is_dir() else None
+
+
 def get_state_dir(workspace: Path) -> Path:
     """Ensure ``.harness/state/<slug>`` exists and is excluded from git tracking."""
     slug = get_branch_slug(workspace)
@@ -524,6 +539,10 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
                 segments.append((seg, c + c))
                 current = []
                 i += 2
+                continue
+            if c == "&" and ((i > 0 and cmd_line[i - 1] in (">", "<")) or (i + 1 < n and cmd_line[i + 1] == ">")):
+                current.append(c)
+                i += 1
                 continue
             if c in (";", "\n", "|", "&", "(", ")"):
                 seg = "".join(current).strip()
@@ -1541,7 +1560,20 @@ def evaluate_pre_edit(
         if on_worktree_resolved is not None:
             on_worktree_resolved(effective_ws)
 
-    if rel_path == ".superpowers" or rel_path.startswith(".superpowers/") or rel_path == ".harness" or rel_path.startswith(".harness/"):
+    if rel_path == ".harness" or rel_path.startswith(".harness/"):
+        return {"decision": "allow"}
+
+    if is_active_swarm_coordinator(workspace, hook_input):
+        return {
+            "decision": "deny",
+            "reason": (
+                f"Swarm Coordinator-Only guard: active Swarm Coordinator cannot write or edit workspace file '{rel_path}' directly. "
+                "Delegate all file edits (specs, plans, code, tests, walkthroughs, and docs) to a Swarm worker via "
+                "swarm(action='add', workspace='share') or post_message."
+            ),
+        }
+
+    if rel_path == ".superpowers" or rel_path.startswith(".superpowers/"):
         return {"decision": "allow"}
 
     append_val = args.get("Append", False)
@@ -1851,6 +1883,29 @@ def evaluate_pre_command(
     segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
     if not segments_with_cwd:
         return {"decision": "allow"}
+
+    if is_active_swarm_coordinator(workspace, hook_input):
+        unsafe_syntax = _has_unsafe_shell_syntax_for_coordinator(cmd_line)
+        if unsafe_syntax:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"Swarm Coordinator-Only guard: shell syntax ({unsafe_syntax}) is blocked for the active Swarm Coordinator. "
+                    "Only read-only inspection and harness coordination commands are allowed; delegate work to Swarm workers."
+                ),
+            }
+        for seg, _ in segments_with_cwd:
+            if not seg:
+                continue
+            if not _is_allowed_coordinator_command_segment(seg):
+                exe_name = os.path.basename(seg[0])
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Swarm Coordinator-Only guard: command '{' '.join(seg[:3])}' ({exe_name}) is blocked for the active Swarm Coordinator. "
+                        "Delegate builds, tests, git mutations, Walkthroughs, and PR operations to Swarm workers (e.g. implementer, verifier, integrator)."
+                    ),
+                }
 
     try:
         real_base_ws = Path(os.path.realpath(str(workspace)))
@@ -2469,11 +2524,117 @@ SWARM_WORKER_CONTRACT_HEADER = (
     "yeniden jev_classify, brainstorming, Spec, Walkthrough veya gh pr create çalıştırma; "
     "docs/parking-lot.md ve docs/canon/* önerilerini panoda @coordinator'a bildir.]"
 )
+SWARM_INTEGRATOR_ROLE_RE = re.compile(r"^(?:integrator|release|pr-shepherd)(?:-\d+)?$")
+SWARM_INTEGRATOR_CONTRACT_HEADER = (
+    "[SWARM_INTEGRATOR_CONTRACT — Tüm işçi dallarını tek feat/<konu> entegrasyon dalında birleştir; "
+    "pre-pr-readiness (Walkthrough, canon-auditor, security-reviewer, tdd-pass, koşullu ui-pass), "
+    "gh pr create ve review-pr (pr-auditor) kapılarını yürütüp sonucu @coordinator'a bildir.]"
+)
 SWARM_BRANCH_GUARD_HEADER = (
     "[SWARM_BRANCH_GUARD — Koda dokunmadan önce kendi özellik dalını aç "
     "(git checkout -b feat/<konu>-<ad>); detached HEAD veya main üzerinde kalma.]"
 )
 SWARM_SYSTEM_ROLE_RE = re.compile(r"^(?:monitor|narrator)(?:-\d+)?$")
+SWARM_SLASH_CMD_RE = re.compile(r"(?:^|\s)/swarm(?:\s|$)", re.IGNORECASE)
+SWARM_QUOTA_ERROR_RE = re.compile(
+    r"(?:"
+    r"quota\s*(?:exceeded|exhausted|limit|depleted|reached)"
+    r"|out\s+of\s+quota"
+    r"|insufficient\s+quota"
+    r"|resource[_\s-]*exhausted"
+    r"|rate[_\s-]*limit(?:ed|s)?"
+    r"|too\s+many\s+requests"
+    r"|\b429\b"
+    r"|usage\s+limit"
+    r"|(?:5[\s-]*hour|weekly|haftalık)\s*(?:quota|limit|cap|window)"
+    r"|capacity\s+exhausted"
+    r")",
+    re.IGNORECASE,
+)
+DEFAULT_SWARM_QUOTA_BUFFER_SEC = 60
+DEFAULT_SWARM_QUOTA_PROBE_SEC = 900.0
+DEFAULT_SWARM_QUOTA_MAX_BACKOFF_SEC = 3600.0
+DEFAULT_SWARM_RESUME_TIMEOUT_SEC = 120.0
+
+COORDINATOR_READ_ONLY_BINS = frozenset(
+    (
+        "cd",
+        "pwd",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "stat",
+        "file",
+        "which",
+        "date",
+        "uname",
+        "jq",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "test",
+        "[",
+        "echo",
+        "printf",
+        "true",
+        "false",
+    )
+)
+COORDINATOR_FIND_FORBIDDEN_FLAGS = frozenset(
+    ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls")
+)
+COORDINATOR_STAMP_GATE_SUBCMDS = frozenset(
+    ("swarm-coordinator", "swarm-quota", "dispatch", "select-model", "tree-sha", "verify-pr-stamps")
+)
+COORDINATOR_READ_ONLY_GIT_SUBCMDS = frozenset(
+    (
+        "status",
+        "log",
+        "diff",
+        "show",
+        "rev-parse",
+        "ls-files",
+        "ls-tree",
+        "merge-base",
+        "shortlog",
+        "describe",
+        "rev-list",
+        "check-ignore",
+    )
+)
+COORDINATOR_GIT_BRANCH_MUTATE_FLAGS = frozenset(
+    (
+        "-d",
+        "-D",
+        "-m",
+        "-M",
+        "-c",
+        "-C",
+        "-f",
+        "--delete",
+        "--move",
+        "--copy",
+        "--force",
+        "--set-upstream-to",
+        "-u",
+        "--unset-upstream",
+        "--edit-description",
+        "--create-reflog",
+    )
+)
+COORDINATOR_READ_ONLY_GH_VERBS = {
+    "auth": frozenset(("status",)),
+    "pr": frozenset(("list", "view", "status", "checks", "diff")),
+    "issue": frozenset(("list", "view", "status")),
+    "repo": frozenset(("view",)),
+}
 TIER_DEFAULT_EFFORT = {
     "trivial_lookup": "LOW",
     "bounded_execution": "MEDIUM",
@@ -2865,8 +3026,643 @@ def _leading_bracket_header_block(text: str) -> str:
     return "\n".join(header_lines)
 
 
+def _is_worker_prompt_text(text: str) -> bool:
+    """Return True if prompt/user text carries Swarm worker contract or XML wrapper markers."""
+    if not text:
+        return False
+    return (
+        "[SWARM_WORKER_CONTRACT" in text
+        or "[SWARM_INTEGRATOR_CONTRACT" in text
+        or "<swarm_worker>" in text
+    )
+
+
+def _has_explicit_swarm_slash_command(last_user_input: str) -> bool:
+    """Return True strictly when user input explicitly invokes ``/swarm`` outside worker briefs."""
+    if not last_user_input or _is_worker_prompt_text(last_user_input):
+        return False
+    return bool(SWARM_SLASH_CMD_RE.search(last_user_input))
+
+
+def _is_in_different_linked_worktree(workspace: Path, target_dir: Path) -> bool:
+    """Return True when ``target_dir`` belongs to a different linked worktree of ``workspace``."""
+    try:
+        real_ws = Path(os.path.realpath(str(workspace)))
+    except OSError:
+        real_ws = workspace
+    linked = resolve_linked_worktree(workspace, target_dir)
+    return linked is not None and linked != real_ws
+
+
+def _read_swarm_coordinator_data(workspace: Path) -> dict[str, Any]:
+    """Read ``swarm-coordinator.json`` safely without creating directories."""
+    swarm_dir = _existing_swarm_state_dir(workspace)
+    if swarm_dir is None:
+        return {}
+    data = read_json_file(swarm_dir / "swarm-coordinator.json")
+    return data if isinstance(data, dict) else {}
+
+
+def register_swarm_coordinator(
+    workspace: Path,
+    conversation_id: str = "",
+    active: bool = True,
+    title: str = "",
+    source: str = "swarm-tool",
+    worker_name: str = "",
+    explicitly_disabled: bool = False,
+) -> dict[str, Any]:
+    """Atomically register or update a Swarm Coordinator state entry in ``swarm-coordinator.json``."""
+    state_dir = get_swarm_state_dir(workspace)
+    conv_key = conversation_id.strip() or "__default__"
+    now_iso = utc_now_iso()
+    clean_title = title.strip()
+    clean_worker = worker_name.strip()
+
+    with locked_state_file(state_dir, "swarm-coordinator"):
+        coord_path = state_dir / "swarm-coordinator.json"
+        data = read_json_file(coord_path)
+        if not isinstance(data, dict):
+            data = {}
+        raw_coords = data.get("coordinators")
+        coords: dict[str, Any] = dict(raw_coords) if isinstance(raw_coords, dict) else {}
+
+        existing = coords.get(conv_key)
+        entry: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+        workers_raw = entry.get("workers")
+        workers: list[str] = [str(w) for w in workers_raw if isinstance(w, str) and w.strip()] if isinstance(workers_raw, list) else []
+        if clean_worker and not SWARM_SYSTEM_ROLE_RE.match(clean_worker.lower()) and clean_worker not in workers:
+            workers.append(clean_worker)
+
+        entry["active"] = bool(active)
+        entry["explicitlyDisabled"] = bool(explicitly_disabled) if not active else False
+        entry["source"] = source
+        entry["workers"] = workers
+        if clean_title:
+            entry["title"] = clean_title
+        elif "title" not in entry:
+            entry["title"] = ""
+        if not entry.get("startedAt"):
+            entry["startedAt"] = now_iso
+        entry["updatedAt"] = now_iso
+
+        coords[conv_key] = entry
+        data["schemaVersion"] = CACHE_SCHEMA_VERSION
+        data["coordinators"] = coords
+        data["updatedAt"] = now_iso
+        atomic_write_json(state_dir, "swarm-coordinator.json", data)
+        return dict(entry)
+
+
+def get_swarm_coordinator_status(workspace: Path, conversation_id: str = "") -> dict[str, Any]:
+    """Return Swarm Coordinator registration summary for ``conversation_id`` or workspace."""
+    data = _read_swarm_coordinator_data(workspace)
+    raw_coords = data.get("coordinators")
+    coords: dict[str, Any] = dict(raw_coords) if isinstance(raw_coords, dict) else {}
+    conv_key = conversation_id.strip() or "__default__"
+    entry = coords.get(conv_key) if isinstance(coords.get(conv_key), dict) else {}
+    return {
+        "active": bool(entry.get("active", False)) and not bool(entry.get("explicitlyDisabled", False)),
+        "conversationId": conv_key,
+        "title": str(entry.get("title") or ""),
+        "workers": list(entry.get("workers") or []),
+        "coordinators": coords,
+    }
+
+
+def is_active_swarm_coordinator(workspace: Path, hook_input: dict[str, Any]) -> bool:
+    """Return True if the current caller is an active Swarm Coordinator (never a worker)."""
+    if not isinstance(hook_input, dict):
+        return False
+    last_input = str(hook_input.get("lastUserInput") or "")
+    if _is_worker_prompt_text(last_input):
+        return False
+
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
+    data = _read_swarm_coordinator_data(workspace)
+    coords = data.get("coordinators") if isinstance(data.get("coordinators"), dict) else {}
+
+    lookup_key = cur_conv if cur_conv else "__default__"
+    entry = coords.get(lookup_key)
+    if isinstance(entry, dict):
+        if entry.get("explicitlyDisabled") is True:
+            return False
+        if entry.get("active") is True:
+            return True
+
+    if _has_explicit_swarm_slash_command(last_input):
+        initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+        if not _is_in_different_linked_worktree(workspace, initial_cwd):
+            return True
+    return False
+
+
+def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
+    """Detect command substitutions, process substitutions, or file-writing redirections."""
+    in_single = False
+    in_double = False
+    escape = False
+    n = len(cmd_line)
+    i = 0
+
+    while i < n:
+        c = cmd_line[i]
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if c == "\\" and not in_single:
+            escape = True
+            i += 1
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+
+        if not in_single:
+            if c == "`":
+                return "backtick command substitution"
+            if c == "$" and i + 1 < n and cmd_line[i + 1] == "(":
+                return "$(...) command substitution"
+
+        if not in_single and not in_double:
+            if c in ("<", ">") and i + 1 < n and cmd_line[i + 1] == "(":
+                return "process substitution"
+            if c == ">" or (c == "&" and i + 1 < n and cmd_line[i + 1] == ">"):
+                # Inspect redirection starting at > (or &>)
+                gt_idx = i + 1 if c == "&" else i
+                rest = cmd_line[gt_idx:]
+                # Allow 2>&1, 1>&2, >&1, >&2 (fd duplication)
+                if re.match(r"^>&[12](?:\s|$|[;&|)])", rest):
+                    i = gt_idx + 3
+                    continue
+                # Allow >/dev/null, >>/dev/null, >|/dev/null (and fd-prefixed 1>/dev/null, 2>/dev/null, &>/dev/null)
+                m_devnull = re.match(r"^>(?:>|\|)?\s*/dev/null(?:\s|$|[;&|)])", rest)
+                if m_devnull:
+                    i = gt_idx + m_devnull.end() - 1
+                    continue
+                return "output redirection"
+        i += 1
+    return None
+
+
+def _extract_stamp_gate_subcommand(args: list[str]) -> str:
+    """Return the subcommand passed to ``stamp-gate.sh`` skipping leading ``--workspace`` flags."""
+    i = 0
+    n = len(args)
+    while i < n:
+        tok = args[i]
+        if tok == "--workspace":
+            i += 2
+            continue
+        if tok.startswith("--workspace="):
+            i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        return tok
+    return ""
+
+
+def _is_allowed_coordinator_command_segment(seg: list[str]) -> bool:
+    """Return True strictly when a command segment is read-only or harness coordination CLI."""
+    if not seg:
+        return True
+    exe = os.path.basename(seg[0])
+
+    if exe in ("bash", "sh"):
+        if len(seg) < 2 or seg[1].startswith("-"):
+            return False
+        target_base = os.path.basename(seg[1])
+        if target_base == "harness-doctor.sh":
+            return True
+        if target_base == "stamp-gate.sh":
+            return _extract_stamp_gate_subcommand(seg[2:]) in COORDINATOR_STAMP_GATE_SUBCMDS
+        return False
+
+    if exe == "harness-doctor.sh":
+        return True
+
+    if exe == "stamp-gate.sh":
+        return _extract_stamp_gate_subcommand(seg[1:]) in COORDINATOR_STAMP_GATE_SUBCMDS
+
+    if exe in COORDINATOR_READ_ONLY_BINS:
+        return True
+
+    if exe == "find":
+        return not any(tok in COORDINATOR_FIND_FORBIDDEN_FLAGS for tok in seg[1:])
+
+    if exe == "git":
+        if any(tok == "--output" or tok.startswith("--output=") for tok in seg[1:]):
+            return False
+        git_subcmd, _, subcmd_idx = _parse_git_invocation(seg, Path.cwd())
+        if not git_subcmd:
+            return False
+        if git_subcmd in COORDINATOR_READ_ONLY_GIT_SUBCMDS:
+            return True
+        rest = seg[subcmd_idx + 1 :] if subcmd_idx >= 0 else []
+        if git_subcmd == "branch":
+            if any(tok in COORDINATOR_GIT_BRANCH_MUTATE_FLAGS for tok in rest):
+                return False
+            # Block positional branch creation args (e.g., `git branch feat/new`) unless --contains/--merged/--no-merged value
+            value_flags = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format"}
+            idx = 0
+            while idx < len(rest):
+                tok = rest[idx]
+                if tok in value_flags:
+                    idx += 2
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                return False
+            return True
+        if git_subcmd == "worktree":
+            return len(rest) >= 1 and rest[0] == "list"
+        if git_subcmd == "remote":
+            pos = [t for t in rest if not t.startswith("-")]
+            return len(pos) == 0 or pos[0] == "show"
+        if git_subcmd == "tag":
+            if any(t in ("-a", "-s", "-d", "-f", "-m", "--annotate", "--sign", "--delete", "--force") for t in rest):
+                return False
+            pos = [t for t in rest if not t.startswith("-")]
+            return len(pos) == 0 or ("-l" in rest or "--list" in rest)
+        return False
+
+    if exe == "gh":
+        if len(seg) < 3:
+            return False
+        noun, verb = seg[1], seg[2]
+        allowed_verbs = COORDINATOR_READ_ONLY_GH_VERBS.get(noun)
+        return bool(allowed_verbs and verb in allowed_verbs)
+
+    return False
+
+
+def is_quota_exhausted_error(error_text: str) -> bool:
+    """Return True if ``error_text`` indicates quota, capacity, or rate-limit exhaustion."""
+    return bool(error_text and SWARM_QUOTA_ERROR_RE.search(error_text))
+
+
+def classify_quota_window(error_text: str = "", wait_seconds: Optional[float] = None) -> str:
+    """Classify quota pause window into ``5h``, ``weekly``, or ``unknown``."""
+    low = (error_text or "").lower()
+    if any(tok in low for tok in ("weekly", "haftalık", "7-day", "7 day", "7d")):
+        return "weekly"
+    if any(tok in low for tok in ("5-hour", "5 hour", "5h", "5 saat", "rolling")):
+        return "5h"
+    if wait_seconds is not None:
+        if wait_seconds > 6 * 3600:
+            return "weekly"
+        if wait_seconds > 0:
+            return "5h"
+    return "unknown"
+
+
+def _parse_iso_timestamp_epoch(raw_ts: str) -> Optional[float]:
+    """Parse an ISO-8601 timestamp string into a UTC epoch float."""
+    cleaned = raw_ts.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    elif re.search(r"[+-]\d{4}$", cleaned):
+        cleaned = cleaned[:-2] + ":" + cleaned[-2:]
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _default_quota_probe_seconds() -> float:
+    raw = os.environ.get("HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC", "").strip()
+    if raw:
+        try:
+            return max(0.1, float(raw))
+        except ValueError:
+            pass
+    return DEFAULT_SWARM_QUOTA_PROBE_SEC
+
+
+def _max_quota_backoff_seconds() -> float:
+    raw = os.environ.get("HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC", "").strip()
+    if raw:
+        try:
+            return max(0.2, float(raw))
+        except ValueError:
+            pass
+    return DEFAULT_SWARM_QUOTA_MAX_BACKOFF_SEC
+
+
+def parse_quota_reset_epoch(
+    error_text: str,
+    now_epoch: Optional[float] = None,
+    buffer_sec: int = DEFAULT_SWARM_QUOTA_BUFFER_SEC,
+    default_probe_sec: Optional[float] = None,
+) -> tuple[float, bool]:
+    """Extract reset time (ISO-8601 or relative duration) from ``error_text`` with buffer.
+
+    Returns ``(target_epoch, parsed_explicitly)``.
+    """
+    now = time.time() if now_epoch is None else float(now_epoch)
+    buf = max(0, int(buffer_sec))
+    probe = _default_quota_probe_seconds() if default_probe_sec is None else max(0.1, float(default_probe_sec))
+
+    text = error_text or ""
+    iso_m = re.search(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)", text)
+    if iso_m:
+        parsed_ep = _parse_iso_timestamp_epoch(iso_m.group(1))
+        if parsed_ep is not None and parsed_ep > now:
+            return parsed_ep + buf, True
+
+    # Prefer clause after resets/retry/wait/after if present
+    clause_m = re.search(
+        r"(?:resets?|retry|try\s+again|available|wait)\s*(?:in|after)?\s*[: ]+([^\n.;]+)",
+        text,
+        re.IGNORECASE,
+    )
+    dur_target = clause_m.group(1) if clause_m else text
+    dur_re = re.compile(
+        r"(?<![A-Za-z0-9-])(\d+(?:\.\d+)?)\s*"
+        r"(days?|d|hours?|hrs?|h|saat|minutes?|mins?|m|dakika|seconds?|secs?|s|saniye)"
+        r"(?![A-Za-z0-9-])(?!\s*[-–]?\s*(?:quota|limit|cap|window|kota))",
+        re.IGNORECASE,
+    )
+    total_sec = 0.0
+    matched_any = False
+    for m in dur_re.finditer(dur_target):
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        matched_any = True
+        if unit in ("d", "day", "days"):
+            total_sec += val * 86400.0
+        elif unit in ("h", "hr", "hrs", "hour", "hours", "saat"):
+            total_sec += val * 3600.0
+        elif unit in ("m", "min", "mins", "minute", "minutes", "dakika"):
+            total_sec += val * 60.0
+        else:
+            total_sec += val
+
+    if matched_any and total_sec > 0:
+        return now + total_sec + buf, True
+
+    return now + probe, False
+
+
+def _epoch_to_iso_utc(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_swarm_quota_state(workspace: Path) -> dict[str, Any]:
+    """Read ``.harness/state/swarm/swarm-quota-wait.json`` safely without side effects."""
+    swarm_dir = _existing_swarm_state_dir(workspace)
+    if swarm_dir is None:
+        return {}
+    data = read_json_file(swarm_dir / "swarm-quota-wait.json")
+    return data if isinstance(data, dict) else {}
+
+
+def has_active_swarm_quota_wait(workspace: Path) -> bool:
+    """Return True if workspace has an active ``waiting`` or ``resuming`` quota wait."""
+    state = get_swarm_quota_state(workspace)
+    return str(state.get("status") or "") in ("waiting", "resuming")
+
+
+def record_swarm_quota_pause(
+    workspace: Path,
+    *,
+    conversation_id: str = "",
+    model: str = "",
+    reason: str = "",
+    resume_at: str = "",
+    wait_seconds: Optional[float] = None,
+    buffer_seconds: int = DEFAULT_SWARM_QUOTA_BUFFER_SEC,
+    window: str = "",
+    paused_members: Optional[list[str]] = None,
+    source: str = "manual",
+    now_epoch: Optional[float] = None,
+) -> dict[str, Any]:
+    """Persist ``swarm-quota-wait.json`` for Pure-Wait quota recovery across 5h/weekly windows."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    buf = max(0, int(buffer_seconds))
+    state_dir = get_swarm_state_dir(workspace)
+
+    target_epoch: Optional[float] = None
+    if resume_at.strip():
+        parsed = _parse_iso_timestamp_epoch(resume_at)
+        if parsed is None:
+            raise ValueError(f"Invalid --resume-at ISO-8601 timestamp: {resume_at}")
+        target_epoch = parsed + buf
+    elif wait_seconds is not None:
+        if wait_seconds < 0:
+            raise ValueError("--wait-seconds must be non-negative")
+        target_epoch = now + float(wait_seconds) + buf
+    else:
+        target_epoch, _ = parse_quota_reset_epoch(reason, now_epoch=now, buffer_sec=buf)
+
+    inferred_window = window.strip().lower() if window.strip() else ""
+    if inferred_window not in ("5h", "weekly", "unknown"):
+        inferred_window = classify_quota_window(reason, wait_seconds=(target_epoch - now))
+    elif not inferred_window:
+        inferred_window = classify_quota_window(reason, wait_seconds=(target_epoch - now))
+
+    clean_conv = conversation_id.strip()
+    coord_data = _read_swarm_coordinator_data(workspace)
+    coords = coord_data.get("coordinators") if isinstance(coord_data.get("coordinators"), dict) else {}
+    coord_entry = coords.get(clean_conv or "__default__") if isinstance(coords, dict) else None
+    coord_workers = list(coord_entry.get("workers") or []) if isinstance(coord_entry, dict) else []
+
+    with locked_state_file(state_dir, "swarm-quota-wait"):
+        quota_path = state_dir / "swarm-quota-wait.json"
+        existing = read_json_file(quota_path) or {}
+        if not clean_conv:
+            clean_conv = str(existing.get("conversationId") or "").strip()
+
+        merged_members: list[str] = []
+        for src_list in (existing.get("pausedMembers") or [], coord_workers, paused_members or []):
+            if not isinstance(src_list, list):
+                continue
+            for m in src_list:
+                ms = str(m).strip()
+                if ms and ms not in merged_members:
+                    merged_members.append(ms)
+
+        delta_sec = max(0.0, target_epoch - now)
+        rec_sched = max(1, int(round(delta_sec)))
+        payload: dict[str, Any] = {
+            "schemaVersion": CACHE_SCHEMA_VERSION,
+            "status": "waiting",
+            "conversationId": clean_conv,
+            "model": model.strip() or str(existing.get("model") or ""),
+            "window": inferred_window,
+            "reason": SECRET_REDACT_RE.sub("[REDACTED]", (reason or "").strip())[:500],
+            "pausedMembers": merged_members,
+            "source": source,
+            "pausedAt": existing.get("pausedAt") if existing.get("status") == "waiting" and existing.get("pausedAt") else _epoch_to_iso_utc(now),
+            "resumeAt": _epoch_to_iso_utc(target_epoch),
+            "resumeAtEpoch": int(round(target_epoch)),
+            "nextProbeEpoch": round(target_epoch, 3),
+            "attemptCount": int(existing.get("attemptCount", 0)) if existing.get("status") == "waiting" else 0,
+            "lastAttemptAt": existing.get("lastAttemptAt", "") if existing.get("status") == "waiting" else "",
+            "lastAttemptError": existing.get("lastAttemptError", "") if existing.get("status") == "waiting" else "",
+            "recommendedScheduleSeconds": rec_sched,
+            "chunkedScheduleSeconds": min(rec_sched, 21600),
+            "updatedAt": _epoch_to_iso_utc(now),
+        }
+        atomic_write_json(state_dir, "swarm-quota-wait.json", payload)
+        return payload
+
+
+def resume_swarm_quota_wait(workspace: Path) -> dict[str, Any]:
+    """Transition ``swarm-quota-wait.json`` to ``resumed`` under lock."""
+    state_dir = get_swarm_state_dir(workspace)
+    now_iso = utc_now_iso()
+    with locked_state_file(state_dir, "swarm-quota-wait"):
+        quota_path = state_dir / "swarm-quota-wait.json"
+        existing = read_json_file(quota_path) or {}
+        existing["schemaVersion"] = CACHE_SCHEMA_VERSION
+        existing["status"] = "resumed"
+        existing["resumedAt"] = now_iso
+        existing["updatedAt"] = now_iso
+        atomic_write_json(state_dir, "swarm-quota-wait.json", existing)
+        return existing
+
+
+def clear_swarm_quota_wait(workspace: Path) -> dict[str, Any]:
+    """Clear ``swarm-quota-wait.json`` state under lock."""
+    swarm_dir = _existing_swarm_state_dir(workspace)
+    if swarm_dir is None:
+        return {"cleared": True}
+    quota_path = swarm_dir / "swarm-quota-wait.json"
+    with locked_state_file(swarm_dir, "swarm-quota-wait"):
+        if quota_path.is_file():
+            quota_path.unlink()
+    return {"cleared": True}
+
+
+def attempt_swarm_quota_resume(workspace: Path, now_epoch: Optional[float] = None) -> dict[str, Any]:
+    """Probe and resume a paused Swarm Coordinator via ``agy --conversation`` when due."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    swarm_dir = _existing_swarm_state_dir(workspace)
+    if swarm_dir is None:
+        return {"status": "idle", "reason": "no swarm state directory"}
+    quota_path = swarm_dir / "swarm-quota-wait.json"
+
+    with locked_state_file(swarm_dir, "swarm-quota-wait"):
+        state = read_json_file(quota_path)
+        if not isinstance(state, dict) or state.get("status") not in ("waiting", "resuming"):
+            return {"status": str((state or {}).get("status") or "idle")}
+        next_probe = float(state.get("nextProbeEpoch") or 0)
+        if next_probe > now:
+            return {"status": "waiting", "nextProbeEpoch": next_probe}
+
+        conv_id = str(state.get("conversationId") or "").strip()
+        if not conv_id or conv_id.startswith("-"):
+            state["status"] = "waiting"
+            state["lastAttemptAt"] = _epoch_to_iso_utc(now)
+            state["lastAttemptError"] = "missing or invalid conversationId for agy --conversation resume"
+            state["nextProbeEpoch"] = round(now + _default_quota_probe_seconds(), 3)
+            state["resumeAt"] = _epoch_to_iso_utc(state["nextProbeEpoch"])
+            state["updatedAt"] = _epoch_to_iso_utc(now)
+            atomic_write_json(swarm_dir, "swarm-quota-wait.json", state)
+            return dict(state)
+
+        state["status"] = "resuming"
+        state["lastAttemptAt"] = _epoch_to_iso_utc(now)
+        state["updatedAt"] = _epoch_to_iso_utc(now)
+        atomic_write_json(swarm_dir, "swarm-quota-wait.json", state)
+        paused_members = [str(m) for m in (state.get("pausedMembers") or []) if str(m).strip()]
+        model_hint = str(state.get("model") or "").strip()
+        attempt_num = int(state.get("attemptCount", 0)) + 1
+
+    agy_bin = _resolve_cli_binary("HARNESS_AGY_BIN", "agy")
+    raw_timeout = os.environ.get("HARNESS_SWARM_RESUME_TIMEOUT_SEC", str(DEFAULT_SWARM_RESUME_TIMEOUT_SEC)).strip()
+    try:
+        timeout_sec = max(1.0, float(raw_timeout))
+    except ValueError:
+        timeout_sec = DEFAULT_SWARM_RESUME_TIMEOUT_SEC
+
+    members_str = ", ".join(f"@{m}" for m in paused_members) if paused_members else "all paused workers"
+    resume_prompt = (
+        "[SWARM_QUOTA_AUTO_RESUME] Quota wait window elapsed. Follow Pure-Wait Quota Policy strictly: "
+        "do NOT kill workers and do NOT switch models unless the user asked. "
+        "1) Call swarm(action='models') and check quota_remaining for your current model"
+        + (f" ({model_hint})" if model_hint else "")
+        + ". 2) If quota is still exhausted, run `./scripts/stamp-gate.sh swarm-quota pause` with the new reset time and set `schedule`. "
+        "3) If quota is restored, run `./scripts/stamp-gate.sh swarm-quota resume`, call `read_board`, and post to resume "
+        f"{members_str} from where they left off."
+    )
+
+    err_msg = ""
+    succeeded = False
+    if not agy_bin:
+        err_msg = "agy CLI binary not found in PATH"
+    else:
+        clean_env = {k: v for k, v in os.environ.items() if k not in REVIEW_SCRUB_ENV_KEYS}
+        cmd = [agy_bin, "--conversation", conv_id, f"--print={resume_prompt}"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(workspace),
+                env=clean_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+            combined = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
+            if proc.returncode == 0 and not is_quota_exhausted_error(combined):
+                succeeded = True
+            else:
+                err_msg = _summarize_cli_failure(proc.returncode, proc.stderr, proc.stdout)
+        except subprocess.TimeoutExpired:
+            err_msg = f"agy --conversation timed out after {timeout_sec}s"
+        except OSError as exc:
+            err_msg = f"Failed to execute agy CLI: {exc}"
+
+    done_now = time.time() if now_epoch is None else max(now, float(now_epoch))
+    with locked_state_file(swarm_dir, "swarm-quota-wait"):
+        cur = read_json_file(quota_path)
+        if not isinstance(cur, dict):
+            return {"status": "cleared"}
+        if cur.get("status") in ("resumed", "cleared"):
+            return dict(cur)
+
+        cur["attemptCount"] = attempt_num
+        cur["lastAttemptAt"] = _epoch_to_iso_utc(done_now)
+        cur["updatedAt"] = _epoch_to_iso_utc(done_now)
+        if succeeded:
+            cur["status"] = "resumed"
+            cur["resumedAt"] = _epoch_to_iso_utc(done_now)
+            cur["lastAttemptError"] = ""
+        else:
+            parsed_next, explicit_reset = parse_quota_reset_epoch(err_msg, now_epoch=done_now)
+            if explicit_reset:
+                next_probe = parsed_next
+            else:
+                base_probe = _default_quota_probe_seconds()
+                max_backoff = _max_quota_backoff_seconds()
+                delay = min(max_backoff, base_probe * (2 ** min(attempt_num - 1, 3)))
+                next_probe = done_now + delay
+            cur["status"] = "waiting"
+            cur["lastAttemptError"] = SECRET_REDACT_RE.sub("[REDACTED]", err_msg)[:400]
+            cur["nextProbeEpoch"] = round(next_probe, 3)
+            cur["resumeAtEpoch"] = int(round(next_probe))
+            cur["resumeAt"] = _epoch_to_iso_utc(next_probe)
+        atomic_write_json(swarm_dir, "swarm-quota-wait.json", cur)
+        return dict(cur)
+
+
 def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate ``swarm`` PreToolUse guard with non-blocking brief enrichment."""
+    """Evaluate ``swarm`` PreToolUse guard with Coordinator tracking, Pure-Wait protection, and brief enrichment."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
     if not isinstance(hook_input, dict):
@@ -2882,11 +3678,68 @@ def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str,
         return {"decision": "allow"}
 
     action = str(args.get("action") or "").strip().lower()
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
+    last_input = str(hook_input.get("lastUserInput") or "")
+
+    if action == "title":
+        if cur_conv and not _is_worker_prompt_text(last_input):
+            register_swarm_coordinator(
+                workspace,
+                conversation_id=cur_conv,
+                active=True,
+                title=str(args.get("title") or "").strip(),
+                source="swarm-tool",
+            )
+        return {"decision": "allow"}
+
+    if action in ("model", "kill"):
+        q_state = get_swarm_quota_state(workspace)
+        q_status = str(q_state.get("status") or "")
+        q_conv = str(q_state.get("conversationId") or "").strip()
+        if q_status in ("waiting", "resuming") and (not cur_conv or not q_conv or cur_conv == q_conv):
+            resume_at = str(q_state.get("resumeAt") or "quota reset")
+            return {
+                "decision": "force_ask",
+                "reason": (
+                    f"Swarm Pure-Wait Quota Policy active (status: {q_status}, resumeAt: {resume_at}). "
+                    f"Confirm only if you explicitly want to execute swarm(action='{action}') instead of waiting for quota reset on the current model."
+                ),
+            }
+        return {"decision": "allow"}
+
     if action != "add":
         return {"decision": "allow"}
 
     worker_name = str(args.get("name") or "").strip()
-    if worker_name and SWARM_SYSTEM_ROLE_RE.match(worker_name.lower()):
+    is_system_role = bool(worker_name and SWARM_SYSTEM_ROLE_RE.match(worker_name.lower()))
+
+    if cur_conv and not _is_worker_prompt_text(last_input):
+        coord_data = _read_swarm_coordinator_data(workspace)
+        coords = coord_data.get("coordinators") if isinstance(coord_data.get("coordinators"), dict) else {}
+        existing_entry = coords.get(cur_conv)
+        other_active = any(
+            k != cur_conv and isinstance(v, dict) and v.get("active") is True and v.get("explicitlyDisabled") is not True
+            for k, v in coords.items()
+        )
+        initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+        in_other_wt = _is_in_different_linked_worktree(workspace, initial_cwd)
+
+        should_register = False
+        if isinstance(existing_entry, dict):
+            should_register = existing_entry.get("active") is True and existing_entry.get("explicitlyDisabled") is not True
+        elif _has_explicit_swarm_slash_command(last_input) or (not other_active and not in_other_wt):
+            should_register = True
+
+        if should_register:
+            register_swarm_coordinator(
+                workspace,
+                conversation_id=cur_conv,
+                active=True,
+                source="swarm-tool",
+                worker_name="" if is_system_role else worker_name,
+            )
+
+    if is_system_role:
         return {"decision": "allow"}
 
     brief = str(args.get("brief") or "")
@@ -2898,7 +3751,6 @@ def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str,
     effort = "MEDIUM"
     if worker_name:
         candidates = _ordered_candidate_worktrees(workspace, brief)
-        cur_conv = str(hook_input.get("conversationId") or "").strip()
         entry, _ = _try_consume_optional_dispatch(
             candidates,
             worker_name,
@@ -2910,11 +3762,15 @@ def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str,
             if is_valid_effort_profile(reg_effort):
                 effort = reg_effort
 
+    is_integrator = bool(worker_name and SWARM_INTEGRATOR_ROLE_RE.match(worker_name.lower()))
     leading_headers = _leading_bracket_header_block(brief)
     headers: list[str] = []
     if "[EFFORT_PROFILE:" not in leading_headers:
         headers.append(EFFORT_PROFILE_HEADERS[effort])
-    if "[SWARM_WORKER_CONTRACT" not in leading_headers:
+    if is_integrator:
+        if "[SWARM_INTEGRATOR_CONTRACT" not in leading_headers:
+            headers.append(SWARM_INTEGRATOR_CONTRACT_HEADER)
+    elif "[SWARM_WORKER_CONTRACT" not in leading_headers:
         headers.append(SWARM_WORKER_CONTRACT_HEADER)
     if ws_mode in ("share", "branch") and "[SWARM_BRANCH_GUARD" not in leading_headers:
         headers.append(SWARM_BRANCH_GUARD_HEADER)
@@ -3137,6 +3993,15 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     tool_name = str(tool_call.get("name") or "")
     if tool_name == "swarm":
         return evaluate_pre_swarm(workspace, hook_input)
+    if tool_name in ("invoke_subagent", "run_workflow") and is_active_swarm_coordinator(workspace, hook_input):
+        return {
+            "decision": "deny",
+            "reason": (
+                f"Swarm Coordinator-Only guard: active Swarm Coordinator cannot invoke '{tool_name}' directly. "
+                "Delegate research, implementation, verification, and integration/audit tasks to Swarm workers "
+                "(e.g. planner, implementer, verifier, integrator) via swarm(action='add') or post_message."
+            ),
+        }
     if tool_name == "run_workflow":
         return evaluate_pre_workflow(workspace, hook_input)
     if tool_name and tool_name != "invoke_subagent":
@@ -3265,16 +4130,37 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     return _build_subagent_overwrite(model, effort, orig_prompt)
 
 
-def evaluate_stop_gate(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate Stop hook gate scoped by worktree and optional ``conversationId``."""
+def evaluate_stop_gate(
+    workspace: Path,
+    hook_input: dict[str, Any],
+    on_swarm_quota_wait: Optional[Callable[[Path], None]] = None,
+) -> dict[str, Any]:
+    """Evaluate Stop hook gate scoped by worktree, ``conversationId``, and Swarm quota ERROR recovery."""
     if is_harness_ignored(workspace):
         return {}
     if not isinstance(hook_input, dict):
         return {}
-    if str(hook_input.get("terminationReason") or "") != "NO_TOOL_CALL":
+
+    term_reason = str(hook_input.get("terminationReason") or "")
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
+
+    if term_reason == "ERROR":
+        err_text = str(hook_input.get("error") or "")
+        if is_quota_exhausted_error(err_text) and is_active_swarm_coordinator(workspace, hook_input):
+            record_swarm_quota_pause(
+                workspace,
+                conversation_id=cur_conv,
+                model=str(hook_input.get("modelName") or ""),
+                reason=err_text,
+                source="stop-error",
+            )
+            if on_swarm_quota_wait is not None:
+                on_swarm_quota_wait(workspace)
         return {}
 
-    cur_conv = str(hook_input.get("conversationId") or "").strip()
+    if term_reason != "NO_TOOL_CALL":
+        return {}
+
     candidates = _ordered_candidate_worktrees(workspace)
     passes = (True, False) if cur_conv else (False,)
     saw_exact_match = False
@@ -5439,6 +6325,24 @@ def build_session_start_payload(
         except Exception:
             pass
 
+    if is_active_swarm_coordinator(workspace, hook_input):
+        lines.append(
+            "[SWARM COORDINATOR MODE] Active Swarm Coordinator-Only guard is enabled: "
+            "delegate all file edits, builds/tests, git mutations, Walkthroughs, and PR gates to Swarm workers "
+            "(planner, implementer, verifier, integrator)."
+        )
+
+    q_state = get_swarm_quota_state(workspace)
+    if str(q_state.get("status") or "") in ("waiting", "resuming"):
+        q_members = ", ".join(str(m) for m in (q_state.get("pausedMembers") or []) if str(m).strip()) or "none"
+        lines.append(
+            f"[SWARM QUOTA WAIT ACTIVE] Window: {q_state.get('window') or 'unknown'}, "
+            f"resumeAt: {q_state.get('resumeAt') or 'unknown'}, pausedMembers: {q_members}. "
+            "Pure-Wait Quota Policy: do NOT kill workers or switch models unless the user asked; "
+            "check swarm(action='models') and either resume paused workers (stamp-gate.sh swarm-quota resume + @mention) "
+            "or re-arm schedule(DurationSeconds=...)."
+        )
+
     return {"injectSteps": [{"systemMessage": {"systemMessage": "\n".join(lines)}}]}
 
 
@@ -5545,6 +6449,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_ios = sub.add_parser("parse-ios-crash")
     p_ios.add_argument("--diag-dir", required=True)
     p_ios.add_argument("--bundle-id", default="")
+
+    p_sw_coord = sub.add_parser("swarm-coordinator")
+    p_sw_coord.add_argument("--workspace", default=".")
+    p_sw_coord.add_argument("--action", required=True, choices=["on", "off", "status"])
+    p_sw_coord.add_argument("--conversation-id", default="")
+    p_sw_coord.add_argument("--title", default="")
+
+    p_sw_quota = sub.add_parser("swarm-quota")
+    p_sw_quota.add_argument("--workspace", default=".")
+    p_sw_quota.add_argument("--action", required=True, choices=["pause", "resume", "status", "clear", "attempt-resume"])
+    p_sw_quota.add_argument("--conversation-id", default="")
+    p_sw_quota.add_argument("--resume-at", default="")
+    p_sw_quota.add_argument("--wait-seconds", type=float, default=None)
+    p_sw_quota.add_argument("--buffer-seconds", type=int, default=DEFAULT_SWARM_QUOTA_BUFFER_SEC)
+    p_sw_quota.add_argument("--window", default="")
+    p_sw_quota.add_argument("--model", default="")
+    p_sw_quota.add_argument("--reason", default="")
+    p_sw_quota.add_argument("--member", action="append", default=[])
 
     args = parser.parse_args(argv)
 
@@ -5686,6 +6608,65 @@ def main(argv: Optional[list[str]] = None) -> int:
         res = parse_ios_crash_report(Path(args.diag_dir), bundle_id=args.bundle_id, allow_unmatched_fallback=True)
         for line in res.get("lines", []):
             print(line)
+        return 0
+
+    if args.subcommand == "swarm-coordinator":
+        ws = Path(args.workspace)
+        if args.action == "on":
+            res = register_swarm_coordinator(
+                ws,
+                conversation_id=args.conversation_id,
+                active=True,
+                title=args.title,
+                source="cli",
+            )
+            print(json.dumps(res, ensure_ascii=False))
+            return 0
+        if args.action == "off":
+            res = register_swarm_coordinator(
+                ws,
+                conversation_id=args.conversation_id,
+                active=False,
+                source="cli",
+                explicitly_disabled=True,
+            )
+            print(json.dumps(res, ensure_ascii=False))
+            return 0
+        res = get_swarm_coordinator_status(ws, conversation_id=args.conversation_id)
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
+
+    if args.subcommand == "swarm-quota":
+        ws = Path(args.workspace)
+        if args.action == "pause":
+            try:
+                res = record_swarm_quota_pause(
+                    ws,
+                    conversation_id=args.conversation_id,
+                    model=args.model,
+                    reason=args.reason,
+                    resume_at=args.resume_at,
+                    wait_seconds=args.wait_seconds,
+                    buffer_seconds=args.buffer_seconds,
+                    window=args.window,
+                    paused_members=args.member or None,
+                    source="cli",
+                )
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            print(json.dumps(res, ensure_ascii=False))
+            return 0
+        if args.action == "resume":
+            print(json.dumps(resume_swarm_quota_wait(ws), ensure_ascii=False))
+            return 0
+        if args.action == "clear":
+            print(json.dumps(clear_swarm_quota_wait(ws), ensure_ascii=False))
+            return 0
+        if args.action == "attempt-resume":
+            print(json.dumps(attempt_swarm_quota_resume(ws), ensure_ascii=False))
+            return 0
+        print(json.dumps(get_swarm_quota_state(ws), ensure_ascii=False))
         return 0
 
     return 1

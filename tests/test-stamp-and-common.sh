@@ -1406,4 +1406,63 @@ EOF
   fi
 }
 
+test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
+  local repo coord_file quota_file
+  repo=$(make_temp_repo)
+  coord_file="$repo/.harness/state/swarm/swarm-coordinator.json"
+  quota_file="$repo/.harness/state/swarm/swarm-quota-wait.json"
+
+  # 1. swarm-coordinator on / status / off
+  local out_on out_st out_off
+  out_on=$("$STAMP_GATE" swarm-coordinator on --workspace "$repo" --conversation-id "conv-cli" --title "CLI Swarm")
+  assert_json_field "$out_on" ".active" "true"
+  assert_json_field "$out_on" ".title" "CLI Swarm"
+  [ -f "$coord_file" ] || { echo "Missing $coord_file" >&2; return 1; }
+
+  out_st=$("$STAMP_GATE" swarm-coordinator status --workspace "$repo" --conversation-id "conv-cli")
+  assert_json_field "$out_st" ".active" "true"
+  assert_json_field "$out_st" ".conversationId" "conv-cli"
+
+  out_off=$("$STAMP_GATE" swarm-coordinator off --workspace "$repo" --conversation-id "conv-cli")
+  assert_json_field "$out_off" ".active" "false"
+  assert_json_field "$out_off" ".explicitlyDisabled" "true"
+
+  # 2. swarm-quota pause / status / resume / clear
+  local out_pause out_qst out_res out_clr
+  out_pause=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --wait-seconds 18000 --buffer-seconds 60 --window 5h --model "gemini-4-neon-high" --reason "5-hour rolling window exhausted" --member "worker-a" --member "worker-b")
+  assert_json_field "$out_pause" ".status" "waiting"
+  assert_json_field "$out_pause" ".window" "5h"
+  assert_json_field "$out_pause" ".recommendedScheduleSeconds" "18060"
+  assert_json_field "$out_pause" ".chunkedScheduleSeconds" "18060"
+  assert_json_field "$out_pause" '.pausedMembers | join(",")' "worker-a,worker-b"
+  [ -f "$quota_file" ] || { echo "Missing $quota_file" >&2; return 1; }
+
+  out_qst=$("$STAMP_GATE" swarm-quota status --workspace "$repo")
+  assert_json_field "$out_qst" ".status" "waiting"
+
+  # Weekly pause (> 6h) caps chunkedScheduleSeconds at 21600
+  local out_weekly
+  out_weekly=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --wait-seconds 172800 --buffer-seconds 0 --window weekly)
+  assert_json_field "$out_weekly" ".window" "weekly"
+  assert_json_field "$out_weekly" ".recommendedScheduleSeconds" "172800"
+  assert_json_field "$out_weekly" ".chunkedScheduleSeconds" "21600"
+
+  out_res=$("$STAMP_GATE" swarm-quota resume --workspace "$repo")
+  assert_json_field "$out_res" ".status" "resumed"
+
+  out_clr=$("$STAMP_GATE" swarm-quota clear --workspace "$repo")
+  assert_json_field "$out_clr" ".cleared" "true"
+  [ ! -f "$quota_file" ] || { echo "swarm-quota clear must remove $quota_file" >&2; return 1; }
+
+  # 3. Invalid flags fail closed
+  if "$STAMP_GATE" swarm-quota pause --workspace "$repo" --resume-at "not-a-timestamp" >/dev/null 2>&1; then
+    echo "Invalid --resume-at must fail" >&2
+    return 1
+  fi
+  if "$STAMP_GATE" swarm-quota pause --workspace "$repo" --wait-seconds "-5" >/dev/null 2>&1; then
+    echo "Negative --wait-seconds must fail" >&2
+    return 1
+  fi
+}
+
 run_tests "$@"

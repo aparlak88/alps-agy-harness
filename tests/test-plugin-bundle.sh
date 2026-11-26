@@ -95,6 +95,7 @@ test_all_eleven_skills_frontmatter_and_folder_match() {
   assert_contains "$pre_pr_content" "çözülmüş" "pre-pr-readiness must instruct cleaning resolved parking-lot items"
   assert_contains "$pre_pr_content" "Swarm Entegrasyon Dalı Kuralı" "pre-pr-readiness must document Swarm integration branch rule"
   assert_contains "$pre_pr_content" "entegrasyon dalında birleştirilir" "pre-pr-readiness must require merging Swarm worker branches into coordinator integration branch first"
+  assert_contains "$pre_pr_content" "integrator" "pre-pr-readiness must assign PR integration to integrator Swarm worker"
 
   assert_contains "$entropy_content" "docs/parking-lot.md" "entropy-sweep must inspect docs/parking-lot.md"
   assert_contains "$entropy_content" "stale check" "entropy-sweep must perform stale check before jev_score"
@@ -200,6 +201,8 @@ test_templates_and_readme_glossary_and_mermaid_contracts() {
   assert_contains "$readme_content" "run-jev-mcp.sh" "README.md must document TYPESAFE wrapper script"
   assert_contains "$readme_content" "Antigravity Swarm ile Kullanım" "README.md must document Antigravity Swarm usage subsection"
   assert_contains "$readme_content" 'workspace: "share"' "README.md must document Swarm workspace: \"share\" mode"
+  assert_contains "$readme_content" "Coordinator-Only" "README.md must document Coordinator-Only enforcement"
+  assert_contains "$readme_content" "swarm-quota-wait.json" "README.md must document swarm-quota-wait.json quota recovery"
   assert_contains "$readme_content" "invoke_subagent|swarm" "README.md must document invoke_subagent|swarm hook matcher"
   assert_contains "$readme_content" "detached-wt-*" "README.md must document detached-wt-* stable worktree slug"
   assert_contains "$readme_content" "Swarm (Antigravity Swarm)" "README.md glossary must include Swarm (Antigravity Swarm)"
