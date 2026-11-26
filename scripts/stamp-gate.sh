@@ -38,7 +38,7 @@ Usage:
   stamp-gate.sh verify-pr-stamps [--workspace <dir>]
   stamp-gate.sh clear-pr-audit [--workspace <dir>]
   stamp-gate.sh swarm-coordinator on|off|status [--conversation-id <id>] [--title <title>] [--workspace <dir>]
-  stamp-gate.sh swarm-quota pause|resume|status|clear [--resume-at <iso>] [--wait-seconds <sec>] [--buffer-seconds <sec>] [--window 5h|weekly|unknown] [--model <id>] [--reason <text>] [--member <name> ...] [--conversation-id <id>] [--workspace <dir>]
+  stamp-gate.sh swarm-quota pause|resume|status|clear|attempt-resume [--resume-at <iso>] [--wait-seconds <sec>] [--buffer-seconds <sec>] [--window 5h|weekly|unknown] [--model <id>] [--reason <text>] [--member <name> ...] [--conversation-id <id>] [--workspace <dir>]
 EOF
 }
 
@@ -872,7 +872,7 @@ cmd_swarm_quota() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --action)
-        [ $# -ge 2 ] || { echo "Error: --action requires pause, resume, status, or clear" >&2; exit 1; }
+        [ $# -ge 2 ] || { echo "Error: --action requires pause, resume, status, clear, or attempt-resume" >&2; exit 1; }
         action="$2"
         shift 2
         ;;
@@ -960,7 +960,7 @@ cmd_swarm_quota() {
   done
 
   if [ "$action" != "pause" ] && [ "$action" != "resume" ] && [ "$action" != "status" ] && [ "$action" != "clear" ] && [ "$action" != "attempt-resume" ]; then
-    echo "Error: swarm-quota requires action: pause, resume, status, or clear" >&2
+    echo "Error: swarm-quota requires action: pause, resume, status, clear, or attempt-resume" >&2
     exit 1
   fi
 
@@ -1001,8 +1001,9 @@ cmd_swarm_quota() {
   printf '%s\n' "$out"
 
   if [ "$action" = "pause" ]; then
-    local evt_payload
-    evt_payload="$(jq -nc --arg ws "$WORKSPACE" '{workspace: $ws}' 2>/dev/null || true)"
+    local abs_ws evt_payload
+    abs_ws="$(cd "$WORKSPACE" && pwd -P)"
+    evt_payload="$(jq -nc --arg ws "$abs_ws" '{workspace: $ws}' 2>/dev/null || true)"
     if [ -n "$evt_payload" ]; then
       harness_daemon_call "/event/swarm-quota-wait" "$evt_payload" >/dev/null 2>&1 || true
     fi

@@ -1427,8 +1427,8 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
   assert_json_field "$out_off" ".active" "false"
   assert_json_field "$out_off" ".explicitlyDisabled" "true"
 
-  # 2. swarm-quota pause / status / resume / clear
-  local out_pause out_qst out_res out_clr
+  # 2. swarm-quota pause / status / resume / clear / window inference / non-inheritance
+  local out_pause out_qst out_res out_clr out_iso out_infer_5h out_infer_wk
   out_pause=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --wait-seconds 18000 --buffer-seconds 60 --window 5h --model "gemini-4-neon-high" --reason "5-hour rolling window exhausted" --member "worker-a" --member "worker-b")
   assert_json_field "$out_pause" ".status" "waiting"
   assert_json_field "$out_pause" ".window" "5h"
@@ -1440,29 +1440,156 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
   out_qst=$("$STAMP_GATE" swarm-quota status --workspace "$repo")
   assert_json_field "$out_qst" ".status" "waiting"
 
-  # Weekly pause (> 6h) caps chunkedScheduleSeconds at 21600
-  local out_weekly
-  out_weekly=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --wait-seconds 172800 --buffer-seconds 0 --window weekly)
-  assert_json_field "$out_weekly" ".window" "weekly"
-  assert_json_field "$out_weekly" ".recommendedScheduleSeconds" "172800"
-  assert_json_field "$out_weekly" ".chunkedScheduleSeconds" "21600"
+  # Valid --resume-at + --buffer-seconds 60
+  out_iso=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --resume-at "2030-05-01T10:00:00Z" --buffer-seconds 60 --window 5h)
+  assert_json_field "$out_iso" ".resumeAt" "2030-05-01T10:01:00Z"
+
+  # Window inference from --wait-seconds when --window omitted (<=6h -> 5h, >6h -> weekly)
+  out_infer_5h=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --wait-seconds 3600 --buffer-seconds 0)
+  assert_json_field "$out_infer_5h" ".window" "5h"
+  out_infer_wk=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --wait-seconds 25000 --buffer-seconds 0)
+  assert_json_field "$out_infer_wk" ".window" "weekly"
+  assert_json_field "$out_infer_wk" ".chunkedScheduleSeconds" "21600"
 
   out_res=$("$STAMP_GATE" swarm-quota resume --workspace "$repo")
   assert_json_field "$out_res" ".status" "resumed"
+
+  # New pause after resumed must NOT inherit old pausedMembers or old conversationId
+  local out_fresh
+  out_fresh=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --wait-seconds 10 --buffer-seconds 0 --member "worker-new")
+  assert_json_field "$out_fresh" ".conversationId" "" "Fresh pause after resumed must not inherit old conversationId"
+  assert_json_field "$out_fresh" '.pausedMembers | join(",")' "worker-new" "Fresh pause after resumed must not inherit old pausedMembers"
 
   out_clr=$("$STAMP_GATE" swarm-quota clear --workspace "$repo")
   assert_json_field "$out_clr" ".cleared" "true"
   [ ! -f "$quota_file" ] || { echo "swarm-quota clear must remove $quota_file" >&2; return 1; }
 
-  # 3. Invalid flags fail closed
-  if "$STAMP_GATE" swarm-quota pause --workspace "$repo" --resume-at "not-a-timestamp" >/dev/null 2>&1; then
-    echo "Invalid --resume-at must fail" >&2
-    return 1
-  fi
-  if "$STAMP_GATE" swarm-quota pause --workspace "$repo" --wait-seconds "-5" >/dev/null 2>&1; then
-    echo "Negative --wait-seconds must fail" >&2
-    return 1
-  fi
+  # 3. Invalid CLI flags & missing actions fail closed
+  local bad_args
+  for bad_args in \
+    "swarm-quota pause --resume-at not-a-timestamp" \
+    "swarm-quota pause --wait-seconds -5" \
+    "swarm-quota pause --window monthly" \
+    "swarm-quota pause --buffer-seconds abc" \
+    "swarm-quota" \
+    "swarm-quota pause --unknown-flag" \
+    "swarm-coordinator" \
+    "swarm-coordinator bogus"
+  do
+    # shellcheck disable=SC2086
+    if "$STAMP_GATE" --workspace "$repo" $bad_args >/dev/null 2>&1; then
+      echo "Expected failure for invalid CLI args: $bad_args" >&2
+      return 1
+    fi
+  done
+
+  # 4. swarm-quota attempt-resume failure, security, false-positive, and mid-flight re-pause/clear coverage
+  local mock_dir mock_agy env_log
+  mock_dir=$(mktemp -d)
+  _TEST_TEMP_DIRS+=("$mock_dir")
+  mock_agy="$mock_dir/mock-agy"
+  env_log="$mock_dir/agy-env.log"
+
+  # (a) Empty conversationId & dash-prefixed conversationId (arg-injection guard)
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_empty_cid
+  out_empty_cid=$("$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_empty_cid" ".status" "waiting"
+  assert_contains "$(printf '%s' "$out_empty_cid" | jq -r '.lastAttemptError')" "conversationId"
+
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "-evil-flag" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_dash_cid
+  out_dash_cid=$("$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_dash_cid" ".status" "waiting"
+  assert_contains "$(printf '%s' "$out_dash_cid" | jq -r '.lastAttemptError')" "conversationId"
+
+  # (b) Missing agy binary -> waiting + backoff
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_no_bin
+  out_no_bin=$(PATH="/usr/bin:/bin" HARNESS_AGY_BIN="" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="60" \
+    "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_no_bin" ".status" "waiting"
+  assert_contains "$(printf '%s' "$out_no_bin" | jq -r '.lastAttemptError')" "not found"
+
+  # (c) Timeout -> waiting + backoff
+  cat << 'EOF' > "$mock_agy"
+#!/usr/bin/env bash
+sleep 2
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_to
+  out_to=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_RESUME_TIMEOUT_SEC="0.3" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="30" \
+    "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_to" ".status" "waiting"
+  assert_contains "$(printf '%s' "$out_to" | jq -r '.lastAttemptError')" "timed out"
+
+  # (d) exit 0 with quota error in stderr -> MUST fail & backoff; exit 1 without quota text -> MUST fail & backoff
+  cat << 'EOF' > "$mock_agy"
+#!/usr/bin/env bash
+echo "429 RESOURCE_EXHAUSTED: quota exceeded" >&2
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_e0_q
+  out_e0_q=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="30" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_e0_q" ".status" "waiting"
+
+  cat << 'EOF' > "$mock_agy"
+#!/usr/bin/env bash
+echo "Internal error sk-secretkey999" >&2
+exit 1
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_e1_nq
+  out_e1_nq=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="30" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_e1_nq" ".status" "waiting"
+  assert_not_contains "$(printf '%s' "$out_e1_nq" | jq -r '.lastAttemptError')" "sk-secretkey999" "Secret in lastAttemptError must be redacted"
+
+  # (e) Explicit reset in error + exponential backoff + env scrubbing + prose non-false-positive
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+printf 'TYPESAFE=%s GITHUB=%s OPENAI=%s\n' "\${TYPESAFE_API_KEY:-}" "\${GITHUB_TOKEN:-}" "\${OPENAI_API_KEY:-}" > "$env_log"
+echo "The 5-hour usage limit has reset; all workers resumed."
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_prose
+  out_prose=$(TYPESAFE_API_KEY="ts_live_12345678" GITHUB_TOKEN="ghp_1234567890abcdef" OPENAI_API_KEY="sk-openai123456" \
+    HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_prose" ".status" "resumed" "Prose mentioning usage limit without error prefix must succeed"
+  assert_eq "TYPESAFE= GITHUB= OPENAI=" "$(cat "$env_log")" "All sensitive env vars must be scrubbed before invoking agy"
+
+  # (f) CRITICAL: Mid-flight re-pause by coordinator inside agy must NOT be overwritten to resumed on exit 0
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+"$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --resume-at "2031-01-01T00:00:00Z" --buffer-seconds 0 --window weekly >/dev/null
+echo "Re-paused until 2031-01-01T00:00:00Z"
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_repause
+  out_repause=$(HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_repause" ".status" "waiting" "Mid-flight re-pause must stay waiting (not overwritten to resumed)"
+  assert_json_field "$out_repause" ".resumeAt" "2031-01-01T00:00:00Z"
+  assert_json_field "$quota_file" ".status" "waiting"
+
+  # (g) Mid-flight clear by agy keeps file cleared on exit 0
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+"$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_mid_clr
+  out_mid_clr=$(HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_mid_clr" ".status" "cleared"
+  [ ! -f "$quota_file" ] || { echo "Mid-flight clear must keep swarm-quota-wait.json deleted" >&2; return 1; }
 }
 
 run_tests "$@"

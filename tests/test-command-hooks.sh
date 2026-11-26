@@ -1512,7 +1512,10 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git log -n 5" \
     "git diff main..HEAD" \
     "git worktree list" \
+    "git remote -v" \
+    "git tag -l" \
     "ls -la && cat README.md" \
+    "sort README.md | uniq" \
     "./scripts/stamp-gate.sh swarm-quota status --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-coordinator status --workspace \"$repo\"" \
     "./scripts/harness-doctor.sh --json" \
@@ -1527,7 +1530,7 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     assert_json_field "$out_ok" ".decision" "allow" "Coordinator must allow read-only/coordination command: $allowed_cmd"
   done
 
-  # 2. Denied work, mutation, shell bypass, and PR/stamp commands
+  # 2. Denied work, mutation, shell bypass, basename spoof, self-disable, and PR/stamp commands
   local denied_cmd
   for denied_cmd in \
     "npm test" \
@@ -1537,15 +1540,35 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git merge feat/worker" \
     "git push origin feat/coord-cmd" \
     "git branch -D old-branch" \
+    "git branch --set-upstream-to=origin/main" \
     "git branch new-branch" \
+    "git -c core.fsmonitor=evil status" \
+    "GIT_EXTERNAL_DIFF=evil git diff" \
+    "git diff --output=out.txt" \
+    "git remote add origin https://example.com/r.git" \
+    "git tag v1.0" \
+    "git worktree add /tmp/wt" \
     "gh pr create --fill" \
     "rm -rf src" \
+    "env -S \"rm -rf src\"" \
+    "sort -o README.md README.md" \
+    "uniq README.md out.txt" \
+    "rg --pre evil pat" \
+    "/tmp/fake/stamp-gate.sh dispatch" \
+    "./cat README.md" \
     "echo bad > README.md" \
+    "echo bad >> README.md" \
+    "echo bad &> out.txt" \
     'echo $(touch /tmp/pwned)' \
     "echo \`id\`" \
+    "cat <(id)" \
     "find . -name '*.tmp' -delete" \
+    "find . -exec rm {} \\;" \
+    "bash ./scripts/stamp-gate.sh canon --verdict PASS" \
     "./scripts/stamp-gate.sh canon --verdict PASS" \
     "./scripts/stamp-gate.sh security --verdict PASS --critical 0 --important 0" \
+    "./scripts/stamp-gate.sh swarm-coordinator off --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota clear --workspace \"$repo\"" \
     "python3 -c 'print(1)'"
   do
     local out_bad
@@ -1555,6 +1578,20 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     assert_json_field "$out_bad" ".decision" "deny" "Coordinator-Only guard must deny: $denied_cmd"
     assert_contains "$(printf '%s' "$out_bad" | jq -r '.reason')" "Coordinator-Only"
   done
+
+  # 2b. Premature stamp-gate.sh swarm-quota resume returns force_ask before reset, allow after reset
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 600 --buffer-seconds 0 --window 5h >/dev/null
+  local out_res_ask out_res_ok
+  out_res_ask=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\"" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_res_ask" ".decision" "force_ask" "Premature swarm-quota resume must trigger force_ask"
+
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 0 --buffer-seconds 0 --window 5h >/dev/null
+  out_res_ok=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\"" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_res_ok" ".decision" "allow" "swarm-quota resume allowed once reset time has elapsed"
 
   # 3. Worker (distinct conversationId) is NOT blocked from running tests or git commits
   local out_worker

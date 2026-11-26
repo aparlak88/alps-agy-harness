@@ -1560,9 +1560,6 @@ def evaluate_pre_edit(
         if on_worktree_resolved is not None:
             on_worktree_resolved(effective_ws)
 
-    if rel_path == ".harness" or rel_path.startswith(".harness/"):
-        return {"decision": "allow"}
-
     if is_active_swarm_coordinator(workspace, hook_input):
         return {
             "decision": "deny",
@@ -1572,6 +1569,9 @@ def evaluate_pre_edit(
                 "swarm(action='add', workspace='share') or post_message."
             ),
         }
+
+    if rel_path == ".harness" or rel_path.startswith(".harness/"):
+        return {"decision": "allow"}
 
     if rel_path == ".superpowers" or rel_path.startswith(".superpowers/"):
         return {"decision": "allow"}
@@ -1881,10 +1881,16 @@ def evaluate_pre_command(
 
     initial_cwd = _resolve_initial_cwd(workspace, hook_input)
     segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
-    if not segments_with_cwd:
-        return {"decision": "allow"}
 
     if is_active_swarm_coordinator(workspace, hook_input):
+        if cmd_line.strip() and not segments_with_cwd:
+            return {
+                "decision": "deny",
+                "reason": (
+                    "Swarm Coordinator-Only guard: command produced no executable segment (e.g. env -S or bare assignment) "
+                    "and is blocked for the active Swarm Coordinator."
+                ),
+            }
         unsafe_syntax = _has_unsafe_shell_syntax_for_coordinator(cmd_line)
         if unsafe_syntax:
             return {
@@ -1894,18 +1900,18 @@ def evaluate_pre_command(
                     "Only read-only inspection and harness coordination commands are allowed; delegate work to Swarm workers."
                 ),
             }
-        for seg, _ in segments_with_cwd:
+        raw_err = _check_coordinator_raw_segments(cmd_line)
+        if raw_err:
+            return {"decision": "deny", "reason": raw_err}
+        for seg, seg_cwd in segments_with_cwd:
             if not seg:
                 continue
-            if not _is_allowed_coordinator_command_segment(seg):
-                exe_name = os.path.basename(seg[0])
-                return {
-                    "decision": "deny",
-                    "reason": (
-                        f"Swarm Coordinator-Only guard: command '{' '.join(seg[:3])}' ({exe_name}) is blocked for the active Swarm Coordinator. "
-                        "Delegate builds, tests, git mutations, Walkthroughs, and PR operations to Swarm workers (e.g. implementer, verifier, integrator)."
-                    ),
-                }
+            seg_decision, seg_reason = _evaluate_coordinator_command_segment(seg, seg_cwd, workspace)
+            if seg_decision != "allow":
+                return {"decision": seg_decision, "reason": seg_reason}
+
+    if not segments_with_cwd:
+        return {"decision": "allow"}
 
     try:
         real_base_ws = Path(os.path.realpath(str(workspace)))
@@ -2551,11 +2557,46 @@ SWARM_QUOTA_ERROR_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+SWARM_QUOTA_STDOUT_ERROR_RE = re.compile(
+    r"(?im)^[ \t]*(?:error|fatal|exception|resource[_\s-]*exhausted|quota[_\s-]*(?:exceeded|exhausted)|rate[_\s-]*limit|http[ \t]*429)\b[^\n]*"
+    r"(?:quota|rate[_\s-]*limit|resource[_\s-]*exhausted|429|usage\s+limit|capacity)"
+)
 DEFAULT_SWARM_QUOTA_BUFFER_SEC = 60
 DEFAULT_SWARM_QUOTA_PROBE_SEC = 900.0
 DEFAULT_SWARM_QUOTA_MAX_BACKOFF_SEC = 3600.0
 DEFAULT_SWARM_RESUME_TIMEOUT_SEC = 120.0
 
+COORDINATOR_TRUSTED_BIN_PREFIXES = ("/bin/", "/usr/bin/", "/opt/homebrew/bin/", "/usr/local/bin/")
+COORDINATOR_DANGEROUS_ENV_VARS = frozenset(
+    (
+        "GIT_EXTERNAL_DIFF",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_ASKPASS",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASH_ENV",
+        "ENV",
+        "CDPATH",
+        "IFS",
+        "PAGER",
+        "EDITOR",
+        "VISUAL",
+        "PATH",
+        "PYTHONPATH",
+    )
+)
 COORDINATOR_READ_ONLY_BINS = frozenset(
     (
         "cd",
@@ -2590,7 +2631,7 @@ COORDINATOR_READ_ONLY_BINS = frozenset(
 COORDINATOR_FIND_FORBIDDEN_FLAGS = frozenset(
     ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls")
 )
-COORDINATOR_STAMP_GATE_SUBCMDS = frozenset(
+COORDINATOR_STAMP_GATE_ALLOWED_SUBCMDS = frozenset(
     ("swarm-coordinator", "swarm-quota", "dispatch", "select-model", "tree-sha", "verify-pr-stamps")
 )
 COORDINATOR_READ_ONLY_GIT_SUBCMDS = frozenset(
@@ -2608,6 +2649,9 @@ COORDINATOR_READ_ONLY_GIT_SUBCMDS = frozenset(
         "rev-list",
         "check-ignore",
     )
+)
+COORDINATOR_GIT_FORBIDDEN_GLOBAL_FLAGS = frozenset(
+    ("-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack")
 )
 COORDINATOR_GIT_BRANCH_MUTATE_FLAGS = frozenset(
     (
@@ -3211,10 +3255,113 @@ def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
     return None
 
 
-def _extract_stamp_gate_subcommand(args: list[str]) -> str:
-    """Return the subcommand passed to ``stamp-gate.sh`` skipping leading ``--workspace`` flags."""
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Safely convert ``val`` to float, returning ``default`` on invalid/non-finite input."""
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        out = float(val)
+    except (TypeError, ValueError):
+        return default
+    return out if (out == out and abs(out) != float("inf")) else default
+
+
+def _stale_resuming_threshold_sec(timeout_sec: float = DEFAULT_SWARM_RESUME_TIMEOUT_SEC) -> float:
+    """Return stale ``resuming`` takeover threshold in seconds (supports test override)."""
+    raw = os.environ.get("HARNESS_SWARM_STALE_RESUMING_SEC", "").strip()
+    if raw:
+        parsed = _safe_float(raw, -1.0)
+        if parsed > 0:
+            return max(0.2, parsed)
+    return max(30.0, float(timeout_sec) + 30.0)
+
+
+def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
+    """Reject ``sudo``, ``env -S``, or dangerous execution env vars in raw segments."""
+    for raw_seg, _ in _tokenize_raw_segments(cmd_line):
+        if not raw_seg:
+            continue
+        try:
+            tokens = shlex.split(raw_seg)
+        except Exception:
+            return (
+                "Swarm Coordinator-Only guard: malformed shell quoting is blocked for the active Swarm Coordinator."
+            )
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if "=" in tok and tok.split("=", 1)[0].isidentifier():
+                key = tok.split("=", 1)[0]
+                if key in COORDINATOR_DANGEROUS_ENV_VARS:
+                    return (
+                        f"Swarm Coordinator-Only guard: setting execution env var '{key}' is blocked for the active Swarm Coordinator."
+                    )
+                idx += 1
+                continue
+            if tok == "sudo":
+                return "Swarm Coordinator-Only guard: 'sudo' is blocked for the active Swarm Coordinator."
+            if tok == "env":
+                idx += 1
+                while idx < len(tokens):
+                    etok = tokens[idx]
+                    if etok == "-S" or etok.startswith(("--split-string", "-S")) or (
+                        etok.startswith("-") and not etok.startswith("--") and "S" in etok[1:]
+                    ):
+                        return "Swarm Coordinator-Only guard: 'env -S/--split-string' is blocked for the active Swarm Coordinator."
+                    if etok.startswith("-"):
+                        idx += 2 if etok in ("-u", "-C") else 1
+                    elif "=" in etok and etok.split("=", 1)[0].isidentifier():
+                        key = etok.split("=", 1)[0]
+                        if key in COORDINATOR_DANGEROUS_ENV_VARS:
+                            return (
+                                f"Swarm Coordinator-Only guard: setting execution env var '{key}' via env is blocked for the active Swarm Coordinator."
+                            )
+                        idx += 1
+                    else:
+                        break
+                continue
+            break
+    return None
+
+
+def _is_trusted_coordinator_exe(raw_exe: str) -> bool:
+    """Return True if ``raw_exe`` is a bare command name or under trusted OS system bin prefixes."""
+    if not raw_exe:
+        return False
+    if "/" not in raw_exe and "\\" not in raw_exe:
+        return True
+    return any(raw_exe.startswith(pref) for pref in COORDINATOR_TRUSTED_BIN_PREFIXES)
+
+
+def _is_trusted_harness_script_path(raw_script: str, seg_cwd: Path, workspace: Path, expected_name: str) -> bool:
+    """Verify script path resolves to ``PLUGIN_ROOT/scripts/<name>`` or ``workspace/scripts/<name>``."""
+    if not raw_script or os.path.basename(raw_script) != expected_name:
+        return False
+    plugin_script = Path(os.path.realpath(str(PLUGIN_ROOT / "scripts" / expected_name)))
+    expanded = os.path.expanduser(raw_script)
+    joined = expanded if os.path.isabs(expanded) else os.path.join(str(seg_cwd), expanded)
+    try:
+        real_script = Path(os.path.realpath(joined))
+    except OSError:
+        return False
+    if not real_script.is_file():
+        return raw_script in (f"./scripts/{expected_name}", f"scripts/{expected_name}") and plugin_script.is_file()
+    allowed_targets = [plugin_script, workspace / "scripts" / expected_name]
+    for cand in allowed_targets:
+        try:
+            if real_script == Path(os.path.realpath(str(cand))):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _extract_stamp_gate_subcmd_and_action(args: list[str]) -> tuple[str, str]:
+    """Return ``(subcommand, first_sub_action)`` skipping ``--workspace`` flags."""
     i = 0
     n = len(args)
+    subcmd = ""
+    sub_action = ""
     while i < n:
         tok = args[i]
         if tok == "--workspace":
@@ -3223,54 +3370,163 @@ def _extract_stamp_gate_subcommand(args: list[str]) -> str:
         if tok.startswith("--workspace="):
             i += 1
             continue
-        if tok.startswith("-"):
+        if not subcmd:
+            if tok.startswith("-"):
+                i += 1
+                continue
+            subcmd = tok
             i += 1
             continue
-        return tok
-    return ""
+        if tok == "--action" and i + 1 < n:
+            sub_action = args[i + 1]
+            break
+        if tok.startswith("--action="):
+            sub_action = tok[len("--action=") :]
+            break
+        if tok.startswith("-"):
+            if tok in ("--conversation-id", "--title", "--resume-at", "--wait-seconds", "--buffer-seconds", "--window", "--model", "--reason", "--member", "--role", "--type", "--tier", "--parent-model", "--effort"):
+                i += 2
+            else:
+                i += 1
+            continue
+        sub_action = tok
+        break
+    return subcmd, sub_action
 
 
-def _is_allowed_coordinator_command_segment(seg: list[str]) -> bool:
-    """Return True strictly when a command segment is read-only or harness coordination CLI."""
+def _evaluate_coordinator_stamp_gate(args: list[str], workspace: Path) -> tuple[str, str]:
+    """Evaluate ``stamp-gate.sh`` invocation for an active Swarm Coordinator."""
+    subcmd, sub_action = _extract_stamp_gate_subcmd_and_action(args)
+    if subcmd not in COORDINATOR_STAMP_GATE_ALLOWED_SUBCMDS:
+        return (
+            "deny",
+            f"Swarm Coordinator-Only guard: 'stamp-gate.sh {subcmd or '(missing)'}' is restricted to Swarm workers/integrator.",
+        )
+    if subcmd == "swarm-coordinator":
+        if sub_action == "off":
+            return (
+                "deny",
+                "Swarm Coordinator-Only guard: active Swarm Coordinator cannot disable its own guard via 'stamp-gate.sh swarm-coordinator off'.",
+            )
+        if sub_action not in ("status", "on"):
+            return (
+                "deny",
+                f"Swarm Coordinator-Only guard: unsupported swarm-coordinator action '{sub_action}'.",
+            )
+    elif subcmd == "swarm-quota":
+        if sub_action == "clear":
+            return (
+                "deny",
+                "Swarm Coordinator-Only guard: active Swarm Coordinator cannot clear quota wait via 'stamp-gate.sh swarm-quota clear'.",
+            )
+        if sub_action == "resume":
+            q_state = get_swarm_quota_state(workspace)
+            q_status = str(q_state.get("status") or "")
+            next_probe = _safe_float(q_state.get("nextProbeEpoch"), 0.0)
+            if q_status in ("waiting", "resuming") and next_probe > time.time():
+                return (
+                    "force_ask",
+                    f"Swarm Pure-Wait Quota Policy: reset time ({q_state.get('resumeAt')}) has not elapsed yet. Confirm only if user explicitly overrides waiting.",
+                )
+        elif sub_action not in ("status", "pause"):
+            return (
+                "deny",
+                f"Swarm Coordinator-Only guard: 'stamp-gate.sh swarm-quota {sub_action}' is blocked for active Coordinator.",
+            )
+    return "allow", ""
+
+
+def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspace: Path) -> tuple[str, str]:
+    """Return ``(decision, reason)`` for a single command segment run by an active Coordinator."""
     if not seg:
-        return True
-    exe = os.path.basename(seg[0])
+        return "allow", ""
+    raw_exe = seg[0]
+    exe = os.path.basename(raw_exe)
+
+    def _deny_seg() -> tuple[str, str]:
+        return (
+            "deny",
+            f"Swarm Coordinator-Only guard: command '{' '.join(seg[:3])}' ({exe}) is blocked for the active Swarm Coordinator. "
+            "Delegate builds, tests, git mutations, Walkthroughs, and PR operations to Swarm workers (e.g. implementer, verifier, integrator).",
+        )
 
     if exe in ("bash", "sh"):
-        if len(seg) < 2 or seg[1].startswith("-"):
-            return False
+        if not _is_trusted_coordinator_exe(raw_exe) or len(seg) < 2 or seg[1].startswith("-"):
+            return _deny_seg()
         target_base = os.path.basename(seg[1])
-        if target_base == "harness-doctor.sh":
-            return True
-        if target_base == "stamp-gate.sh":
-            return _extract_stamp_gate_subcommand(seg[2:]) in COORDINATOR_STAMP_GATE_SUBCMDS
-        return False
+        if target_base == "harness-doctor.sh" and _is_trusted_harness_script_path(seg[1], seg_cwd, workspace, "harness-doctor.sh"):
+            return "allow", ""
+        if target_base == "stamp-gate.sh" and _is_trusted_harness_script_path(seg[1], seg_cwd, workspace, "stamp-gate.sh"):
+            return _evaluate_coordinator_stamp_gate(seg[2:], workspace)
+        return _deny_seg()
 
     if exe == "harness-doctor.sh":
-        return True
+        if _is_trusted_harness_script_path(raw_exe, seg_cwd, workspace, "harness-doctor.sh"):
+            return "allow", ""
+        return _deny_seg()
 
     if exe == "stamp-gate.sh":
-        return _extract_stamp_gate_subcommand(seg[1:]) in COORDINATOR_STAMP_GATE_SUBCMDS
+        if _is_trusted_harness_script_path(raw_exe, seg_cwd, workspace, "stamp-gate.sh"):
+            return _evaluate_coordinator_stamp_gate(seg[1:], workspace)
+        return _deny_seg()
+
+    if not _is_trusted_coordinator_exe(raw_exe):
+        return _deny_seg()
 
     if exe in COORDINATOR_READ_ONLY_BINS:
-        return True
+        if exe == "sort":
+            for tok in seg[1:]:
+                if tok == "-o" or tok.startswith("-o") or tok == "--output" or tok.startswith(("--output=", "--compress-program=")) or tok == "--compress-program":
+                    return _deny_seg()
+        elif exe == "uniq":
+            pos_args: list[str] = []
+            idx = 1
+            while idx < len(seg):
+                tok = seg[idx]
+                if tok in ("-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"):
+                    idx += 2
+                    continue
+                if tok.startswith("-"):
+                    idx += 1
+                    continue
+                pos_args.append(tok)
+                idx += 1
+            if len(pos_args) >= 2:
+                return _deny_seg()
+        elif exe == "rg":
+            for tok in seg[1:]:
+                if tok in ("--pre", "--pre-glob") or tok.startswith(("--pre=", "--pre-glob=")):
+                    return _deny_seg()
+        return "allow", ""
 
     if exe == "find":
-        return not any(tok in COORDINATOR_FIND_FORBIDDEN_FLAGS for tok in seg[1:])
+        if any(tok in COORDINATOR_FIND_FORBIDDEN_FLAGS for tok in seg[1:]):
+            return _deny_seg()
+        return "allow", ""
 
     if exe == "git":
         if any(tok == "--output" or tok.startswith("--output=") for tok in seg[1:]):
-            return False
+            return _deny_seg()
         git_subcmd, _, subcmd_idx = _parse_git_invocation(seg, Path.cwd())
         if not git_subcmd:
-            return False
+            return _deny_seg()
+        global_opts = seg[1:subcmd_idx] if subcmd_idx >= 1 else seg[1:]
+        for gtok in global_opts:
+            if (
+                gtok in COORDINATOR_GIT_FORBIDDEN_GLOBAL_FLAGS
+                or gtok.startswith(("-c", "--config-env=", "--exec-path=", "--upload-pack=", "--receive-pack="))
+            ):
+                if gtok == "-C" or gtok.startswith("-C"):
+                    continue
+                return _deny_seg()
+
         if git_subcmd in COORDINATOR_READ_ONLY_GIT_SUBCMDS:
-            return True
+            return "allow", ""
         rest = seg[subcmd_idx + 1 :] if subcmd_idx >= 0 else []
         if git_subcmd == "branch":
-            if any(tok in COORDINATOR_GIT_BRANCH_MUTATE_FLAGS for tok in rest):
-                return False
-            # Block positional branch creation args (e.g., `git branch feat/new`) unless --contains/--merged/--no-merged value
+            for tok in rest:
+                if tok in COORDINATOR_GIT_BRANCH_MUTATE_FLAGS or tok.startswith(("--set-upstream-to=", "-u=", "--edit-description=")):
+                    return _deny_seg()
             value_flags = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format"}
             idx = 0
             while idx < len(rest):
@@ -3281,28 +3537,28 @@ def _is_allowed_coordinator_command_segment(seg: list[str]) -> bool:
                 if tok.startswith("-"):
                     idx += 1
                     continue
-                return False
-            return True
+                return _deny_seg()
+            return "allow", ""
         if git_subcmd == "worktree":
-            return len(rest) >= 1 and rest[0] == "list"
+            return ("allow", "") if (len(rest) >= 1 and rest[0] == "list") else _deny_seg()
         if git_subcmd == "remote":
             pos = [t for t in rest if not t.startswith("-")]
-            return len(pos) == 0 or pos[0] == "show"
+            return ("allow", "") if (len(pos) == 0 or pos[0] == "show") else _deny_seg()
         if git_subcmd == "tag":
             if any(t in ("-a", "-s", "-d", "-f", "-m", "--annotate", "--sign", "--delete", "--force") for t in rest):
-                return False
+                return _deny_seg()
             pos = [t for t in rest if not t.startswith("-")]
-            return len(pos) == 0 or ("-l" in rest or "--list" in rest)
-        return False
+            return ("allow", "") if (len(pos) == 0 or ("-l" in rest or "--list" in rest)) else _deny_seg()
+        return _deny_seg()
 
     if exe == "gh":
         if len(seg) < 3:
-            return False
+            return _deny_seg()
         noun, verb = seg[1], seg[2]
         allowed_verbs = COORDINATOR_READ_ONLY_GH_VERBS.get(noun)
-        return bool(allowed_verbs and verb in allowed_verbs)
+        return ("allow", "") if (allowed_verbs and verb in allowed_verbs) else _deny_seg()
 
-    return False
+    return _deny_seg()
 
 
 def is_quota_exhausted_error(error_text: str) -> bool:
@@ -3484,11 +3740,13 @@ def record_swarm_quota_pause(
     with locked_state_file(state_dir, "swarm-quota-wait"):
         quota_path = state_dir / "swarm-quota-wait.json"
         existing = read_json_file(quota_path) or {}
-        if not clean_conv:
+        is_active_wait = existing.get("status") in ("waiting", "resuming")
+        if not clean_conv and is_active_wait:
             clean_conv = str(existing.get("conversationId") or "").strip()
 
         merged_members: list[str] = []
-        for src_list in (existing.get("pausedMembers") or [], coord_workers, paused_members or []):
+        prior_members = existing.get("pausedMembers") if is_active_wait else []
+        for src_list in (prior_members or [], coord_workers, paused_members or []):
             if not isinstance(src_list, list):
                 continue
             for m in src_list:
@@ -3502,18 +3760,20 @@ def record_swarm_quota_pause(
             "schemaVersion": CACHE_SCHEMA_VERSION,
             "status": "waiting",
             "conversationId": clean_conv,
-            "model": model.strip() or str(existing.get("model") or ""),
+            "model": model.strip() or (str(existing.get("model") or "") if is_active_wait else ""),
             "window": inferred_window,
             "reason": SECRET_REDACT_RE.sub("[REDACTED]", (reason or "").strip())[:500],
             "pausedMembers": merged_members,
             "source": source,
-            "pausedAt": existing.get("pausedAt") if existing.get("status") == "waiting" and existing.get("pausedAt") else _epoch_to_iso_utc(now),
+            "pausedAt": existing.get("pausedAt") if is_active_wait and existing.get("pausedAt") else _epoch_to_iso_utc(now),
             "resumeAt": _epoch_to_iso_utc(target_epoch),
             "resumeAtEpoch": int(round(target_epoch)),
             "nextProbeEpoch": round(target_epoch, 3),
-            "attemptCount": int(existing.get("attemptCount", 0)) if existing.get("status") == "waiting" else 0,
-            "lastAttemptAt": existing.get("lastAttemptAt", "") if existing.get("status") == "waiting" else "",
-            "lastAttemptError": existing.get("lastAttemptError", "") if existing.get("status") == "waiting" else "",
+            "resumingToken": "",
+            "resumingStartedAtEpoch": 0,
+            "attemptCount": int(existing.get("attemptCount", 0)) if is_active_wait else 0,
+            "lastAttemptAt": existing.get("lastAttemptAt", "") if is_active_wait else "",
+            "lastAttemptError": existing.get("lastAttemptError", "") if is_active_wait else "",
             "recommendedScheduleSeconds": rec_sched,
             "chunkedScheduleSeconds": min(rec_sched, 21600),
             "updatedAt": _epoch_to_iso_utc(now),
@@ -3531,6 +3791,8 @@ def resume_swarm_quota_wait(workspace: Path) -> dict[str, Any]:
         existing = read_json_file(quota_path) or {}
         existing["schemaVersion"] = CACHE_SCHEMA_VERSION
         existing["status"] = "resumed"
+        existing["resumingToken"] = ""
+        existing["resumingStartedAtEpoch"] = 0
         existing["resumedAt"] = now_iso
         existing["updatedAt"] = now_iso
         atomic_write_json(state_dir, "swarm-quota-wait.json", existing)
@@ -3557,17 +3819,31 @@ def attempt_swarm_quota_resume(workspace: Path, now_epoch: Optional[float] = Non
         return {"status": "idle", "reason": "no swarm state directory"}
     quota_path = swarm_dir / "swarm-quota-wait.json"
 
+    raw_timeout = os.environ.get("HARNESS_SWARM_RESUME_TIMEOUT_SEC", str(DEFAULT_SWARM_RESUME_TIMEOUT_SEC)).strip()
+    timeout_sec = max(0.2, _safe_float(raw_timeout, DEFAULT_SWARM_RESUME_TIMEOUT_SEC))
+    stale_threshold = _stale_resuming_threshold_sec(timeout_sec)
+
     with locked_state_file(swarm_dir, "swarm-quota-wait"):
         state = read_json_file(quota_path)
-        if not isinstance(state, dict) or state.get("status") not in ("waiting", "resuming"):
-            return {"status": str((state or {}).get("status") or "idle")}
-        next_probe = float(state.get("nextProbeEpoch") or 0)
-        if next_probe > now:
-            return {"status": "waiting", "nextProbeEpoch": next_probe}
+        if not isinstance(state, dict):
+            return {"status": "idle"}
+        cur_status = str(state.get("status") or "")
+        if cur_status not in ("waiting", "resuming"):
+            return {"status": cur_status or "idle"}
+        if cur_status == "resuming":
+            started_ep = _safe_float(state.get("resumingStartedAtEpoch"), 0.0)
+            if started_ep > 0 and (now - started_ep) < stale_threshold:
+                return dict(state)
+        else:
+            next_probe = _safe_float(state.get("nextProbeEpoch"), 0.0)
+            if next_probe > now:
+                return {"status": "waiting", "nextProbeEpoch": next_probe}
 
         conv_id = str(state.get("conversationId") or "").strip()
         if not conv_id or conv_id.startswith("-"):
             state["status"] = "waiting"
+            state["resumingToken"] = ""
+            state["resumingStartedAtEpoch"] = 0
             state["lastAttemptAt"] = _epoch_to_iso_utc(now)
             state["lastAttemptError"] = "missing or invalid conversationId for agy --conversation resume"
             state["nextProbeEpoch"] = round(now + _default_quota_probe_seconds(), 3)
@@ -3576,21 +3852,18 @@ def attempt_swarm_quota_resume(workspace: Path, now_epoch: Optional[float] = Non
             atomic_write_json(swarm_dir, "swarm-quota-wait.json", state)
             return dict(state)
 
+        resume_token = f"{os.getpid()}-{threading.get_ident()}-{int(now * 1_000_000)}"
         state["status"] = "resuming"
+        state["resumingToken"] = resume_token
+        state["resumingStartedAtEpoch"] = round(now, 3)
         state["lastAttemptAt"] = _epoch_to_iso_utc(now)
         state["updatedAt"] = _epoch_to_iso_utc(now)
         atomic_write_json(swarm_dir, "swarm-quota-wait.json", state)
         paused_members = [str(m) for m in (state.get("pausedMembers") or []) if str(m).strip()]
         model_hint = str(state.get("model") or "").strip()
-        attempt_num = int(state.get("attemptCount", 0)) + 1
+        attempt_num = int(_safe_float(state.get("attemptCount"), 0.0)) + 1
 
     agy_bin = _resolve_cli_binary("HARNESS_AGY_BIN", "agy")
-    raw_timeout = os.environ.get("HARNESS_SWARM_RESUME_TIMEOUT_SEC", str(DEFAULT_SWARM_RESUME_TIMEOUT_SEC)).strip()
-    try:
-        timeout_sec = max(1.0, float(raw_timeout))
-    except ValueError:
-        timeout_sec = DEFAULT_SWARM_RESUME_TIMEOUT_SEC
-
     members_str = ", ".join(f"@{m}" for m in paused_members) if paused_members else "all paused workers"
     resume_prompt = (
         "[SWARM_QUOTA_AUTO_RESUME] Quota wait window elapsed. Follow Pure-Wait Quota Policy strictly: "
@@ -3618,11 +3891,12 @@ def attempt_swarm_quota_resume(workspace: Path, now_epoch: Optional[float] = Non
                 text=True,
                 timeout=timeout_sec,
             )
-            combined = f"{proc.stdout or ''}\n{proc.stderr or ''}".strip()
-            if proc.returncode == 0 and not is_quota_exhausted_error(combined):
+            out_txt = proc.stdout or ""
+            err_txt = proc.stderr or ""
+            if proc.returncode == 0 and not is_quota_exhausted_error(err_txt) and not SWARM_QUOTA_STDOUT_ERROR_RE.search(out_txt):
                 succeeded = True
             else:
-                err_msg = _summarize_cli_failure(proc.returncode, proc.stderr, proc.stdout)
+                err_msg = _summarize_cli_failure(proc.returncode, err_txt, out_txt)
         except subprocess.TimeoutExpired:
             err_msg = f"agy --conversation timed out after {timeout_sec}s"
         except OSError as exc:
@@ -3633,12 +3907,14 @@ def attempt_swarm_quota_resume(workspace: Path, now_epoch: Optional[float] = Non
         cur = read_json_file(quota_path)
         if not isinstance(cur, dict):
             return {"status": "cleared"}
-        if cur.get("status") in ("resumed", "cleared"):
+        if cur.get("status") != "resuming" or cur.get("resumingToken") != resume_token:
             return dict(cur)
 
         cur["attemptCount"] = attempt_num
         cur["lastAttemptAt"] = _epoch_to_iso_utc(done_now)
         cur["updatedAt"] = _epoch_to_iso_utc(done_now)
+        cur["resumingToken"] = ""
+        cur["resumingStartedAtEpoch"] = 0
         if succeeded:
             cur["status"] = "resumed"
             cur["resumedAt"] = _epoch_to_iso_utc(done_now)

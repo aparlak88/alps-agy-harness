@@ -1365,6 +1365,10 @@ test_daemon_swarm_coordinator_parity_and_quota_auto_resume_watchdog() {
   git -C "$repo" commit -m "chore: init" --quiet
   git -C "$repo" checkout -b "feat/daemon-quota" --quiet
 
+  local started_flag release_flag
+  started_flag="$mock_dir/agy.started"
+  release_flag="$mock_dir/agy.release"
+
   cat << EOF > "$mock_agy"
 #!/usr/bin/env bash
 count=0
@@ -1375,6 +1379,12 @@ count=\$((count + 1))
 echo "\$count" > "$attempt_file"
 printf 'ATTEMPT=%s TYPESAFE=%s ARGS=%s\n' "\$count" "\${TYPESAFE_API_KEY:-}" "\$*" >> "$calls_log"
 if [ "\$count" -eq 1 ]; then
+  touch "$started_flag"
+  tries=0
+  while [ ! -f "$release_flag" ] && [ "\$tries" -lt 80 ]; do
+    sleep 0.05
+    tries=\$((tries + 1))
+  done
   echo "429 RESOURCE_EXHAUSTED: quota still exhausted" >&2
   exit 1
 fi
@@ -1389,15 +1399,33 @@ EOF
   HARNESS_SKIP_SHELL_PATH_SYNC="1" \
   HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
   HARNESS_DAEMON_WORKSPACE_TTL_SEC="0.4" \
-  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.25" \
-  HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="0.5" \
-  HARNESS_AGY_BIN="$mock_agy" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
+  HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="0.4" \
+  HARNESS_SWARM_STALE_RESUMING_SEC="0.3" \
   python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
   dpid=$!
   _TD_PIDS+=("$dpid")
   _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
 
-  # 1. Parity: Coordinator-Only pre-edit, pre-command, and pre-subagent under daemon ON vs cold OFF
+  # Restart daemon with HARNESS_AGY_BIN exported cleanly for all child tests:
+  kill -TERM "$dpid" 2>/dev/null || true
+  wait "$dpid" 2>/dev/null || true
+  TYPESAFE_API_KEY="ts_live_must_be_scrubbed" \
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  HARNESS_DAEMON_WORKSPACE_TTL_SEC="0.4" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
+  HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="0.4" \
+  HARNESS_SWARM_STALE_RESUMING_SEC="0.3" \
+  HARNESS_AGY_BIN="$mock_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not restart" >&2; return 1; }
+
+  # 1. Parity: Coordinator-Only pre-edit, pre-command, and pre-subagent under daemon ON vs cold OFF (full JSON equality)
   printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "swarm", args: {action: "title", title: "Quota Swarm"}}}')" \
     | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" >/dev/null
 
@@ -1406,39 +1434,40 @@ EOF
   p_cmd=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "run_command", args: {CommandLine: "npm test"}}}')
   p_sub=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "invoke_subagent", args: {TypeName: "research", Role: "R", Prompt: "Scan"}}}')
 
-  on_ed=$(printf '%s' "$p_ed" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
-  off_ed=$(printf '%s' "$p_ed" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
-  assert_json_field "$on_ed" ".decision" "deny"
-  assert_json_field "$off_ed" ".decision" "deny"
+  on_ed=$(printf '%s' "$p_ed" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD" | jq -c .)
+  off_ed=$(printf '%s' "$p_ed" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD" | jq -c .)
+  assert_eq "$off_ed" "$on_ed" "pre-edit Coordinator-Only parity"
 
-  on_cmd=$(printf '%s' "$p_cmd" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
-  off_cmd=$(printf '%s' "$p_cmd" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
-  assert_json_field "$on_cmd" ".decision" "deny"
-  assert_json_field "$off_cmd" ".decision" "deny"
+  on_cmd=$(printf '%s' "$p_cmd" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD" | jq -c .)
+  off_cmd=$(printf '%s' "$p_cmd" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD" | jq -c .)
+  assert_eq "$off_cmd" "$on_cmd" "pre-command Coordinator-Only parity"
 
-  on_sub=$(printf '%s' "$p_sub" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD")
-  off_sub=$(printf '%s' "$p_sub" | HARNESS_DISABLE_DAEMON="1" "$PRE_SUBAGENT_GUARD")
-  assert_json_field "$on_sub" ".decision" "deny"
-  assert_json_field "$off_sub" ".decision" "deny"
+  on_sub=$(printf '%s' "$p_sub" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" | jq -c .)
+  off_sub=$(printf '%s' "$p_sub" | HARNESS_DISABLE_DAEMON="1" "$PRE_SUBAGENT_GUARD" | jq -c .)
+  assert_eq "$off_sub" "$on_sub" "pre-subagent Coordinator-Only parity"
 
-  # 2. Trigger Coordinator Stop(ERROR) quota wait via daemon, verify workspace survives >0.4s TTL,
-  #    /health reports quotaWaits >= 1, attempt 1 backs off, and attempt 2 auto-resumes via agy --conversation!
+  # 2. stamp-gate.sh swarm-quota pause from relative --workspace . arms daemon automatically,
+  #    in-flight deduplication holds attempt count at 1 behind barrier, TTL eviction is bypassed, and attempt 2 resumes.
   printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "swarm", args: {action: "add", name: "worker-1", workspace: "share", brief: "Work."}}}')" \
     | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" >/dev/null
 
-  # Wait > TTL (0.5s) first? No, arm quota wait with a short future wait (0.6s > TTL 0.4s) via Stop hook -> stop_err with no explicit reset uses DEFAULT_PROBE_SEC=0.25s,
-  # so let's first pause with 0.6s via stamp-gate.sh so we can assert /health quotaWaits >= 1 and survival past 0.4s TTL!
-  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-dq" --wait-seconds 0.6 --buffer-seconds 0 --window 5h --model "gemini-4-neon-high" --reason "5-hour quota" >/dev/null
-  local evt_resp health_json
-  evt_resp=$(jq -nc --arg ws "$repo" '{workspace: $ws}' | curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST --data-binary @- "http://localhost/event/swarm-quota-wait")
-  assert_json_field "$evt_resp" ".armed" "true"
+  (cd "$repo" && HARNESS_DAEMON_SOCK="$sock_path" "$STAMP_GATE" swarm-quota pause --workspace "." --conversation-id "conv-dq" --wait-seconds 0 --buffer-seconds 0 --window 5h --model "gemini-4-neon-high" --reason "5-hour quota" >/dev/null)
 
-  sleep 0.45
+  local tries_b=0
+  while [ ! -f "$started_flag" ] && [ "$tries_b" -lt 60 ]; do
+    sleep 0.05
+    tries_b=$((tries_b + 1))
+  done
+  [ -f "$started_flag" ] || { echo "stamp-gate.sh pause --workspace . did not trigger daemon auto-resume" >&2; return 1; }
+
+  # While attempt 1 is blocked behind barrier, verify in-flight dedup (count == 1) & /health quotaWaits == 1
+  local health_json
   health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
-  assert_json_field "$health_json" ".activeWorkspaces" "1" "Workspace with active quota wait must survive TTL eviction"
-  assert_json_field "$health_json" ".quotaWaits" "1" "Health endpoint must report active quotaWaits == 1"
+  assert_json_field "$health_json" ".quotaWaits" "1"
+  assert_eq "1" "$(cat "$attempt_file")" "In-flight deduplication must keep attempt count at 1 while barrier is held"
 
-  # Wait for attempt 1 (fails with 429 -> backoff) and attempt 2 (succeeds -> status=resumed)
+  # Release barrier -> attempt 1 fails with 429 -> backoff -> attempt 2 succeeds -> status == resumed
+  touch "$release_flag"
   local quota_file="$repo/.harness/state/swarm/swarm-quota-wait.json"
   _wait_for_file_jq "$quota_file" '.status == "resumed" and .attemptCount == 2' 60 \
     || { echo "Daemon quota watchdog failed to auto-resume on attempt 2: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
@@ -1450,7 +1479,52 @@ EOF
   assert_contains "$agy_log" "@worker-1"
   assert_not_contains "$agy_log" "ts_live_must_be_scrubbed" "Daemon must scrub TYPESAFE_API_KEY before invoking agy"
 
-  # 3. Verify Stop hook over daemon /hook/stop-gate also arms quota wait cleanly
+  # 3. Registry reload across daemon restart retains workspace past expired TTL when quota wait is active
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-dq" --resume-at "2031-01-01T00:00:00Z" --buffer-seconds 0 --window weekly >/dev/null
+  kill -TERM "$dpid" 2>/dev/null || true
+  wait "$dpid" 2>/dev/null || true
+  local real_repo
+  real_repo=$(cd "$repo" && pwd -P)
+  jq --arg ws "$real_repo" '.workspaces[$ws].lastSeenAt = 1' "$data_dir/workspaces.json" > "$data_dir/workspaces.json.tmp" && mv "$data_dir/workspaces.json.tmp" "$data_dir/workspaces.json"
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  HARNESS_DAEMON_WORKSPACE_TTL_SEC="0.5" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
+  HARNESS_SWARM_STALE_RESUMING_SEC="0.3" \
+  HARNESS_AGY_BIN="$mock_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon failed restart" >&2; return 1; }
+  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
+  assert_json_field "$health_json" ".activeWorkspaces" "1" "Registry reload must keep workspace with active quota wait even when TTL expired"
+  assert_json_field "$health_json" ".quotaWaits" "1"
+
+  # 4. Stale 'resuming' state recovery & malformed swarm-quota-wait.json resilience
+  jq '.status = "resuming" | .resumingStartedAtEpoch = 1 | .resumingToken = "stale-tok"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
+    || { echo "Daemon failed to recover stale resuming state: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
+
+  jq '.status = "waiting" | .nextProbeEpoch = "not-a-number"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
+    || { echo "Malformed nextProbeEpoch broke watcher_loop" >&2; return 1; }
+  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
+  assert_json_field "$health_json" ".status" "ok"
+
+  # 5. /event/swarm-quota-wait edge responses: invalid workspace (400) & .harness-ignore (ignored: true)
+  local bad_status ign_repo ign_resp
+  bad_status=$(curl -s -o /dev/null -w "%{http_code}" --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST -d '{"workspace":""}' "http://localhost/event/swarm-quota-wait")
+  assert_eq "400" "$bad_status"
+  ign_repo=$(make_temp_repo)
+  touch "$ign_repo/.harness-ignore"
+  ign_resp=$(jq -nc --arg ws "$ign_repo" '{workspace: $ws}' | curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST --data-binary @- "http://localhost/event/swarm-quota-wait")
+  assert_json_field "$ign_resp" ".ignored" "true"
+  assert_json_field "$ign_resp" ".armed" "false"
+
+  # 6. Verify Stop hook over daemon /hook/stop-gate also arms quota wait cleanly
   "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
   local stop_out
   stop_out=$(jq -nc --arg ws "$repo" '{

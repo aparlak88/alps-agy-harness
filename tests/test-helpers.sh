@@ -6,6 +6,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 export REPO_ROOT
 export HARNESS_AUTO_START_DAEMON="${HARNESS_AUTO_START_DAEMON:-0}"
+unset HARNESS_CONVERSATION_ID ANTIGRAVITY_CONVERSATION_ID ANTIGRAVITY_SOURCE_METADATA 2>/dev/null || true
 
 _cleanup_harness_temp_dirs() {
   if [ -n "${_HARNESS_TEMP_TRACKER:-}" ] && [ -f "$_HARNESS_TEMP_TRACKER" ]; then

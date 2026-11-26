@@ -310,16 +310,21 @@ class HarnessDaemonState:
 
     def _run_swarm_quota_resume(self, ws_key: str) -> None:
         """Invoke ``agy --conversation`` via ``harness_core.attempt_swarm_quota_resume`` in background."""
+        resumed = False
         try:
             ensure_startup_path_enriched()
             res = harness_core.attempt_swarm_quota_resume(Path(ws_key))
             status = str(res.get("status") or "unknown")
+            resumed = status == "resumed"
             self.logger.log("INFO", f"Swarm quota resume probe for {ws_key}: status={status} attempt={res.get('attemptCount', 0)}")
         except Exception as exc:
             self.logger.log("WARN", f"Swarm quota resume error for {ws_key}: {exc}")
         finally:
             with self._lock:
                 self._quota_resume_inflight.discard(ws_key)
+                if resumed and ws_key in self._workspaces:
+                    self._workspaces[ws_key]["lastSeenAt"] = time.time()
+                    self._persist_registry_locked()
             self.wake_event.set()
 
     def get_caches(self, ws_path: Path, allow_disk_hydration: bool = True) -> dict[str, Any]:
@@ -715,13 +720,24 @@ class HarnessDaemonState:
                         due_graphify.append((ws_key, str(job.get("reason", "queued"))))
 
                 due_quota_resumes: list[str] = []
+                stale_threshold = harness_core._stale_resuming_threshold_sec()
                 for ws_key in to_refresh:
                     if ws_key in self._quota_resume_inflight:
                         continue
-                    q_state = harness_core.get_swarm_quota_state(Path(ws_key))
-                    if q_state.get("status") == "waiting" and float(q_state.get("nextProbeEpoch") or 0) <= now:
-                        self._quota_resume_inflight.add(ws_key)
-                        due_quota_resumes.append(ws_key)
+                    try:
+                        q_state = harness_core.get_swarm_quota_state(Path(ws_key))
+                        q_status = str(q_state.get("status") or "")
+                        if q_status == "waiting":
+                            if harness_core._safe_float(q_state.get("nextProbeEpoch"), 0.0) <= now:
+                                self._quota_resume_inflight.add(ws_key)
+                                due_quota_resumes.append(ws_key)
+                        elif q_status == "resuming":
+                            started_ep = harness_core._safe_float(q_state.get("resumingStartedAtEpoch"), 0.0)
+                            if started_ep <= 0 or (now - started_ep) >= stale_threshold:
+                                self._quota_resume_inflight.add(ws_key)
+                                due_quota_resumes.append(ws_key)
+                    except Exception as exc:
+                        self.logger.log("WARN", f"Malformed quota state for {ws_key}: {exc}")
 
                 dirty_snapshot = set(self._dirty_workspaces)
 

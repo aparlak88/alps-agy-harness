@@ -1988,9 +1988,10 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
   }' | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_int_sec" ".decision" "allow" "Integrator worker must be allowed to invoke_subagent(security-reviewer)"
 
-  # 4. Pure-Wait Quota Policy: swarm(action="model"|"kill") returns force_ask while swarm-quota-wait is waiting, then allow after resume
+  # 4. Pure-Wait Quota Policy: swarm(action="model"|"kill") returns force_ask while waiting or resuming,
+  #    allows other conversationId, and allows after resume.
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 600 --buffer-seconds 0 --window 5h --reason "5-hour quota exhausted" >/dev/null
-  local out_model_ask out_kill_ask out_model_ok
+  local out_model_ask out_kill_ask out_other_conv out_resuming_ask out_model_ok
   out_model_ask=$(jq -nc --arg ws "$repo" '{
     workspacePaths: [$ws],
     conversationId: "conv-coord",
@@ -2005,6 +2006,22 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
   }' | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_kill_ask" ".decision" "force_ask" "swarm(kill) during active quota wait must require force_ask"
 
+  out_other_conv=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-different",
+    toolCall: {name: "swarm", args: {action: "model", name: "helper-1", model: "gemini-4-hydrogen-high"}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_other_conv" ".decision" "allow" "Pure-Wait force_ask must scope to matching conversationId"
+
+  local qf="$repo/.harness/state/swarm/swarm-quota-wait.json"
+  jq '.status = "resuming"' "$qf" > "$qf.tmp" && mv "$qf.tmp" "$qf"
+  out_resuming_ask=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "swarm", args: {action: "kill", name: "implementer-1"}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_resuming_ask" ".decision" "force_ask" "swarm(kill) during resuming state must still require force_ask"
+
   "$STAMP_GATE" swarm-quota resume --workspace "$repo" >/dev/null
   out_model_ok=$(jq -nc --arg ws "$repo" '{
     workspacePaths: [$ws],
@@ -2016,16 +2033,22 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
 
 test_stop_gate_detects_coordinator_quota_error_without_looping() {
   export HARNESS_DISABLE_DAEMON=1
-  local repo quota_file
+  local repo quota_file coord_file
   repo=$(make_temp_repo)
   quota_file="$repo/.harness/state/swarm/swarm-quota-wait.json"
+  coord_file="$repo/.harness/state/swarm/swarm-coordinator.json"
 
-  # Register Coordinator + 2 workers
+  # Register Coordinator + 2 workers + system roles (monitor/narrator must be excluded from workers)
   "$STAMP_GATE" swarm-coordinator on --workspace "$repo" --conversation-id "conv-q" --title "Long Swarm" >/dev/null
   printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-q", toolCall: {name: "swarm", args: {action: "add", name: "api-worker", workspace: "share", brief: "API."}}}')" \
     | "$PRE_SUBAGENT_GUARD" >/dev/null
   printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-q", toolCall: {name: "swarm", args: {action: "add", name: "ui-worker", workspace: "share", brief: "UI."}}}')" \
     | "$PRE_SUBAGENT_GUARD" >/dev/null
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-q", toolCall: {name: "swarm", args: {action: "add", name: "monitor", workspace: "inherit", brief: "Monitor."}}}')" \
+    | "$PRE_SUBAGENT_GUARD" >/dev/null
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-q", toolCall: {name: "swarm", args: {action: "add", name: "narrator", workspace: "inherit", brief: "Narrator."}}}')" \
+    | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$coord_file" '.coordinators["conv-q"].workers | sort | join(",")' "api-worker,ui-worker" "System roles monitor/narrator must be excluded from coordinator workers"
 
   # 1. Non-quota ERROR must return {} without creating swarm-quota-wait.json
   local out_net
@@ -2057,7 +2080,7 @@ test_stop_gate_detects_coordinator_quota_error_without_looping() {
     conversationId: "conv-q",
     modelName: "gemini-4-neon-high",
     terminationReason: "ERROR",
-    error: "RESOURCE_EXHAUSTED: 5-hour quota exceeded. Resets at 2030-11-27T04:00:00Z"
+    error: "RESOURCE_EXHAUSTED: 5-hour quota exceeded token=ts_live_abcdef123456. Resets at 2030-11-27T04:00:00Z"
   }' | "$STOP_GATE" | jq -c .)
   assert_eq "{}" "$out_5h" "Stop gate must return {} on quota ERROR (never loop immediately)"
   [ -f "$quota_file" ] || { echo "Expected swarm-quota-wait.json after Coordinator quota ERROR" >&2; return 1; }
@@ -2067,9 +2090,13 @@ test_stop_gate_detects_coordinator_quota_error_without_looping() {
   assert_json_field "$quota_file" ".model" "gemini-4-neon-high"
   assert_json_field "$quota_file" ".resumeAt" "2030-11-27T04:01:00Z" "ISO reset timestamp must include +60s buffer"
   assert_json_field "$quota_file" '.pausedMembers | sort | join(",")' "api-worker,ui-worker"
+  assert_not_contains "$(jq -r '.reason' "$quota_file")" "ts_live_abcdef123456" "Secret in quota reason must be redacted"
+  assert_contains "$(jq -r '.reason' "$quota_file")" "[REDACTED]"
 
-  # 4. Weekly quota ERROR with relative duration ("3d 4h") -> classifies window == "weekly"
+  # 4. Weekly quota ERROR with relative duration ("3d 4h") -> exact duration epoch math + buffer
   "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  local now_ep expected_ep actual_ep diff_ep
+  now_ep=$(date +%s)
   local out_wkly
   out_wkly=$(jq -nc --arg ws "$repo" '{
     workspacePaths: [$ws],
@@ -2082,6 +2109,27 @@ test_stop_gate_detects_coordinator_quota_error_without_looping() {
   assert_json_field "$quota_file" ".status" "waiting"
   assert_json_field "$quota_file" ".window" "weekly"
   assert_json_field "$quota_file" ".source" "stop-error"
+  expected_ep=$((now_ep + 3 * 86400 + 4 * 3600 + 60))
+  actual_ep=$(jq -r '.resumeAtEpoch' "$quota_file")
+  diff_ep=$((actual_ep - expected_ep))
+  if [ "$diff_ep" -lt -15 ] || [ "$diff_ep" -gt 15 ]; then
+    echo "Expected 3d 4h + 60s resumeAtEpoch near $expected_ep, got $actual_ep" >&2
+    return 1
+  fi
+
+  # 5. Past ISO reset timestamp falls back to HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC instead of past epoch
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  now_ep=$(date +%s)
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="120" "$STOP_GATE" >/dev/null <<EOF
+{"workspacePaths":["$repo"],"conversationId":"conv-q","terminationReason":"ERROR","error":"429 quota exceeded. Resets at 2020-01-01T00:00:00Z"}
+EOF
+  actual_ep=$(jq -r '.resumeAtEpoch' "$quota_file")
+  expected_ep=$((now_ep + 120))
+  diff_ep=$((actual_ep - expected_ep))
+  if [ "$diff_ep" -lt -15 ] || [ "$diff_ep" -gt 15 ]; then
+    echo "Past ISO timestamp must fall back to default probe (~$expected_ep), got $actual_ep" >&2
+    return 1
+  fi
 }
 
 run_tests

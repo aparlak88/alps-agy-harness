@@ -75,16 +75,16 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** `always_on` kural dosyasında Antigravity'nin 8 KB sınırını aşmadan koordinatöre mutlak devretme kuralını, `integrator` rolünü ve Saf Bekleme kota kurtarma protokolünü zorunlu kılmak için güncellendi.
 
 ### `scripts/lib/harness_core.py` — [GÜNCELLENDİ] (`Paylaşımlı Çekirdek Kütüphane`)
-- **Ne Değişti / Ne Üretildi?:** Dal-bağımsız `get_swarm_state_dir()`, `register_swarm_coordinator()`, `is_active_swarm_coordinator()`, `_has_unsafe_shell_syntax_for_coordinator()`, `_is_allowed_coordinator_command_segment()`, `_tokenize_raw_segments()` içinde `>&` / `&>` yönlendirme ayrıştırma düzeltmesi, `SWARM_INTEGRATOR_ROLE_RE` / `SWARM_INTEGRATOR_CONTRACT_HEADER`, `is_quota_exhausted_error()`, `classify_quota_window()`, `parse_quota_reset_epoch()`, `record_swarm_quota_pause()`, `attempt_swarm_quota_resume()`, `evaluate_pre_edit`/`evaluate_pre_command`/`evaluate_pre_subagent`/`evaluate_pre_swarm` koordinatör ve `force_ask` korumaları, `evaluate_stop_gate` `ERROR` yakalayıcısı, `build_session_start_payload` kurtarma satırları ve `swarm-coordinator`/`swarm-quota` CLI alt komutları eklendi.
-- **Neden Değişti / Neden Üretildi?:** Sıcak daemon ve soğuk fallback arasında tam eşitlikle hem Coordinator-Only fiziksel kapılarını hem de 5 saatlik/haftalık kota bekleme ve otomatik devam durum makinesini tek doğruluk kaynağında yürütmek için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** Dal-bağımsız `get_swarm_state_dir()`, `register_swarm_coordinator()`, `is_active_swarm_coordinator()`, `_has_unsafe_shell_syntax_for_coordinator()`, `_check_coordinator_raw_segments()` (`sudo`, `env -S/--split-string`, tehlikeli env atamaları), `_is_trusted_coordinator_exe()`, `_is_trusted_harness_script_path()`, `_evaluate_coordinator_stamp_gate()` (`swarm-coordinator off` ve `swarm-quota clear` için `deny`, erken `swarm-quota resume` için `force_ask`), `_is_allowed_coordinator_command_segment()` (`sort -o`/`--compress-program`, `uniq >=2` argüman, `rg --pre`, `git -c`/`--exec-path`/`--output` engelleri ve boş segment reddi), `evaluate_pre_edit` içinde `.harness/` muafiyetinden önce koordinatör koruması, `_safe_float()`, `_stale_resuming_threshold_sec()`, `resumingToken` korumalı `attempt_swarm_quota_resume()` (`resumed` döngüsünden miras almama), `evaluate_pre_subagent`/`evaluate_pre_swarm`/`evaluate_stop_gate` ve `swarm-coordinator`/`swarm-quota` CLI alt komutları eklendi.
+- **Neden Değişti / Neden Üretildi?:** Sıcak daemon ve soğuk fallback arasında tam eşitlikle hem Coordinator-Only fiziksel kapılarını bypass açıklarına karşı sertleştirmek hem de 5 saatlik/haftalık kota bekleme ve otomatik devam durum makinesini yarış koşullarından arındırmak için güncellendi.
 
 ### `scripts/stamp-gate.sh` — [GÜNCELLENDİ] (`Damga ve Durum CLI`)
-- **Ne Değişti / Ne Üretildi?:** `usage()`, `cmd_swarm_coordinator()` ve `cmd_swarm_quota()` alt komutları eklendi (`pause`, `resume`, `status`, `clear`, `attempt-resume`, `--resume-at`, `--wait-seconds`, `--buffer-seconds`, `--window`, `--member`); `pause` çağrısı sonrası sıcak `harness-daemon`'a `/event/swarm-quota-wait` bildirimi gönderilmesi sağlandı.
-- **Neden Değişti / Neden Üretildi?:** Koordinatörün oturum içi kota duraklatma/devam durumunu Bash 3.2 uyumlu CLI üzerinden kaydetmesi ve arka plan daemon bekleyicisini anında kurabilmesi için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `usage()` ve hata mesajlarında `attempt-resume` belgelendi; `cmd_swarm_coordinator()` ve `cmd_swarm_quota()` alt komutları eklendi (`pause`, `resume`, `status`, `clear`, `attempt-resume`, `--resume-at`, `--wait-seconds`, `--buffer-seconds`, `--window`, `--member`); `pause` çağrısı sonrası `--workspace` yolu `pwd -P` ile çözümlenerek sıcak `harness-daemon`'a `/event/swarm-quota-wait` bildirimi gönderilmesi sağlandı.
+- **Neden Değişti / Neden Üretildi?:** Koordinatörün oturum içi kota duraklatma/devam durumunu Bash 3.2 uyumlu CLI üzerinden kaydetmesi ve göreceli çalışma alanı yollarında bile arka plan daemon bekleyicisini anında kurabilmesi için güncellendi.
 
 ### `sidecars/harness-daemon/daemon.py` — [GÜNCELLENDİ] (`Arka Plan Sidecar Daemon`)
-- **Ne Değişti / Ne Üretildi?:** `HarnessDaemonState` içine `_quota_resume_inflight`, `active_quota_wait_count()`, `notify_swarm_quota_wait()` ve `_run_swarm_quota_resume()` eklendi; `_load_registry()` ve `watcher_loop()` aktif kota beklemesi olan çalışma alanlarını TTL temizliğinden muaf tutacak ve `nextProbeEpoch <= now` olduğunda arka planda `agy --conversation` uyandırması yapacak şekilde güncellendi; `GET /health` (`quotaWaits`), `POST /hook/stop-gate` ve `POST /event/swarm-quota-wait` eklendi.
-- **Neden Değişti / Neden Üretildi?:** Koordinatörün kendi kotası dolup `Stop(ERROR)` ile durduğu senaryoda sıfır token harcayarak 5 saatlik ve 7 günlük pencereleri bekleyip oturumu otomatik devam ettirmek için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `HarnessDaemonState` içine `_quota_resume_inflight`, `active_quota_wait_count()`, `notify_swarm_quota_wait()` ve `_run_swarm_quota_resume()` (başarılı `resumed` sonrasında `lastSeenAt` yenilemesiyle) eklendi; `_load_registry()` ve `watcher_loop()` aktif kota beklemesi olan çalışma alanlarını TTL temizliğinden muaf tutacak, bozuk kota durumlarında `try/except` + `_safe_float` ile çökmeyecek ve bayat `"resuming"` durumlarını `stale_threshold` sonrasında kurtaracak şekilde güncellendi; `GET /health` (`quotaWaits`), `POST /hook/stop-gate` ve `POST /event/swarm-quota-wait` eklendi.
+- **Neden Değişti / Neden Üretildi?:** Koordinatörün kendi kotası dolup `Stop(ERROR)` ile durduğu senaryoda sıfır token harcayarak 5 saatlik ve 7 günlük pencereleri bekleyip oturumu otomatik devam ettirmek ve daemon döngüsünü bozuk alanlara karşı dayanıklı kılmak için güncellendi.
 
 ### `skills/harness-orchestrator/SKILL.md` — [GÜNCELLENDİ] (`Orkestrasyon Skill'i`)
 - **Ne Değişti / Ne Üretildi?:** `## 8. Antigravity Swarm Orkestrasyon Modu (Coordinator-Only & Kota Kurtarma)` bölümü sıkı Coordinator-Only kuralları, uzman işçi rolleri (`planner`, `implementer-*`, `verifier`, `integrator`) ve Çift Katmanlı Saf Bekleme Kota Kurtarma protokolüyle yenilendi.
@@ -103,12 +103,16 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Çok adımlı geliştirme sırasında kapsam disiplinini ve doğrulama kriterlerini sabitlemek için üretildi.
 
 ### `tests/test-command-hooks.sh` — [GÜNCELLENDİ] (`Komut Kancası Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_command_allowlist_and_bypass_guards` testi eklendi (`git status >/dev/null 2>&1` dahil salt-okunur ve koordinasyon komutlarına izin, derleme/test/mutasyon/`$(...)`/backtick/yönlendirme/`find -delete` komutlarına red, işçiye izin).
-- **Neden Değişti / Neden Üretildi?:** `pre-command-guard.sh` üzerinden koordinatör komut beyaz listesinin ve kabuk kaçış korumalarının regresyona karşı kilitlenmesi için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_command_allowlist_and_bypass_guards` testi genişletildi (`git status >/dev/null 2>&1` izni, `env -S`, `sort -o`, `uniq` 2 argüman, `rg --pre`, `git -c`/`--upload-pack`/`--branch -u`, sahte `/tmp/stamp-gate.sh`, `stamp-gate swarm-coordinator off`/`swarm-quota clear` reddi, erken `swarm-quota resume` için `force_ask`, güvenli olmayan `PATH` çalıştırılabilirleri ve işçiye izin).
+- **Neden Değişti / Neden Üretildi?:** `pre-command-guard.sh` üzerinden koordinatör komut beyaz listesinin, kendini devre dışı bırakma engellerinin ve kabuk kaçış korumalarının mutasyonlara karşı kilitlenmesi için güncellendi.
 
 ### `tests/test-edit-and-session-hooks.sh` — [GÜNCELLENDİ] (`Dosya ve Oturum Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_pre_edit_and_session_start` testi eklendi (düz metinde yanlış pozitif olmaması, `/swarm` ve `title` ile koordinatör yazma reddi, `.harness/` ve harici UI `plan.json` izni, farklı `conversationId` işçisi izni ve `SessionStart` `[SWARM COORDINATOR MODE]` / `[SWARM QUOTA WAIT ACTIVE]` satırları).
-- **Neden Değişti / Neden Üretildi?:** `pre-edit-guard.sh` ve `session-start.sh` davranışlarını tüm sınır durumlarıyla doğrulamak için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_pre_edit_and_session_start` testi genişletildi (düz metinde yanlış pozitif olmaması, `/swarm` ve `title` ile koordinatör yazma reddi, `.harness/state/swarm/*` hedeflerinin koordinatöre kapatılması, harici UI `plan.json` izni, bağlı worktree ve `explicitlyDisabled` geçersiz kılması, `__default__` anahtarı ve bozuk JSON dayanıklılığı).
+- **Neden Değişti / Neden Üretildi?:** `pre-edit-guard.sh` ve `session-start.sh` davranışlarını tüm sınır durumlarıyla ve kendini devre dışı bırakma girişimlerine karşı doğrulamak için güncellendi.
+
+### `tests/test-helpers.sh` — [GÜNCELLENDİ] (`Ortak Test Yardımcıları`)
+- **Ne Değişti / Ne Üretildi?:** Test süreçlerinin dış Antigravity ajan oturumunun `HARNESS_CONVERSATION_ID`, `ANTIGRAVITY_CONVERSATION_ID` ve `ANTIGRAVITY_SOURCE_METADATA` ortam değişkenlerini devralmaması için başlangıçta temizleme (`unset`) eklendi.
+- **Neden Değişti / Neden Üretildi?:** Canlı bir Antigravity sohbeti içinde `./tests/run-all.sh` koşulurken `--conversation-id` verilmeyen birim testlerinin ana sohbet kimliğinden izole kalmasını sağlamak için güncellendi.
 
 ### `tests/test-manifest.sh` — [GÜNCELLENDİ] (`Manifesto Testleri`)
 - **Ne Değişti / Ne Üretildi?:** `test_plugin_json_required_fields` içindeki beklenen sürüm `"1.4.0"` olarak güncellendi.
@@ -123,15 +127,15 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** `< 8192` bayt sıkıştırmaları sırasında yeni Swarm koordinatör ve kota kurallarının silinmemesini garanti altına almak için güncellendi.
 
 ### `tests/test-sidecar-daemon.sh` — [GÜNCELLENDİ] (`Sidecar Daemon Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_daemon_swarm_coordinator_parity_and_quota_auto_resume_watchdog` testi eklendi (sıcak daemon vs soğuk fallback paritesi, TTL muafiyeti, `/health` `quotaWaits`, ilk denemede `429` üstel geri çekilme ve ikinci denemede sahte `HARNESS_AGY_BIN` ile `status == "resumed"` geçişi ve `TYPESAFE_API_KEY` temizliği).
-- **Neden Değişti / Neden Üretildi?:** Arka plan kota bekleyicisinin gerçek bir izole daemon süreci altında sıfır token harcayarak uyandırma yaptığını uçtan uca kanıtlamak için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_daemon_swarm_coordinator_parity_and_quota_auto_resume_watchdog` testi genişletildi (sıcak daemon vs soğuk fallback tam JSON paritesi, göreceli `--workspace .` ile `/event/swarm-quota-wait`, uçuş içi tekilleştirme bariyeri, TTL muafiyeti, bayat `"resuming"` kurtarması, bozuk `nextProbeEpoch` dayanıklılığı, `.harness-ignore`/geçersiz `/event` yanıtları ve `/hook/stop-gate` `stop-error` akışı).
+- **Neden Değişti / Neden Üretildi?:** Arka plan kota bekleyicisinin gerçek bir izole daemon süreci altında sıfır token harcayarak uyandırma yaptığını, kesintiye ve bozuk veriye dayandığını uçtan uca kanıtlamak için güncellendi.
 
 ### `tests/test-stamp-and-common.sh` — [GÜNCELLENDİ] (`Damga CLI Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_stamp_gate_swarm_coordinator_and_swarm_quota_cli` testi eklendi (`swarm-coordinator on|status|off`, `swarm-quota pause|status|resume|clear`, 5h/weekly `chunkedScheduleSeconds`, geçersiz argüman reddi).
-- **Neden Değişti / Neden Üretildi?:** `stamp-gate.sh` yeni alt komutlarının deterministik CLI davranışını ve hata yönetimini kilitlemek için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_stamp_gate_swarm_coordinator_and_swarm_quota_cli` testi genişletildi (`swarm-coordinator on|status|off`, `swarm-quota pause|status|resume|clear`, `--resume-at` + tampon, pencere çıkarımı, `resumed` sonrası miras almama, geçersiz argüman reddi ve `resumingToken` çakışma korumalı `attempt-resume` doğrulaması).
+- **Neden Değişti / Neden Üretildi?:** `stamp-gate.sh` yeni alt komutlarının ve `attempt_swarm_quota_resume` yarış koşulu korumasının deterministik davranışını kilitlemek için güncellendi.
 
 ### `tests/test-subagent-and-stop-hooks.sh` — [GÜNCELLENDİ] (`Alt Ajan ve Stop Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure_wait` ve `test_stop_gate_detects_coordinator_quota_error_without_looping` testleri eklendi (`invoke_subagent`/`run_workflow` reddi, `integrator` sözleşmesi, worker'ın yardımcı açarken koordinatöre dönüşmemesi, `swarm(model|kill)` `force_ask` koruması, `Stop(ERROR)` 5h/weekly kota tespiti).
+- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure_wait` ve `test_stop_gate_detects_coordinator_quota_error_without_looping` testleri genişletildi (`invoke_subagent`/`run_workflow` reddi, `integrator` sözleşmesi, worker'ın yardımcı açarken ve boşluklu brief kenar durumunda koordinatöre dönüşmemesi, `swarm(model|kill)` `force_ask` koruması, `Stop(ERROR)` 5h/weekly ve düz metinde yanlış pozitif olmaması).
 - **Neden Değişti / Neden Üretildi?:** Alt ajan delegasyon sınırlarını, Saf Bekleme `force_ask` kuralını ve `Stop` kancası kota tespitini tam kapsamlı doğrulamak için güncellendi.
 
 ---
@@ -141,17 +145,17 @@ sequenceDiagram
 | Senaryo / Kenar Durum | Sistemin Davranışı ve Korunan Kural (*Invariant*) | Üretilen Yanıt / Durum |
 | :--- | :--- | :--- |
 | **Düz metinde `"swarm"` kelimesi** | Yalnızca `/swarm` slash komutu (`SWARM_SLASH_CMD_RE`) veya `swarm-coordinator.json` kaydı koordinatör sayılır. | Normal görevlerde yanlış pozitif `deny` oluşmaz |
-| **Boş `conversationId` geriye dönük uyumu** | `swarm(action="add")` boş `conversationId` ile `"__default__"` koordinatör kaydı oluşturmaz. | Mevcut testler ve tekil akışlar kırılmaz |
-| **Koordinatör `git status >/dev/null 2>&1`** | `_tokenize_raw_segments` `>&` ve `&>` yönlendirmelerini arka plan `&` olarak bölmez. | Salt-okunur yönlendirmeli komutlar güvenle geçer |
-| **Kota `ERROR` anında `Stop` kancası** | Koordinatör kotaya takıldığında `evaluate_stop_gate` `{}` döner ve `swarm-quota-wait.json` yazar. | Anlık `continue` döngüsü olmaz; `harness-daemon` devralır |
-| **Haftalık beklemelerde daemon ömrü** | `has_active_swarm_quota_wait(ws)` True iken `_load_registry` ve `watcher_loop` TTL eviction atlar. | 5 saatlik / 7 günlük beklemelerde kayıt silinmez |
+| **Koordinatör `.harness/state/swarm/*` yazması** | `evaluate_pre_edit` içindeki `is_active_swarm_coordinator` kontrolü `.harness/` muafiyetinden önce çalışır; `stamp-gate.sh` kendini kapatma komutları engellenir. | Koordinatör kendi koruma dosyasını silemez veya değiştiremez |
+| **Uçuş içi yeniden pause & bayat `resuming`** | `attempt_swarm_quota_resume` benzersiz `resumingToken` kontrolü yapar; `watcher_loop` `stale_threshold` aşımında bayat durumu devralır ve `resumed` sonrasında `lastSeenAt` yenilenir. | Uzun prob sırasında yeni `pause`/`clear` ezilmez; çökmüş prob kurtarılır |
+| **Koşul / bayrak enjeksiyon bypass'ları** | `env -S`, `sort -o`, `uniq` 2 argüman, `rg --pre`, `git -c`/`--upload-pack`/`--branch -u`, güvenilmeyen yollar ve `GIT_EXTERNAL_DIFF` engellenir. | Salt-okunur beyaz liste dışında dosya/komut yürütülemez |
+| **Haftalık beklemelerde daemon ömrü** | `has_active_swarm_quota_wait(ws)` True iken `_load_registry` ve `watcher_loop` TTL eviction atlar; `_safe_float` bozuk epoklarda çökmeyi önler. | 5 saatlik / 7 günlük beklemelerde kayıt silinmez |
 
 ---
 
 ## 5. Somut Doğrulama Kanıtları
 
 1. **Tam Depo Test Paketi (`./scripts/run-quiet.sh full-tests -- ./tests/run-all.sh`):**
-   `✅ PASS [full-tests] (süre: 324.4s, warnings: 0 — log: .harness/logs/last.log)` — **9/9 paket, 108/108 test, 0 hata:**
+   `✅ PASS [full-tests] (süre: 338.2s, warnings: 0 — log: .harness/logs/last.log)` — **9/9 paket, 108/108 test, 0 hata:**
    - `tests/test-command-hooks.sh`: `14 passed, 0 failed`
    - `tests/test-edit-and-session-hooks.sh`: `14 passed, 0 failed`
    - `tests/test-manifest.sh`: `9 passed, 0 failed`
@@ -161,8 +165,8 @@ sequenceDiagram
    - `tests/test-stamp-and-common.sh`: `18 passed, 0 failed`
    - `tests/test-subagent-and-stop-hooks.sh`: `17 passed, 0 failed`
    - `tests/test-utilities.sh`: `11 passed, 0 failed`
-2. **CWD-Bağımsız Koşu (`(cd /tmp && ... run-all.sh)`):**
-   `✅ PASS [cwd-tmp-tests] (süre: 310.8s, warnings: 0 — log: .harness/logs/last.log)` — tüm paketler `/tmp` dizininden yeşil geçti.
+2. **Sertleştirme Sonrası Sözdizimi Kontrolü (`py_compile` & `bash -n`):**
+   `python3 -m py_compile scripts/lib/harness_core.py sidecars/harness-daemon/daemon.py && bash -n scripts/stamp-gate.sh` sıfır hata ile geçti.
 
 ---
 
