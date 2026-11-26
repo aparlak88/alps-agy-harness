@@ -14,6 +14,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import ast
 import contextlib
 import fcntl
 import glob
@@ -1204,7 +1205,7 @@ def verify_pr_stamps(
             f"Error: verify-pr-stamps failed: security-pass.json codeTreeSha ({sec_sha}) does not match current HEAD codeTreeSha ({current_sha})",
         )
 
-    need_ui, _, _ = requires_ui_stamp(workspace, diff_files=diff_files, config_dir=config_dir)
+    need_ui, ui_info_chk, _ = requires_ui_stamp(workspace, diff_files=diff_files, config_dir=config_dir)
     if need_ui and not ui_file.is_file():
         return (
             False,
@@ -1229,6 +1230,14 @@ def verify_pr_stamps(
             return (
                 False,
                 f"Error: verify-pr-stamps failed: ui-pass.json codeTreeSha ({ui_sha}) does not match current HEAD codeTreeSha ({current_sha})",
+            )
+        req_web = [f for f in ui_info_chk["webFiles"] if (workspace / f).is_file()]
+        scanned_web = {str(p) for p in (ui_data.get("scannedWebFiles") or []) if isinstance(p, str)}
+        missing_web = [f for f in req_web if f not in scanned_web]
+        if missing_web:
+            return (
+                False,
+                f"Error: verify-pr-stamps failed: ui-pass.json scannedWebFiles omits changed Web UI file(s): {', '.join(missing_web)}",
             )
 
     return True, ""
@@ -1982,13 +1991,13 @@ def evaluate_pre_command(
                                 "reason": f"Local merge stamps for '{target_branch}' do not match target branch codeTreeSha ({target_tree_sha}) or verdict is not PASS",
                             }
 
-                        need_ui, _, _ = requires_ui_stamp(seg_ws, diff_files=diff_files)
-                        if need_ui:
-                            ui_path = target_state_dir / "ui-pass.json"
-                            if not ui_path.is_file() and wt_for_branch is not None:
-                                wt_ui = wt_for_branch / ".harness" / "state" / target_slug / "ui-pass.json"
-                                if wt_ui.is_file():
-                                    ui_path = wt_ui
+                        need_ui, seg_ui_info, _ = requires_ui_stamp(seg_ws, diff_files=diff_files)
+                        ui_path = target_state_dir / "ui-pass.json"
+                        if not ui_path.is_file() and wt_for_branch is not None:
+                            wt_ui = wt_for_branch / ".harness" / "state" / target_slug / "ui-pass.json"
+                            if wt_ui.is_file():
+                                ui_path = wt_ui
+                        if need_ui or ui_path.is_file():
                             if not ui_path.is_file():
                                 return {
                                     "decision": "deny",
@@ -2005,6 +2014,15 @@ def evaluate_pre_command(
                                 return {
                                     "decision": "deny",
                                     "reason": f"Local merge ui-pass.json for '{target_branch}' does not match target branch codeTreeSha ({target_tree_sha}) or has non-PASS/non-zero findings",
+                                }
+                            content_root = wt_for_branch or seg_ws
+                            req_web = [f for f in seg_ui_info["webFiles"] if (content_root / f).is_file()]
+                            scanned_web = {str(p) for p in (ui_data.get("scannedWebFiles") or []) if isinstance(p, str)}
+                            missing_web = [f for f in req_web if f not in scanned_web]
+                            if missing_web:
+                                return {
+                                    "decision": "deny",
+                                    "reason": f"Local merge ui-pass.json scannedWebFiles omits changed Web UI file(s): {', '.join(missing_web)}",
                                 }
 
         # Gate 3: Package install verification
@@ -2362,11 +2380,12 @@ def default_effort_for_tier(tier: str) -> Optional[str]:
 ORCHESTRATOR_FAMILIES = frozenset(
     ("orchestrator", "orchestrator_neon", "orchestrator_carbon", "orchestrator_argon")
 )
-WORKFLOW_SUBPROCESS_RE = re.compile(
-    r"(?:^|[^A-Za-z0-9_])(?:subprocess\s*\.|os\s*\.\s*(?:system|popen|exec[lv]?p?e?|spawn[lv]?p?e?)\s*\()"
-)
-WORKFLOW_AGENT_MODEL_RE = re.compile(r"\bmodel\s*=\s*(['\"])([^'\"]*)\1")
 VALID_SUBAGENT_MODEL_TIERS = frozenset(("inherit", "flash_lite", "flash", "pro"))
+FORBIDDEN_WORKFLOW_MODULES = frozenset(("subprocess", "pty", "shutil", "commands", "ctypes", "importlib", "popen2"))
+FORBIDDEN_WORKFLOW_OS_ATTRS = frozenset(("system", "popen", "fork", "forkpty"))
+FORBIDDEN_WORKFLOW_OS_PREFIXES = ("exec", "spawn", "posix_spawn")
+FORBIDDEN_WORKFLOW_BUILTINS = frozenset(("eval", "exec", "compile", "__import__", "getattr"))
+MAX_WORKFLOW_SCRIPT_BYTES = 1_048_576
 
 
 def resolve_subagent_model(
@@ -2805,12 +2824,25 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     script_path_raw = str(args.get("ScriptPath") or "").strip()
     if script_path_raw:
         sp = _resolve_dir_arg(wf_cwd, script_path_raw)
+        _, is_ext = _resolve_rel_path(workspace, str(sp))
+        if is_ext:
+            wt_root = resolve_linked_worktree(workspace, sp)
+            if wt_root is None or _resolve_rel_path(wt_root, str(sp))[1]:
+                return {
+                    "decision": "deny",
+                    "reason": f"Workflow ScriptPath '{script_path_raw}' must reside inside the active workspace or linked worktree.",
+                }
         if not sp.is_file():
             return {
                 "decision": "deny",
                 "reason": f"Workflow ScriptPath '{script_path_raw}' does not exist or is not a file.",
             }
         try:
+            if sp.stat().st_size > MAX_WORKFLOW_SCRIPT_BYTES:
+                return {
+                    "decision": "deny",
+                    "reason": f"Workflow ScriptPath '{script_path_raw}' exceeds {MAX_WORKFLOW_SCRIPT_BYTES} bytes limit.",
+                }
             script_parts.append(sp.read_text(encoding="utf-8", errors="replace"))
         except OSError as exc:
             return {
@@ -2824,24 +2856,117 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
             "decision": "deny",
             "reason": "Plain private key detected in workflow script; secrets must never be embedded.",
         }
-    if WORKFLOW_SUBPROCESS_RE.search(full_script):
+
+    try:
+        tree = ast.parse(full_script)
+    except SyntaxError as exc:
         return {
             "decision": "deny",
-            "reason": (
-                "Direct subprocess/os.system shell execution inside run_workflow scripts is blocked because "
-                "it bypasses pre-command-guard.sh. Delegate shell commands to workflow agent() steps instead."
-            ),
+            "reason": f"Invalid Python syntax in workflow script (fail-closed): {exc.msg}.",
         }
-    for m in WORKFLOW_AGENT_MODEL_RE.finditer(full_script):
-        m_val = m.group(2).strip()
-        if m_val and m_val not in VALID_SUBAGENT_MODEL_TIERS:
-            return {
-                "decision": "deny",
-                "reason": (
-                    f"Invalid workflow agent model tier '{m_val}'. "
-                    "run_workflow agent(model=...) only accepts 'inherit', 'flash_lite', 'flash', or 'pro'."
-                ),
-            }
+
+    os_aliases: set[str] = {"os"}
+    asyncio_aliases: set[str] = {"asyncio"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root in FORBIDDEN_WORKFLOW_MODULES:
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            f"Importing forbidden module '{alias.name}' inside run_workflow scripts is blocked "
+                            "because direct shell/process execution bypasses pre-command-guard.sh."
+                        ),
+                    }
+                if root == "os":
+                    os_aliases.add(alias.asname or root)
+                elif root == "asyncio":
+                    asyncio_aliases.add(alias.asname or root)
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            root = mod.split(".", 1)[0]
+            if root in FORBIDDEN_WORKFLOW_MODULES:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Importing from forbidden module '{mod}' inside run_workflow scripts is blocked "
+                        "because direct shell/process execution bypasses pre-command-guard.sh."
+                    ),
+                }
+            if root == "os":
+                for alias in node.names:
+                    nm = alias.name
+                    if nm == "*" or nm in FORBIDDEN_WORKFLOW_OS_ATTRS or nm.startswith(FORBIDDEN_WORKFLOW_OS_PREFIXES):
+                        return {
+                            "decision": "deny",
+                            "reason": (
+                                f"Direct os process execution ('from {mod} import {nm}') inside run_workflow "
+                                "bypasses pre-command-guard.sh and is denied."
+                            ),
+                        }
+            elif root == "asyncio":
+                for alias in node.names:
+                    nm = alias.name
+                    if nm == "*" or nm.startswith("create_subprocess"):
+                        return {
+                            "decision": "deny",
+                            "reason": (
+                                f"Direct asyncio subprocess execution ('from {mod} import {nm}') inside run_workflow "
+                                "bypasses pre-command-guard.sh and is denied."
+                            ),
+                        }
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            attr = node.attr
+            if attr.startswith("create_subprocess"):
+                return {
+                    "decision": "deny",
+                    "reason": "Direct asyncio.create_subprocess_* calls inside run_workflow scripts are blocked.",
+                }
+            if isinstance(node.value, ast.Name) and node.value.id in os_aliases:
+                if attr in FORBIDDEN_WORKFLOW_OS_ATTRS or attr.startswith(FORBIDDEN_WORKFLOW_OS_PREFIXES):
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            f"Direct process execution ('{node.value.id}.{attr}') inside run_workflow scripts "
+                            "is blocked because it bypasses pre-command-guard.sh."
+                        ),
+                    }
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_WORKFLOW_BUILTINS:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Dynamic execution primitive '{node.func.id}()' is blocked inside run_workflow scripts "
+                        "to prevent pre-command-guard.sh evasion."
+                    ),
+                }
+            is_agent_call = (
+                (isinstance(node.func, ast.Name) and node.func.id == "agent")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "agent")
+            )
+            if is_agent_call:
+                for kw in node.keywords:
+                    if kw.arg == "model":
+                        if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, str):
+                            return {
+                                "decision": "deny",
+                                "reason": (
+                                    "run_workflow agent(model=...) must be a static string literal in "
+                                    "{'inherit', 'flash_lite', 'flash', 'pro'}."
+                                ),
+                            }
+                        m_val = kw.value.value.strip()
+                        if not m_val or m_val not in VALID_SUBAGENT_MODEL_TIERS:
+                            return {
+                                "decision": "deny",
+                                "reason": (
+                                    f"Invalid workflow agent model tier '{m_val}'. "
+                                    "run_workflow agent(model=...) only accepts 'inherit', 'flash_lite', 'flash', or 'pro'."
+                                ),
+                            }
 
     return {"decision": "allow"}
 
@@ -3184,14 +3309,14 @@ def classify_ui_files(file_paths: list[str]) -> dict[str, Any]:
 
 
 def _resolve_executable_detect_cmd(candidate_raw: str) -> list[str]:
-    """Build a command prefix ending in ``detect`` for a binary or launcher path."""
+    """Build a command prefix ending in ``detect`` for an executable binary or launcher path."""
     if not candidate_raw:
         return []
     expanded = os.path.expanduser(candidate_raw)
     if os.path.sep in expanded or (os.altsep and os.altsep in expanded) or expanded.startswith("."):
         p = Path(expanded)
-        if p.is_file():
-            return [str(p), "detect"] if os.access(p, os.X_OK) else ["/bin/sh", str(p), "detect"]
+        if p.is_file() and os.access(p, os.X_OK):
+            return [str(p), "detect"]
         return []
     which = shutil.which(expanded)
     return [which, "detect"] if which else []
@@ -3254,20 +3379,27 @@ def detect_impeccable(
     if explicit_bin:
         detector_cmd = _resolve_executable_detect_cmd(explicit_bin)
 
-    if not detector_cmd and matched_skill_dir is not None:
-        launcher = matched_skill_dir / "scripts" / "impeccable"
-        if launcher.is_file():
-            detector_cmd = [str(launcher), "detect"] if os.access(launcher, os.X_OK) else ["/bin/sh", str(launcher), "detect"]
-
-    if not detector_cmd and eff_home is not None:
-        home_bin = eff_home / ".impeccable" / "bin" / "impeccable"
-        if home_bin.is_file() and os.access(home_bin, os.X_OK):
-            detector_cmd = [str(home_bin), "detect"]
+    # Prefer trusted global/user launchers before workspace-local .agent/.agents scripts so a PR
+    # branch cannot shadow the machine's Impeccable detector with an in-repo stub.
+    trusted_launchers: list[Path] = [cfg_dir / "skills" / "impeccable" / "scripts" / "impeccable"]
+    if eff_home is not None:
+        trusted_launchers.append(eff_home / ".agents" / "skills" / "impeccable" / "scripts" / "impeccable")
+        trusted_launchers.append(eff_home / ".impeccable" / "bin" / "impeccable")
+    if not detector_cmd:
+        for tlauncher in trusted_launchers:
+            if tlauncher.is_file() and os.access(tlauncher, os.X_OK):
+                detector_cmd = [str(tlauncher), "detect"]
+                break
 
     if not detector_cmd and not explicit_cfg:
         which_imp = shutil.which("impeccable")
         if which_imp:
             detector_cmd = [which_imp, "detect"]
+
+    if not detector_cmd and matched_skill_dir is not None:
+        launcher = matched_skill_dir / "scripts" / "impeccable"
+        if launcher.is_file() and os.access(launcher, os.X_OK):
+            detector_cmd = [str(launcher), "detect"]
 
     installed = bool(skill_path or detector_cmd)
     return {
@@ -3313,7 +3445,8 @@ def run_impeccable_detect(
     if not existing:
         return 0, "[]", 0
 
-    cmd = [*detector_cmd, "--json", *existing]
+    safe_args = [f"./{p}" if p.startswith("-") else p for p in existing]
+    cmd = [*detector_cmd, "--json", *safe_args]
     env = dict(os.environ)
     env.update(IMPECCABLE_SAFE_ENV)
     timeout_sec = max(5, int(os.environ.get("HARNESS_IMPECCABLE_TIMEOUT_SEC", "30")))
@@ -3381,10 +3514,12 @@ def ui_stamp_register(
     if verdict == "PASS" and (p0 != 0 or p1 != 0):
         return False, f"Error: ui stamp cannot record PASS when p0Count ({p0}) or p1Count ({p1}) is non-zero", 1
 
+    branch_files = _collect_branch_diff_files(workspace, "HEAD")
     if explicit_targets:
-        candidates = [p.strip().lstrip("./") for p in explicit_targets if p.strip()]
+        norm_targets = [p.strip().lstrip("./") for p in explicit_targets if p.strip()]
+        candidates = list(dict.fromkeys([*branch_files, *norm_targets])) if verdict == "PASS" else norm_targets
     else:
-        candidates = _collect_branch_diff_files(workspace, "HEAD")
+        candidates = branch_files
 
     ui_info = classify_ui_files(candidates)
     detector_findings = 0
@@ -3426,15 +3561,17 @@ def ui_stamp_register(
     return True, "", 0
 
 
-def _extract_segment_env_vars(raw_seg: str) -> dict[str, str]:
-    """Extract leading or ``env``/``export`` KEY=VALUE assignments from a raw shell segment."""
+def _extract_segment_env_controls(raw_seg: str) -> tuple[dict[str, str], bool, set[str]]:
+    """Extract per-segment KEY=VALUE assignments, ``env -i`` reset state, and ``env -u`` removals."""
     try:
         tokens = shlex.split(raw_seg)
     except Exception:
         tokens = raw_seg.split()
     env_vars: dict[str, str] = {}
+    cleared_env = False
+    unset_vars: set[str] = set()
     if not tokens:
-        return env_vars
+        return env_vars, cleared_env, unset_vars
     idx = 0
     if tokens[0] == "export":
         idx = 1
@@ -3444,25 +3581,42 @@ def _extract_segment_env_vars(raw_seg: str) -> dict[str, str]:
                 k, v = tok.split("=", 1)
                 if k.isidentifier():
                     env_vars[k] = v
+                    unset_vars.discard(k)
             idx += 1
-        return env_vars
+        return env_vars, cleared_env, unset_vars
 
     while idx < len(tokens):
         tok = tokens[idx]
         if "=" in tok and tok.split("=", 1)[0].isidentifier():
             k, v = tok.split("=", 1)
             env_vars[k] = v
+            unset_vars.discard(k)
             idx += 1
             continue
         if tok == "env":
             idx += 1
             while idx < len(tokens):
                 etok = tokens[idx]
-                if etok.startswith("-"):
-                    idx += 2 if etok in ("-u", "-C", "-S") else 1
+                if etok in ("-i", "--ignore-environment"):
+                    cleared_env = True
+                    env_vars.clear()
+                    idx += 1
+                elif etok in ("-u", "--unset") and idx + 1 < len(tokens):
+                    ukey = tokens[idx + 1]
+                    env_vars.pop(ukey, None)
+                    unset_vars.add(ukey)
+                    idx += 2
+                elif etok.startswith("--unset="):
+                    ukey = etok.split("=", 1)[1]
+                    env_vars.pop(ukey, None)
+                    unset_vars.add(ukey)
+                    idx += 1
+                elif etok.startswith("-"):
+                    idx += 2 if etok in ("-C", "-S") else 1
                 elif "=" in etok and etok.split("=", 1)[0].isidentifier():
                     k, v = etok.split("=", 1)
                     env_vars[k] = v
+                    unset_vars.discard(k)
                     idx += 1
                 else:
                     break
@@ -3474,24 +3628,70 @@ def _extract_segment_env_vars(raw_seg: str) -> dict[str, str]:
                     idx += 2 if tokens[idx] in ("-u", "-g", "-h", "-p", "-U") else 1
             continue
         break
-    return env_vars
+    return env_vars, cleared_env, unset_vars
+
+
+def _is_impeccable_pkg_and_live(tokens: list[str], start_idx: int, val_flags: frozenset[str]) -> bool:
+    """Return True when runner args starting at ``start_idx`` resolve package ``impeccable`` with ``live``."""
+    idx = start_idx
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--":
+            idx += 1
+            break
+        if tok in val_flags:
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens):
+        return False
+    pkg = tokens[idx]
+    pkg_base = pkg.split("@", 1)[0] if not pkg.startswith("@") else pkg
+    if pkg_base != "impeccable" and not pkg.replace("\\", "/").endswith("/impeccable"):
+        return False
+    idx += 1
+    while idx < len(tokens) and tokens[idx] == "--":
+        idx += 1
+    return idx < len(tokens) and tokens[idx] == "live"
 
 
 def _is_impeccable_live_tokens(tokens: list[str]) -> bool:
-    """Return True if argv tokens invoke ``impeccable live`` directly or via ``npx``/``bunx``."""
+    """Return True if argv tokens invoke ``impeccable live`` directly or via package/node runners."""
     if not tokens:
         return False
     exe_base = os.path.basename(tokens[0])
     norm_exe = tokens[0].replace("\\", "/")
     if (exe_base == "impeccable" or norm_exe.endswith("/scripts/impeccable")) and len(tokens) >= 2 and tokens[1] == "live":
         return True
-    if exe_base in ("npx", "bunx"):
-        for idx, tok in enumerate(tokens[1:], start=1):
-            if tok.startswith("-"):
+    if exe_base in ("npx", "bunx", "pnpx"):
+        if _is_impeccable_pkg_and_live(tokens, 1, frozenset(("-p", "--package", "-c", "--call", "--userconfig"))):
+            return True
+        # Fallback for `-p impeccable` followed by command `impeccable live`
+        for j in range(1, len(tokens) - 1):
+            if tokens[j] in ("-p", "--package") and tokens[j + 1].split("@", 1)[0] == "impeccable":
+                rest = tokens[j + 2 :]
+                for k, rt in enumerate(rest):
+                    if rt == "live" or (rt == "impeccable" and k + 1 < len(rest) and rest[k + 1] == "live"):
+                        return True
+        return False
+    if exe_base == "npm" and len(tokens) >= 3 and tokens[1] == "exec":
+        return _is_impeccable_pkg_and_live(tokens, 2, frozenset(("-p", "--package", "-w", "--workspace", "--userconfig")))
+    if exe_base in ("pnpm", "yarn") and len(tokens) >= 3 and tokens[1] == "dlx":
+        return _is_impeccable_pkg_and_live(tokens, 2, frozenset(("--package", "-p")))
+    if exe_base in ("node", "nodejs", "bun") and len(tokens) >= 3:
+        for idx in range(1, len(tokens)):
+            t = tokens[idx]
+            if t.startswith("-"):
                 continue
-            pkg_base = tok.split("@", 1)[0] if not tok.startswith("@") else tok
-            if pkg_base == "impeccable" and idx + 1 < len(tokens) and tokens[idx + 1] == "live":
-                return True
+            tb = os.path.basename(t)
+            if tb in ("impeccable", "impeccable.js", "impeccable.mjs", "impeccable.cjs") or t.replace("\\", "/").endswith("/scripts/impeccable"):
+                nxt = idx + 1
+                while nxt < len(tokens) and tokens[nxt] == "--":
+                    nxt += 1
+                return nxt < len(tokens) and tokens[nxt] == "live"
             break
     return False
 
@@ -3499,19 +3699,30 @@ def _is_impeccable_live_tokens(tokens: list[str]) -> bool:
 def _check_impeccable_live_guard(cmd_line: str) -> Optional[dict[str, Any]]:
     """Deny ``impeccable live`` unless ``IMPECCABLE_LIVE_COPY_AGENT`` is pinned to ``chat`` or ``off``."""
     session_env: dict[str, str] = {}
+    session_unset: set[str] = set()
     for raw_seg, _ in _tokenize_raw_segments(cmd_line):
-        seg_env = _extract_segment_env_vars(raw_seg)
+        seg_env, cleared_env, seg_unset = _extract_segment_env_controls(raw_seg)
         cleaned = _strip_segment_wrappers(raw_seg)
         if not cleaned:
             continue
         if cleaned[0] == "export":
-            session_env.update(seg_env)
+            for k, v in seg_env.items():
+                session_env[k] = v
+                session_unset.discard(k)
+            continue
+        if cleaned[0] == "unset":
+            for ukey in cleaned[1:]:
+                if ukey.isidentifier():
+                    session_env.pop(ukey, None)
+                    session_unset.add(ukey)
             continue
         if _is_impeccable_live_tokens(cleaned):
-            effective = seg_env.get(
-                "IMPECCABLE_LIVE_COPY_AGENT",
-                session_env.get("IMPECCABLE_LIVE_COPY_AGENT", os.environ.get("IMPECCABLE_LIVE_COPY_AGENT", "")),
-            )
+            if "IMPECCABLE_LIVE_COPY_AGENT" in seg_env:
+                effective = seg_env["IMPECCABLE_LIVE_COPY_AGENT"]
+            elif cleared_env or "IMPECCABLE_LIVE_COPY_AGENT" in seg_unset or "IMPECCABLE_LIVE_COPY_AGENT" in session_unset:
+                effective = ""
+            else:
+                effective = session_env.get("IMPECCABLE_LIVE_COPY_AGENT", os.environ.get("IMPECCABLE_LIVE_COPY_AGENT", ""))
             if effective.strip().lower() not in ("chat", "off"):
                 return {
                     "decision": "deny",

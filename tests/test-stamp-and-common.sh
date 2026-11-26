@@ -998,6 +998,26 @@ EOF
   assert_json_field "$native_state_dir/ui-pass.json" ".auditedNativeFiles[0]" "Sources/Features/PaywallView.swift"
   HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$native_skill_dir" \
     "$STAMP_GATE" verify-pr-stamps --workspace "$native_repo"
+
+  # 8. --target cannot bypass changed Web UI files when --verdict PASS, and non-executable repo scripts are not executed via /bin/sh
+  local partial_err
+  if partial_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$repo/.missing-bin" "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0 --target README.md 2>&1); then
+    echo "stamp-gate ui --verdict PASS --target README.md must still scan changed Hero.html and require valid detector" >&2
+    return 1
+  fi
+  mkdir -p "$repo/.agent/skills/impeccable/scripts"
+  cat << 'EOF' > "$repo/.agent/skills/impeccable/scripts/impeccable"
+#!/usr/bin/env bash
+echo '[]'
+exit 0
+EOF
+  # Deliberately NOT chmod +x: must NOT run via /bin/sh fallback
+  echo "# Skill" > "$repo/.agent/skills/impeccable/SKILL.md"
+  if HARNESS_CONFIG_DIR="$mock_cfg" env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR \
+      "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0 --target README.md >/dev/null 2>&1; then
+    echo "Non-executable .agent/skills/impeccable/scripts/impeccable must not be executed via /bin/sh" >&2
+    return 1
+  fi
 }
 
 run_tests "$@"

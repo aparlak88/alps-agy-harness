@@ -1741,6 +1741,42 @@ test_five_layer_gemini4_orchestrator_deprecation_and_run_workflow() {
     }
   }' | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_wf_path_ok" ".decision" "allow" "Clean run_workflow ScriptPath allowed"
+
+  # 5. AST bypass hardening regressions (pty, import alias, from-import, eval, dynamic/triple-quote model, SyntaxError, external ScriptPath)
+  local bypass_case
+  for bypass_case in \
+    'import pty
+pty.spawn(["git", "push", "origin", "main"])' \
+    'from subprocess import run
+run(["echo", "hi"])' \
+    'import subprocess as sp
+sp.run(["echo", "hi"])' \
+    'from os import system
+system("echo hi")' \
+    'eval("__import__(\"os\").system(\"id\")")' \
+    'agent(prompt="Scan", model="""gpt4""")' \
+    'm = "gpt4"
+agent(prompt="Scan", model=m)' \
+    'def broken(:'
+  do
+    local out_byp
+    out_byp=$(jq -nc --arg ws "$repo" --arg sc "$bypass_case" '{
+      workspacePaths: [$ws],
+      toolCall: {name: "run_workflow", args: {Description: "Bypass test", Script: $sc}}
+    }' | "$PRE_SUBAGENT_GUARD")
+    assert_json_field "$out_byp" ".decision" "deny" "AST guard denies bypass payload: ${bypass_case%%$'\n'*}"
+  done
+
+  local ext_dir ext_wf out_wf_ext
+  ext_dir=$(mktemp -d "${TMPDIR:-/tmp}/ext-wf.XXXXXX")
+  echo "$ext_dir" >> "$_HARNESS_TEMP_TRACKER"
+  ext_wf="$ext_dir/wf.py"
+  printf 'agent(prompt="Scan", model="pro")\n' > "$ext_wf"
+  out_wf_ext=$(jq -nc --arg ws "$repo" --arg sp "$ext_wf" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "run_workflow", args: {Description: "External path", ScriptPath: $sp}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_ext" ".decision" "deny" "run_workflow ScriptPath outside workspace denied"
 }
 
 run_tests

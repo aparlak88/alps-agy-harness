@@ -76,15 +76,6 @@ Ana Oturum (`HOOK_INPUT.modelName`) Duyarlı Katman Eşlemesi:
 
 ---
 
-## 9. İki Fazlı `Orchestrator` (`Planner ↔ Executor`) ve `run_workflow` Modu
-
-- **İki Fazlı `Orchestrator` (`Neon`/`Carbon`/`Opus 5.5` Planner ↔ `Hydrogen`/`Sonnet 5.5` Executor):**
-  1. **Planner Fazı (Salt-Okunur):** `jev_classify`, kod tabanı keşfi, `jev_check` (`ADR`), `context7` doküman sorguları ve `ask_question` kararlarını tamamlayıp `Re-plan if:` tetikleyicileriyle `exit_plan_mode` üzerinden yürütmeye devredin.
-  2. **Executor Fazı:** İzole `feat/*` dalı/worktree açıp Spec/Plan/kod yazın, `stamp-gate.sh` ve `run-quiet.sh` doğrulamalarını çalıştırın; başarısız doğrulama veya plan dışı karar gereksiniminde `enter_plan_mode` ile Planner'a dönün.
-- **`run_workflow` Koruması:** `hooks.json` (`invoke_subagent|swarm|run_workflow`) dinamik Python iş akışı betiklerinde doğrudan `subprocess`/`os.system` kabuk atlatmalarını, gömülü gizli anahtarları ve geçersiz `agent(model=...)` katmanlarını fiziksel olarak reddeder.
-
----
-
 ## 5. Sessiz Komut Çalıştırma (`run-quiet.sh`)
 
 Context çürümesini önlemek için tüm derleme, test ve statik analiz komutlarını `scripts/run-quiet.sh` üzerinden yürütün:
@@ -131,3 +122,12 @@ Kullanıcı `/swarm` veya çoklu ajan koordinasyonu başlattığında ana ajan *
 5. **`swarm` vs. `invoke_subagent` Görev Ayrımı:**
    - **`swarm`:** Paralel uygulayıcı işçiler, paylaşılan mesaj panosu koordinasyonu ve `share`/`branch` alt dallarında eşzamanlı kodlama için kullanılır.
    - **`invoke_subagent`:** Tekil salt-okunur profiller ve zorunlu denetim kapıları (`canon-auditor`, `security-reviewer`, `pr-auditor`, `research`, `browser`) için kullanılır. Tüm işçi dalları entegrasyon dalında birleştirildikten sonra koordinatör `pre-pr-readiness`, tek Walkthrough, `gh pr create` ve `review-pr` (`pr-auditor`) adımlarını yürütür.
+
+---
+
+## 9. İki Fazlı `Orchestrator` (`Planner ↔ Executor`) ve `run_workflow` Modu
+
+- **İki Fazlı `Orchestrator` (`Neon`/`Carbon`/`Opus 5.5` Planner ↔ `Hydrogen`/`Sonnet 5.5` Executor):**
+  1. **Planner Fazı (Salt-Okunur):** `jev_classify`, kod tabanı keşfi, `jev_check` (`ADR`), `context7` doküman sorguları ve `ask_question` kararlarını tamamlayıp `Re-plan if:` tetikleyicileriyle `exit_plan_mode` üzerinden yürütmeye devredin.
+  2. **Executor Fazı:** İzole `feat/*` dalı/worktree açıp Spec/Plan/kod yazın, `stamp-gate.sh` ve `run-quiet.sh` doğrulamalarını çalıştırın; başarısız doğrulama veya plan dışı karar gereksiniminde `enter_plan_mode` ile Planner'a dönün.
+- **`run_workflow` Koruması:** `hooks.json` (`invoke_subagent|swarm|run_workflow`) dinamik Python iş akışı betiklerinde doğrudan `subprocess`/`os.system` kabuk atlatmalarını, `pty`/`eval`/`exec` kaçışlarını, gömülü gizli anahtarları ve geçersiz statik `agent(model=...)` katmanlarını AST tabanlı analizle fiziksel olarak reddeder.

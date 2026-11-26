@@ -1274,6 +1274,21 @@ EOF
 
   out_live_off=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "export IMPECCABLE_LIVE_COPY_AGENT=off && impeccable live"}}}' | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_live_off" ".decision" "allow" "impeccable live after export IMPECCABLE_LIVE_COPY_AGENT=off must be allowed"
+
+  # 5. Live guard bypass hardening (npx -p, npm exec, pnpm dlx, unset, env -u, env -i)
+  local bypass_cmd
+  for bypass_cmd in \
+    "npx -p impeccable impeccable live" \
+    "npm exec impeccable -- live" \
+    "pnpm dlx impeccable live" \
+    "export IMPECCABLE_LIVE_COPY_AGENT=chat && unset IMPECCABLE_LIVE_COPY_AGENT && impeccable live" \
+    "IMPECCABLE_LIVE_COPY_AGENT=chat env -u IMPECCABLE_LIVE_COPY_AGENT impeccable live" \
+    "IMPECCABLE_LIVE_COPY_AGENT=chat env -i npx impeccable live"
+  do
+    local out_byp_cmd
+    out_byp_cmd=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_cmd" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_byp_cmd" ".decision" "deny" "Live guard must deny bypass: $bypass_cmd"
+  done
 }
 
 run_tests

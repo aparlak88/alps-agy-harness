@@ -96,11 +96,11 @@ sequenceDiagram
 `git diff --name-status origin/main..HEAD` çıktısındaki tüm 30 dosya aşağıda eksiksiz olarak analiz edilmiştir:
 
 ### `README.md` — GÜNCELLENDİ (`Documentation Layer`)
-- **Ne Değişti / Ne Üretildi?:** Belge başlığı ve `§1 Session Intake`, `§7 Hybrid jev & Gemini 4/Orchestrator/Claude 5.5 Routing`, `§8 Context & Hooks` ve `## Teknik Terimler Sözlüğü` bölümleri güncellendi. Yeni iki fazlı `Orchestrator (Neon / Carbon)` Planner/Executor ayrımı, `2026-11-30` tarihinde emekliye ayrılacak modeller (`Argon`, `3.8 Flash`, `GPT-OSS`, `Claude 4.6`), `Extra` (`xhigh`) efor eşlemesi, `invoke_subagent|swarm|run_workflow` matcher genişlemesi ve koşullu `impeccable` UI kapısı (`.impeccable/` ile `DO_NOT_TRACK=1`) dokümana işlendi; sözlüğe `Orchestrator (Two-Phase Planner/Executor)` ve `run_workflow` maddeleri eklendi.
+- **Ne Değişti / Ne Üretildi?:** Belge başlığı ile `§1 Neden "Engineering Harness"?`, `§3 Ön Gereksinimler`, `§7 Yaşam Döngüsü / Swarm`, `§8 Bileşenler Özeti` ve `## Teknik Terimler Sözlüğü` bölümleri güncellendi. Yeni iki fazlı `Orchestrator (Neon / Carbon)` Planner/Executor ayrımı, `2026-11-30` tarihinde emekliye ayrılacak modeller (`Argon`, `3.8 Flash`, `GPT-OSS`, `Claude 4.6`), `Extra` (`xhigh`) efor eşlemesi, `invoke_subagent|swarm|run_workflow` matcher genişlemesi ve koşullu `impeccable` UI kapısı (`.impeccable/` ile `DO_NOT_TRACK=1`) dokümana işlendi; sözlüğe `Orchestrator (Two-Phase Planner/Executor)` ve `run_workflow` maddeleri eklendi.
 - **Neden Değişti / Neden Üretildi?:** Harness kullanıcılarının hem yeni Gemini 4 / Claude 5.5 yönlendirme kurallarını hem de koşullu UI tasarım kapısının tetiklenme şartlarını tek bir Türkçe referans dokümanda görmesi ve `test-plugin-bundle.sh` sözlük sözleşmesinin korunması gerektiği için güncellendi.
 
 ### `agents/canon-auditor.md` — GÜNCELLENDİ (`Subagent Contract Layer`)
-- **Ne Değişti / Ne Üretildi?:** Altı satırlık YAML frontmatter (`name`, `description`, `tools`, `model`, `effort`, `tier`) korunarak `§1.1` altındaki model kilidi açıklamaları güncellendi. Yeni metinde `Neon`/`Carbon`/`Opus 5.5` gibi üst sınıf ebeveynlerde `Model: "inherit"` desteklendiği; ancak iki fazlı `Orchestrator (Neon|Carbon)`, `Hydrogen`, `frontier_low`, `Claude Sonnet 5.5` ve `Flash` altında yürütme düşmesini (*executor downgrade*) önlemek için `pre-subagent-guard.sh` kancasının `canon-auditor` çağrılarını otomatik olarak `pro` (`HIGH`) seviyesine yükselttiği açıklandı.
+- **Ne Değişti / Ne Üretildi?:** Altı satırlık YAML frontmatter (`name`, `description`, `subagent`, `mainAgent`, `inheritMcp`, `tools`) korunarak `§1.1` altındaki model kilidi açıklamaları güncellendi (`tests/test-rules-and-agents.sh` gereği `model:` ön eki yasaktır). Yeni metinde `Neon`/`Carbon`/`Opus 5.5` gibi üst sınıf ebeveynlerde `Model: "inherit"` desteklendiği; ancak iki fazlı `Orchestrator (Neon|Carbon)`, `Hydrogen`, `frontier_low`, `Claude Sonnet 5.5` ve `Flash` altında yürütme düşmesini (*executor downgrade*) önlemek için `pre-subagent-guard.sh` kancasının `canon-auditor` çağrılarını otomatik olarak `pro` (`HIGH`) seviyesine yükselttiği açıklandı.
 - **Neden Değişti / Neden Üretildi?:** Mimari ve alan sözlüğü denetimini yürüten `canon-auditor` alt ajanının özellikle iki fazlı `Orchestrator` yürütme turlarında düşük kapasiteli yürütücüye (`Hydrogen`) düşmesini engellemek ve ajan belgeleri ile çalışma zamanı kancası arasında tam sözleşme uyumu kurmak için güncellendi.
 
 ### `agents/pr-auditor.md` — GÜNCELLENDİ (`Subagent Contract Layer`)
@@ -120,7 +120,7 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** UI/Frontend odaklı PR ve yerel merge kapılarının backend projelerini bozmadan adım adım doğrulanabilir bir planla inşa edilmesi için oluşturuldu.
 
 ### `docs/superpowers/specs/2026-11-26-gemini4-orchestrator-5layer-design.md` — ÜRETİLDİ (`Specification Layer`)
-- **Ne Değişti / Ne Üretildi?:** 5 katmanlı mimarinin intent/hedeflerini, Antigravity `agy models` tablosuyla hizalanmış yeni sınıflandırma kurallarını, `jev_check = 0.67` (`yes`) kalibrasyonlu Mimari Karar Kayıtlarını (`ADR-01`..`ADR-05`) ve Türkçe terimler sözlüğünü tanımlayan tasarım dokümanı üretildi.
+- **Ne Değişti / Ne Üretildi?:** 5 katmanlı mimarinin intent/hedeflerini, Antigravity `agy models` tablosuyla hizalanmış yeni sınıflandırma kurallarını, `jev_check = 0.67` (`yes`) kalibrasyonlu Mimari Karar Kayıtlarını (`ADR-01`..`ADR-03`) ve Türkçe terimler sözlüğünü tanımlayan tasarım dokümanı üretildi.
 - **Neden Değişti / Neden Üretildi?:** Yeni model isimleri (`Neon`, `Carbon`, `Hydrogen`, `Claude Opus/Sonnet 5.5`) ile iki fazlı `Orchestrator` davranışının kodlamadan önce kararlara (`ADR`) bağlanması için hazırlandı.
 
 ### `docs/superpowers/specs/2026-11-26-impeccable-ui-gate-design.md` — ÜRETİLDİ (`Specification Layer`)
@@ -152,17 +152,17 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** iOS/SwiftUI projelerinde Apple HIG uyumunun PR öncesi deterministik damga ile doğrulanmasını sağlamak için güncellendi.
 
 ### `scripts/hooks/common.sh` — GÜNCELLENDİ (`Bash Hook Fast-Path Layer`)
-- **Ne Değişti / Ne Üretildi?:** `_harness_is_extra_effort_model`, `harness_detect_parent_effort_hint` (`LOW|MEDIUM|HIGH|XHIGH`) ve `harness_is_deprecated_model` (`Argon`, `3.8 Flash`, `GPT-OSS`, `Claude 4.6`) yardımcıları eklendi; `harness_classify_parent_model` ve `harness_resolve_subagent_model` fonksiyonları `orchestrator_neon`, `orchestrator_carbon`, `orchestrator_argon`, `frontier_low`, `claude_opus`, `claude_sonnet` ailelerini destekleyecek ve `orchestrator*` altında `critical_architecture_or_audit` çağrılarını `pro`'ya yükseltecek şekilde güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `_harness_is_extra_effort_model`, `harness_detect_parent_effort_hint` (`LOW|MEDIUM|HIGH|XHIGH`) ve `harness_is_deprecated_model` (`Argon`, `3.8 Flash`, `GPT-OSS`, `Claude 4.6`) yardımcıları eklendi; `harness_classify_parent_model` ve `harness_resolve_subagent_model` fonksiyonları `orchestrator_neon`, `orchestrator_carbon`, `orchestrator_argon`, `frontier_low`, `claude_opus`, `claude_sonnet` ailelerini destekleyecek ve `orchestrator*` altında hem `multi_module_integration` hem de `critical_architecture_or_audit` çağrılarını `pro`'ya yükseltecek şekilde güncellendi.
 - **Neden Değişti / Neden Üretildi?:** Daemon kapalıyken veya `stamp-gate.sh` saf Bash yolundan çalışırken Python çekirdeği (`harness_core.py`) ile bit-düzeyinde %100 parite sağlamak ve *executor downgrade* açıklarını kapatmak için güncellendi.
 
 ### `scripts/lib/harness_core.py` — GÜNCELLENDİ (`Core Python Engine Layer`)
-- **Ne Değişti / Ne Üretildi?:** İki ana modül bütünü eklendi:
-  1. **Impeccable UI Kapısı:** `discover_impeccable`, `classify_ui_files`, `.impeccable/` dizini muafiyeti (sır taraması korunarak), `PRODUCT.md`/`DESIGN.md` `main` dalı taslak izni, `DO_NOT_TRACK=1` / `IMPECCABLE_LIVE_COPY_AGENT` güvenli sarmalayıcısı, `validate-ui-stamp` ve `gh pr create` / yerel `merge` içinde koşullu `ui-pass.json` (`codeTreeSha` eşleşmeli) doğrulaması.
-  2. **Gemini 4 5-Katman & `run_workflow`:** `is_extra_effort_model`, `detect_parent_effort_hint`, `is_deprecated_parent_model`, `ORCHESTRATOR_FAMILIES`, güncellenen `classify_parent_model` / `resolve_subagent_model`, `evaluate_pre_subagent` (`run_workflow` yönlendirmesi + `Extra`->`XHIGH` + `Orchestrator` `pro` denetim kalkanı), `evaluate_pre_workflow` (AST/regex tabanlı `subprocess`/`os.system`/`pty` engeli, özel anahtar taraması, `ScriptPath` okunabilirlik doğrulaması ve `agent(model=...)` kademe kontrolü) ve `build_session_start_payload` (`[MODEL DEPRECATION WARNING]` enjeksiyonu).
+- **Ne Değişti / Ne Üretildi?:** İki ana modül bütünü ve güvenlik sıkılaştırmaları eklendi:
+  1. **Impeccable UI Kapısı:** `detect_impeccable` (güvenilir küresel/kullanıcı ikililerini çalışma alanı içi `.agent`/`.agents` betiklerinden önce arar ve çalıştırma biti olmayan betikleri `/bin/sh` ile yürütmez), `detect_ui_workspace`, `classify_ui_files`, `requires_ui_stamp`, `run_impeccable_detect` (`DO_NOT_TRACK=1`, `IMPECCABLE_LIVE_COPY_AGENT=off`, baştaki `-` dosya adı normalizasyonu), `ui_stamp_register` (`ui-stamp` — `--verdict PASS` sırasında `--target` verilse dahi tüm dal farkındaki Web UI dosyalarını tarar), `verify_pr_stamps` + yerel `merge` Kapısı (`scannedWebFiles` eksiksizlik doğrulaması), `.impeccable/` dizini muafiyeti (sır taraması korunarak), `PRODUCT.md`/`DESIGN.md` `main` dalı taslak izni ve `_check_impeccable_live_guard` (`npx -p`, `npm exec`, `pnpm dlx`, `node`, `unset`, `env -u`, `env -i` atlatma koruması).
+  2. **Gemini 4 5-Katman & `run_workflow`:** `is_extra_effort_model`, `detect_parent_effort_hint`, `is_deprecated_parent_model`, `ORCHESTRATOR_FAMILIES`, güncellenen `classify_parent_model` / `resolve_subagent_model`, `evaluate_pre_subagent` (`run_workflow` yönlendirmesi + `Extra`->`XHIGH` + `Orchestrator` `pro` denetim kalkanı), `evaluate_pre_workflow` (Python `ast.parse()` tabanlı `SyntaxError` fail-closed kilidi, `subprocess`/`pty`/`shutil`/`commands`/`ctypes`/`importlib`/`os.{system,popen,exec*,spawn*,fork*}`/`asyncio.create_subprocess_*`/`eval`/`exec`/`compile`/`__import__`/`getattr` engeli, özel anahtar taraması, çalışma alanı içi `ScriptPath` sınır & 1 MiB boyut doğrulaması ve statik string literal `agent(model=...)` doğrulaması) ve `build_session_start_payload` (`[MODEL DEPRECATION WARNING]` enjeksiyonu).
 - **Neden Değişti / Neden Üretildi?:** Tüm pre-edit, pre-command, pre-subagent, daemon RPC ve SessionStart kararlarının tek merkezli Python motorunda fail-closed ve sıfır harici bağımlılıkla çalışması için güncellendi.
 
 ### `scripts/stamp-gate.sh` — GÜNCELLENDİ (`Gate CLI Layer`)
-- **Ne Değişti / Ne Üretildi?:** Yeni `stamp-gate.sh ui` alt komutu (`--verdict`, `--p0`, `--p1`, `--report`) ve `verify-pr-stamps` / `tree-state` içine koşullu `ui-pass.json` denetimi eklendi. Ayrıca `cmd_select_model` JSON çıktısına `parentEffortHint` (`LOW|MEDIUM|HIGH|XHIGH|""`) ve `deprecated` (`true|false`) alanları eklendi.
+- **Ne Değişti / Ne Üretildi?:** Yeni `stamp-gate.sh ui` alt komutu (`--verdict`, `--p0`, `--p1`, `--target`) ve `verify-pr-stamps` içine koşullu `ui-pass.json` denetimi eklendi (daemon `tree-state.json` önbelleği `ui-pass.json` durumunu otomatik izler; CLI komutu `tree-sha` olarak kalır). Ayrıca `cmd_select_model` JSON çıktısına `parentEffortHint` (`LOW|MEDIUM|HIGH|XHIGH|""`) ve `deprecated` (`true|false`) alanları eklendi.
 - **Neden Değişti / Neden Üretildi?:** PR öncesi UI anti-pattern denetiminin SHA-kilitli damga üretmesini sağlamak ve alt ajan/orkestratör çağrıcılarının efor ve emeklilik durumunu CLI çıktısından programatik okuyabilmesini sağlamak için güncellendi.
 
 ### `sidecars/harness-daemon/daemon.py` — GÜNCELLENDİ (`Background Daemon Layer`)
@@ -225,7 +225,7 @@ sequenceDiagram
 | :--- | :--- | :--- |
 | **`Orchestrator (Neon|Carbon)` yürütme turunda `security-reviewer` / `pr-auditor` / `canon-auditor` çağrısı** | Yürütme turunda aktif uç noktanın `Hydrogen` olması nedeniyle `inherit` yasaklanır; tüm denetim ve çok-modüllü işler deterministik olarak `pro` kademesine yükseltilir | `PreToolUse` `overwrite: { Model: "pro" }` |
 | **`run_workflow` betiğinde `subprocess`, `os.system`, geçersiz `model=` veya gömülü sır** | Python çalışma ortamına geçmeden statik inceleme (`evaluate_pre_workflow`) çalışır; okunamayan `ScriptPath` dahil fail-closed reddedilir | `PreToolUse` `decision: "deny"` + İngilizce gerekçe |
-| **UI dosyası + `impeccable` algılandığında `detect` bulgusu (`exit 2`) veya damgasız PR/merge** | `impeccable detect --json` bulgu döndürürse `stamp-gate.sh ui` `PASS` yazmaz; damgasız/bayat `ui-pass.json` varken `gh pr create` ve yerel `merge` engellenir | `REMEDIATION:` içeren `deny` kararı |
+| **UI dosyası + `impeccable` algılandığında `detect` bulgusu (`exit 2`) veya damgasız PR/merge** | `impeccable detect --json` bulgu döndürürse `stamp-gate.sh ui` `PASS` yazmaz; damgasız/bayat/eksik `scannedWebFiles` içeren `ui-pass.json` varken `gh pr create` ve yerel `merge` engellenir | `Error: ui stamp rejected...` / `Error: verify-pr-stamps failed...` / `Local merge requires valid ui-pass.json...` (`deny`) |
 | **Saf Backend / UI dosyası yokken Impeccable kurulu veya kurulu değil** | `classify_ui_files` boş döner, `ui` damgası talep edilmez ve mevcut PR akışı sıfır sürtünmeyle çalışır | `dormant` (`INFO`) veya UI+yoksa `advisory` (`WARN`, exit `0`) |
 | **Test ortamında `HARNESS_CONFIG_DIR` izolasyonu** | Global makine dizinindeki gerçek `~/.agents/skills/impeccable` veya eski socket testlere sızmaz | İzole geçici dizin ve soket kullanımı |
 
@@ -238,7 +238,7 @@ sequenceDiagram
 | Test Dosyası / Senaryo | Kanıtladığı İş Kuralı veya Mimari Sınır | Sonuç |
 | :--- | :--- | :--- |
 | `tests/test-manifest.sh` | `hooks.json` `invoke_subagent\|swarm\|run_workflow` matcher bütünlüğü ve manifesto anahtar kilidi | `9 passed, 0 failed` (`PASS`) |
-| `tests/test-rules-and-agents.sh` | `AGENTS.md` `7624` bayt (`< 8192`), 46+ zorunlu jeton ve `agents/*.md` 6 satır frontmatter kilidi | `3 passed, 0 failed` (`PASS`) |
+| `tests/test-rules-and-agents.sh` | `AGENTS.md` `7624` bayt (`< 8192`), tüm zorunlu `AGENTS.md` jeton doğrulamaları ve `agents/*.md` 6 satır frontmatter kilidi | `3 passed, 0 failed` (`PASS`) |
 | `tests/test-plugin-bundle.sh` | Çekirdek paket `53` dosya kilidi, Spec/Plan/README Türkçe terimler sözlüğü ve diyagram doğrulaması | `3 passed, 0 failed` (`PASS`) |
 | `tests/test-stamp-and-common.sh` | 14 model ailesi, `detect_parent_effort_hint`, `is_deprecated_parent_model` Bash/Python paritesi ve UI damgası | `16 passed, 0 failed` (`PASS`) |
 | `tests/test-subagent-and-stop-hooks.sh` | `Orchestrator` `pro` denetim kalkanı, `Extra`->`XHIGH`, `Claude 5.5` ve `run_workflow` allow/deny matrisi | `14 passed, 0 failed` (`PASS`) |
@@ -250,7 +250,7 @@ sequenceDiagram
 ### Çalıştırılan Komutlar ve Çıktı Özetleri
 - **Tam Birim ve Entegrasyon Paketi:**
   - Komut: `./scripts/run-quiet.sh full-tests -- bash tests/run-all.sh`
-  - Gerçek Çıktı Özeti: `✅ PASS [full-tests] (süre: 238.7s, warnings: 0 — log: .harness/logs/last.log)` — 9 paket, 97 testin tamamı geçti (`0 failed`).
+  - Gerçek Çıktı Özeti: `✅ PASS [full-tests] (süre: 225.0s, warnings: 0 — log: .harness/logs/last.log)` — 9 paket, 97 testin tamamı geçti (`0 failed`).
 - **Sözleşme ve Boyut Kontrolleri:**
   - `wc -c rules/AGENTS.md` -> `7624` bayt (`< 8192`).
   - Çekirdek eklenti dosya sayısı -> `53`.

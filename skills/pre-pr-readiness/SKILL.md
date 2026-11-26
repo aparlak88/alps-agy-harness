@@ -11,7 +11,7 @@ Bu skill, bir geliştirme dalında tüm görevler tamamlandığında ve PR açı
 
 ---
 
-## 1. Dört Aşamalı Doğrulama Sırası
+## 1. Doğrulama Sırası
 
 PR açılmadan önce aşağıdaki adımlar sırayla tamamlanmalıdır:
 
