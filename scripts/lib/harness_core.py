@@ -1105,6 +1105,21 @@ def _evaluate_ui_stamp_status(stamp_data: Optional[dict[str, Any]], current_sha:
     return "fresh", stamp_sha
 
 
+def _evaluate_tdd_stamp_status(stamp_data: Optional[dict[str, Any]], current_sha: str) -> tuple[str, str]:
+    """Return ``(status, stamp_sha)`` for ``tdd-pass.json`` (``fresh|stale|fail|missing``)."""
+    if not isinstance(stamp_data, dict):
+        return "missing", ""
+    verdict = str(stamp_data.get("verdict", ""))
+    stamp_sha = str(stamp_data.get("codeTreeSha", ""))
+    if verdict != "PASS":
+        return "fail", stamp_sha
+    if not _is_zero_int(stamp_data.get("criticalGaps")) or not _is_zero_int(stamp_data.get("importantGaps")):
+        return "fail", stamp_sha
+    if not current_sha or current_sha == "UNBORN" or stamp_sha != current_sha:
+        return "stale", stamp_sha
+    return "fresh", stamp_sha
+
+
 def compute_tree_and_stamp_state(workspace: Path, existing_cache: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Compute branch, HEAD OID, codeTreeSha, and PR stamp freshness.
 
@@ -1129,11 +1144,13 @@ def compute_tree_and_stamp_state(workspace: Path, existing_cache: Optional[dict[
     canon_data = read_json_file(state_dir / "canon-pass.json")
     sec_data = read_json_file(state_dir / "security-pass.json")
     ui_data = read_json_file(state_dir / "ui-pass.json")
+    tdd_data = read_json_file(state_dir / "tdd-pass.json")
     pending_data = read_json_file(state_dir / "pr-audit-pending.json")
 
     canon_status, canon_sha = _evaluate_stamp_status(canon_data, code_sha, require_zero_findings=False)
     sec_status, sec_sha = _evaluate_stamp_status(sec_data, code_sha, require_zero_findings=True)
     ui_status, ui_sha = _evaluate_ui_stamp_status(ui_data, code_sha)
+    tdd_status, tdd_sha = _evaluate_tdd_stamp_status(tdd_data, code_sha)
 
     return {
         "schemaVersion": CACHE_SCHEMA_VERSION,
@@ -1151,6 +1168,9 @@ def compute_tree_and_stamp_state(workspace: Path, existing_cache: Optional[dict[
         "uiStampStatus": ui_status,
         "uiStampValid": ui_status == "fresh",
         "uiStampSha": ui_sha,
+        "tddStampStatus": tdd_status,
+        "tddStampValid": tdd_status == "fresh",
+        "tddStampSha": tdd_sha,
         "prAuditPending": isinstance(pending_data, dict),
         "prAuditConversationId": str(pending_data.get("conversationId") or "") if isinstance(pending_data, dict) else "",
     }
@@ -1161,7 +1181,7 @@ def verify_pr_stamps(
     diff_files: Optional[list[str]] = None,
     config_dir: Optional[Path] = None,
 ) -> tuple[bool, str]:
-    """Verify canon-pass.json, security-pass.json, and conditional ui-pass.json against HEAD codeTreeSha."""
+    """Verify canon-pass.json, security-pass.json, conditional tdd-pass.json, and conditional ui-pass.json against HEAD codeTreeSha."""
     live_head = get_head_oid(workspace)
     if live_head == "UNBORN":
         return False, "Error: verify-pr-stamps failed: repository HEAD is UNBORN (no commits found)"
@@ -1175,6 +1195,7 @@ def verify_pr_stamps(
     canon_file = state_dir / "canon-pass.json"
     security_file = state_dir / "security-pass.json"
     ui_file = state_dir / "ui-pass.json"
+    tdd_file = state_dir / "tdd-pass.json"
 
     if not canon_file.is_file():
         return False, f"Error: verify-pr-stamps failed: missing canon stamp ({canon_file})"
@@ -1204,6 +1225,26 @@ def verify_pr_stamps(
             False,
             f"Error: verify-pr-stamps failed: security-pass.json codeTreeSha ({sec_sha}) does not match current HEAD codeTreeSha ({current_sha})",
         )
+
+    need_tdd, _ = requires_tdd_stamp(workspace, diff_files=diff_files)
+    if need_tdd and not tdd_file.is_file():
+        return (
+            False,
+            f"Error: verify-pr-stamps failed: missing tdd stamp ({tdd_file}) required because code/script files changed in branch diff",
+        )
+    if need_tdd or tdd_file.is_file():
+        tdd_data = read_json_file(tdd_file) or {}
+        tdd_verdict = str(tdd_data.get("verdict", ""))
+        tdd_sha = str(tdd_data.get("codeTreeSha", ""))
+        if tdd_verdict != "PASS":
+            return False, f"Error: verify-pr-stamps failed: tdd-pass.json verdict is '{tdd_verdict}' (expected PASS)"
+        if not _is_zero_int(tdd_data.get("criticalGaps")) or not _is_zero_int(tdd_data.get("importantGaps")):
+            return False, "Error: verify-pr-stamps failed: tdd-pass.json has non-zero criticalGaps or importantGaps"
+        if tdd_sha != current_sha:
+            return (
+                False,
+                f"Error: verify-pr-stamps failed: tdd-pass.json codeTreeSha ({tdd_sha}) does not match current HEAD codeTreeSha ({current_sha})",
+            )
 
     need_ui, ui_info_chk, _ = requires_ui_stamp(workspace, diff_files=diff_files, config_dir=config_dir)
     if need_ui and not ui_file.is_file():
@@ -1991,6 +2032,30 @@ def evaluate_pre_command(
                                 "decision": "deny",
                                 "reason": f"Local merge stamps for '{target_branch}' do not match target branch codeTreeSha ({target_tree_sha}) or verdict is not PASS",
                             }
+
+                        need_tdd, _ = requires_tdd_stamp(wt_for_branch or seg_ws, diff_files=diff_files)
+                        tdd_path = target_state_dir / "tdd-pass.json"
+                        if not tdd_path.is_file() and wt_for_branch is not None:
+                            wt_tdd = wt_for_branch / ".harness" / "state" / target_slug / "tdd-pass.json"
+                            if wt_tdd.is_file():
+                                tdd_path = wt_tdd
+                        if need_tdd or tdd_path.is_file():
+                            if not tdd_path.is_file():
+                                return {
+                                    "decision": "deny",
+                                    "reason": f"Local merge requires valid tdd-pass.json under .harness/state/{target_slug} (code/script files changed in branch diff)",
+                                }
+                            tdd_data = read_json_file(tdd_path) or {}
+                            if (
+                                tdd_data.get("verdict") != "PASS"
+                                or not _is_zero_int(tdd_data.get("criticalGaps"))
+                                or not _is_zero_int(tdd_data.get("importantGaps"))
+                                or tdd_data.get("codeTreeSha") != target_tree_sha
+                            ):
+                                return {
+                                    "decision": "deny",
+                                    "reason": f"Local merge tdd-pass.json for '{target_branch}' does not match target branch codeTreeSha ({target_tree_sha}) or has non-PASS/non-zero gaps",
+                                }
 
                         need_ui, seg_ui_info, _ = requires_ui_stamp(wt_for_branch or seg_ws, diff_files=diff_files)
                         ui_path = target_state_dir / "ui-pass.json"
@@ -3590,6 +3655,402 @@ def ui_stamp_register(
     return True, "", 0
 
 
+REVIEW_CLAUDE_UNAVAILABLE_EXIT = 42
+DEFAULT_REVIEW_TIMEOUT_SEC = 300
+REVIEW_PROFILES: dict[str, dict[str, str]] = {
+    "spec-plan": {
+        "claudeModel": "opus",
+        "claudeEffort": "medium",
+        "agyClaudeModel": "claude-opus-5-5-medium",
+        "agyDefaultModel": "gemini-4-carbon-high",
+        "stateFile": "spec-plan-review.json",
+        "reportFile": "spec-plan-review.md",
+    },
+    "tdd": {
+        "claudeModel": "sonnet",
+        "claudeEffort": "high",
+        "agyClaudeModel": "claude-sonnet-5-5-high",
+        "agyDefaultModel": "gemini-4-neon-medium",
+        "stateFile": "tdd-review.json",
+        "reportFile": "tdd-review.md",
+    },
+}
+TDD_EXEMPT_PREFIXES = ("docs/", "assets/", "medium-kit/", ".impeccable/", ".superpowers/", ".harness/")
+TDD_EXEMPT_FILENAMES = frozenset(
+    ("README.md", "PRODUCT.md", "DESIGN.md", "CHANGELOG.md", "LICENSE", ".gitignore", ".harness-ignore")
+)
+TDD_EXEMPT_EXTENSIONS = frozenset((".md", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".webp", ".pdf"))
+VALID_TDD_PROVIDERS = frozenset(("claude-cli", "agy-cli", "subagent"))
+VERDICT_JSON_RE = re.compile(r"VERDICT_JSON\s*:\s*(\{[^\n]*\})")
+
+
+def requires_tdd_stamp(workspace: Path, diff_files: Optional[list[str]] = None) -> tuple[bool, list[str]]:
+    """Return ``(required, code_files)`` when branch diff modifies non-documentation code or script files."""
+    files = _collect_branch_diff_files(workspace) if diff_files is None else list(diff_files)
+    code_files: list[str] = []
+    for raw_f in files:
+        norm = str(raw_f or "").strip().lstrip("./")
+        if not norm:
+            continue
+        if any(norm.startswith(pref) for pref in TDD_EXEMPT_PREFIXES):
+            continue
+        base = os.path.basename(norm)
+        if base in TDD_EXEMPT_FILENAMES:
+            continue
+        _, ext = os.path.splitext(base.lower())
+        if ext in TDD_EXEMPT_EXTENSIONS:
+            continue
+        code_files.append(norm)
+    return len(code_files) > 0, code_files
+
+
+def tdd_stamp_register(
+    workspace: Path,
+    verdict: str,
+    critical_gaps: int,
+    important_gaps: int,
+    provider: str,
+    model: str,
+    effort: str = "",
+    explicit_files: Optional[list[str]] = None,
+) -> tuple[bool, str, int]:
+    """Validate and atomically write ``tdd-pass.json`` bound to HEAD ``codeTreeSha``."""
+    if verdict not in ("PASS", "FAIL"):
+        return False, f"Error: tdd --verdict must be PASS or FAIL (got '{verdict}')", 1
+    if critical_gaps < 0 or important_gaps < 0:
+        return False, "Error: tdd --critical-gaps and --important-gaps must be non-negative integers", 1
+    if verdict == "PASS" and (critical_gaps != 0 or important_gaps != 0):
+        return (
+            False,
+            f"Error: tdd stamp cannot record PASS when criticalGaps ({critical_gaps}) or importantGaps ({important_gaps}) is non-zero",
+            1,
+        )
+    if provider not in VALID_TDD_PROVIDERS:
+        return False, f"Error: tdd --provider must be claude-cli, agy-cli, or subagent (got '{provider}')", 1
+    clean_model = (model or "").strip()
+    if not clean_model:
+        return False, "Error: tdd requires non-empty --model", 1
+
+    _, code_files = requires_tdd_stamp(workspace)
+    audited = [str(f).lstrip("./") for f in (explicit_files or code_files) if str(f).strip()]
+    state_dir = get_state_dir(workspace)
+    payload = {
+        "verdict": verdict,
+        "codeTreeSha": compute_code_tree_sha(workspace),
+        "provider": provider,
+        "model": clean_model,
+        "effort": (effort or "").strip(),
+        "criticalGaps": critical_gaps,
+        "importantGaps": important_gaps,
+        "auditedFiles": audited,
+        "timestamp": utc_now_iso(),
+    }
+    with locked_state_file(state_dir, "tdd-pass"):
+        atomic_write_json(state_dir, "tdd-pass.json", payload)
+    return True, "", 0
+
+
+def _build_external_review_prompt(workspace: Path, kind: str, targets: Optional[list[str]] = None) -> str:
+    """Build a focused, read-only review prompt for ``claude -p`` or ``agy -p``."""
+    clean_targets = [str(t).strip().lstrip("./") for t in (targets or []) if str(t).strip()]
+    if kind == "spec-plan":
+        target_block = "\n".join(f"- {t}" for t in clean_targets) if clean_targets else "- (Inspect docs/superpowers/specs/ and docs/superpowers/plans/)"
+        return (
+            "You are performing a read-only Spec & Implementation Plan Review for this repository.\n"
+            f"Workspace: {workspace}\n"
+            "Target document(s):\n"
+            f"{target_block}\n\n"
+            "Use your read-only tools (Read, Grep, Glob) to inspect the target document(s) and any referenced code/canon files.\n"
+            "Evaluate:\n"
+            "1. Ambiguities, contradictions, or missing edge cases/failure modes.\n"
+            "2. Clean Architecture boundaries, YAGNI / Rule of Three (reject speculative bloat).\n"
+            "3. Alignment with docs/canon/ (if present) and testable acceptance criteria.\n"
+            "Report concrete file:line findings grouped by Critical, Important, and Minor.\n"
+            "End your response with a single final line in exact JSON format:\n"
+            'VERDICT_JSON: {"verdict":"PASS"|"FAIL","criticalGaps":<int>,"importantGaps":<int>,"summary":"<one sentence>"}\n'
+            "(Use verdict PASS only when criticalGaps == 0 and importantGaps == 0.)\n"
+        )
+
+    _, code_files = requires_tdd_stamp(workspace)
+    scope_files = clean_targets or code_files
+    file_block = "\n".join(f"- {f}" for f in scope_files) if scope_files else "- (Inspect current branch diff and tests)"
+    return (
+        "You are performing a read-only TDD Unit Test Coverage & Behavioral Rigor Audit for this repository.\n"
+        f"Workspace: {workspace}\n"
+        "Changed code/test files in scope:\n"
+        f"{file_block}\n\n"
+        "Use your read-only tools (Read, Grep, Glob) to inspect the changed production files and their corresponding unit/integration tests.\n"
+        "Evaluate strictly:\n"
+        "1. Real observable behavior vs. tautological mock-echo assertions (reject tests that only verify mock calls without asserting state/output).\n"
+        "2. Edge cases: null/empty inputs, boundary values, error/rollback paths, fail-closed guards, and bugfix regressions.\n"
+        "3. Mutation resistance: would realistic mutations (wrong constant/arg, inverted branch, missing side effect, default return, missing validation) fail at least one test?\n"
+        "4. Concurrency tests (if any): reject sleep-based synchronization; require deterministic barriers.\n"
+        "Report concrete file:line gaps grouped by Critical, Important, and Minor.\n"
+        "End your response with a single final line in exact JSON format:\n"
+        'VERDICT_JSON: {"verdict":"PASS"|"FAIL","criticalGaps":<int>,"importantGaps":<int>,"summary":"<one sentence>"}\n'
+        "(Use verdict PASS only when criticalGaps == 0 and importantGaps == 0.)\n"
+    )
+
+
+def _extract_verdict_json(output_text: str) -> Optional[dict[str, Any]]:
+    """Extract the last ``VERDICT_JSON: {...}`` object from review output if valid."""
+    matches = VERDICT_JSON_RE.findall(output_text or "")
+    for raw in reversed(matches):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            continue
+        if isinstance(parsed, dict) and parsed.get("verdict") in ("PASS", "FAIL"):
+            return parsed
+    return None
+
+
+def _summarize_cli_failure(returncode: int, stderr_text: str, stdout_text: str) -> str:
+    """Produce a concise single-line failure reason from CLI stderr/stdout."""
+    raw = (stderr_text or "").strip() or (stdout_text or "").strip()
+    if raw:
+        first_lines = " | ".join(line.strip() for line in raw.splitlines() if line.strip())[:320]
+        return f"exit {returncode}: {first_lines}"
+    return f"exit {returncode} (empty output)"
+
+
+def run_external_review(
+    workspace: Path,
+    kind: str,
+    provider: str = "claude",
+    model: str = "",
+    effort: str = "",
+    targets: Optional[list[str]] = None,
+    auto_stamp: bool = False,
+) -> tuple[dict[str, Any], int]:
+    """Run read-only Spec/Plan or TDD coverage review via ``claude -p`` (primary) or ``agy -p`` (explicit fallback).
+
+    Never silently falls back from ``claude`` to ``agy``; returns exit code 42
+    with structured failure reason and Antigravity fallback options so the
+    orchestrator can ask the user with a 30-second scheduled timeout.
+    """
+    if kind not in REVIEW_PROFILES:
+        return {"status": "error", "reason": f"Unknown review kind '{kind}' (expected spec-plan|tdd)"}, 1
+    if provider not in ("claude", "agy"):
+        return {"status": "error", "reason": f"Unknown review provider '{provider}' (expected claude|agy)"}, 1
+
+    profile = REVIEW_PROFILES[kind]
+    timeout_sec = max(5, int(os.environ.get("HARNESS_REVIEW_TIMEOUT_SEC", str(DEFAULT_REVIEW_TIMEOUT_SEC))))
+    prompt_text = _build_external_review_prompt(workspace, kind, targets=targets)
+
+    fallback_choices = {
+        "agyClaudeModel": profile["agyClaudeModel"],
+        "agyDefaultModel": profile["agyDefaultModel"],
+        "timeoutSeconds": 30,
+    }
+
+    clean_env = dict(os.environ)
+    clean_env.pop("CLAUDECODE", None)
+
+    if provider == "claude":
+        use_model = (model or profile["claudeModel"]).strip()
+        use_effort = (effort or profile["claudeEffort"]).strip()
+        claude_bin = os.environ.get("HARNESS_CLAUDE_BIN", "").strip() or (shutil.which("claude") or "")
+        if not claude_bin:
+            return (
+                {
+                    "status": "claude_unavailable",
+                    "kind": kind,
+                    "provider": "claude",
+                    "model": use_model,
+                    "effort": use_effort,
+                    "reason": "claude CLI binary not found in PATH.",
+                    "fallbackChoices": fallback_choices,
+                },
+                REVIEW_CLAUDE_UNAVAILABLE_EXIT,
+            )
+        cmd = [
+            claude_bin,
+            "-p",
+            "--model",
+            use_model,
+            "--effort",
+            use_effort,
+            "--permission-mode",
+            "plan",
+            "--no-session-persistence",
+            "--tools",
+            "Read,Grep,Glob",
+            "--output-format",
+            "text",
+        ]
+        try:
+            res = subprocess.run(
+                cmd,
+                input=prompt_text,
+                cwd=str(workspace),
+                env=clean_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                {
+                    "status": "claude_unavailable",
+                    "kind": kind,
+                    "provider": "claude",
+                    "model": use_model,
+                    "effort": use_effort,
+                    "reason": f"claude -p timed out after {timeout_sec}s.",
+                    "fallbackChoices": fallback_choices,
+                },
+                REVIEW_CLAUDE_UNAVAILABLE_EXIT,
+            )
+        except OSError as exc:
+            return (
+                {
+                    "status": "claude_unavailable",
+                    "kind": kind,
+                    "provider": "claude",
+                    "model": use_model,
+                    "effort": use_effort,
+                    "reason": f"Failed to execute claude CLI: {exc}",
+                    "fallbackChoices": fallback_choices,
+                },
+                REVIEW_CLAUDE_UNAVAILABLE_EXIT,
+            )
+
+        if res.returncode != 0 or not (res.stdout or "").strip():
+            return (
+                {
+                    "status": "claude_unavailable",
+                    "kind": kind,
+                    "provider": "claude",
+                    "model": use_model,
+                    "effort": use_effort,
+                    "exitCode": res.returncode,
+                    "reason": _summarize_cli_failure(res.returncode, res.stderr, res.stdout),
+                    "fallbackChoices": fallback_choices,
+                },
+                REVIEW_CLAUDE_UNAVAILABLE_EXIT,
+            )
+        provider_label = "claude-cli"
+        report_text = res.stdout.strip()
+    else:
+        use_model = (model or profile["agyDefaultModel"]).strip()
+        use_effort = (effort or "").strip()
+        agy_bin = os.environ.get("HARNESS_AGY_BIN", "").strip() or (shutil.which("agy") or "")
+        if not agy_bin:
+            return (
+                {
+                    "status": "agy_error",
+                    "kind": kind,
+                    "provider": "agy",
+                    "model": use_model,
+                    "reason": "agy CLI binary not found in PATH.",
+                },
+                1,
+            )
+        cmd = [
+            agy_bin,
+            "-p",
+            "--model",
+            use_model,
+            "--mode",
+            "plan",
+            "--disable-slash-commands",
+            "--output-format",
+            "text",
+        ]
+        if use_effort:
+            cmd.extend(["--effort", use_effort])
+        try:
+            res = subprocess.run(
+                cmd,
+                input=prompt_text,
+                cwd=str(workspace),
+                env=clean_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+        except subprocess.TimeoutExpired:
+            return (
+                {
+                    "status": "agy_error",
+                    "kind": kind,
+                    "provider": "agy",
+                    "model": use_model,
+                    "reason": f"agy -p timed out after {timeout_sec}s.",
+                },
+                1,
+            )
+        except OSError as exc:
+            return (
+                {
+                    "status": "agy_error",
+                    "kind": kind,
+                    "provider": "agy",
+                    "model": use_model,
+                    "reason": f"Failed to execute agy CLI: {exc}",
+                },
+                1,
+            )
+
+        if res.returncode != 0 or not (res.stdout or "").strip():
+            return (
+                {
+                    "status": "agy_error",
+                    "kind": kind,
+                    "provider": "agy",
+                    "model": use_model,
+                    "exitCode": res.returncode,
+                    "reason": _summarize_cli_failure(res.returncode, res.stderr, res.stdout),
+                },
+                1,
+            )
+        provider_label = "agy-cli"
+        report_text = res.stdout.strip()
+
+    state_dir = get_state_dir(workspace)
+    report_path = state_dir / profile["reportFile"]
+    report_path.write_text(report_text + "\n", encoding="utf-8")
+
+    parsed_verdict = _extract_verdict_json(report_text)
+    verdict_val = str(parsed_verdict.get("verdict")) if parsed_verdict else "UNKNOWN"
+    crit_gaps = int(parsed_verdict.get("criticalGaps", 0)) if parsed_verdict and isinstance(parsed_verdict.get("criticalGaps"), int) else -1
+    imp_gaps = int(parsed_verdict.get("importantGaps", 0)) if parsed_verdict and isinstance(parsed_verdict.get("importantGaps"), int) else -1
+    summary_val = str(parsed_verdict.get("summary") or "") if parsed_verdict else ""
+
+    meta = {
+        "status": "ok",
+        "kind": kind,
+        "provider": provider_label,
+        "model": use_model,
+        "effort": use_effort,
+        "codeTreeSha": compute_code_tree_sha(workspace),
+        "verdict": verdict_val,
+        "criticalGaps": crit_gaps,
+        "importantGaps": imp_gaps,
+        "summary": summary_val,
+        "reportPath": str(report_path),
+        "stamped": False,
+        "timestamp": utc_now_iso(),
+    }
+
+    if auto_stamp and kind == "tdd" and verdict_val == "PASS" and crit_gaps == 0 and imp_gaps == 0:
+        ok_stamp, _, _ = tdd_stamp_register(
+            workspace,
+            verdict="PASS",
+            critical_gaps=0,
+            important_gaps=0,
+            provider=provider_label,
+            model=use_model,
+            effort=use_effort,
+            explicit_files=targets or None,
+        )
+        meta["stamped"] = ok_stamp
+
+    atomic_write_json(state_dir, profile["stateFile"], meta)
+    return meta, 0
+
+
 def _extract_segment_env_controls(raw_seg: str) -> tuple[dict[str, str], bool, set[str]]:
     """Extract per-segment KEY=VALUE assignments, ``env -i`` reset state, and ``env -u`` removals."""
     try:
@@ -4820,6 +5281,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_ui.add_argument("--p1", type=int, default=0)
     p_ui.add_argument("--target", action="append", default=[])
 
+    p_tdd = sub.add_parser("tdd-stamp")
+    p_tdd.add_argument("--workspace", default=".")
+    p_tdd.add_argument("--verdict", required=True)
+    p_tdd.add_argument("--critical-gaps", type=int, default=0)
+    p_tdd.add_argument("--important-gaps", type=int, default=0)
+    p_tdd.add_argument("--provider", required=True)
+    p_tdd.add_argument("--model", required=True)
+    p_tdd.add_argument("--effort", default="")
+    p_tdd.add_argument("--file", action="append", default=[])
+
+    p_rev = sub.add_parser("external-review")
+    p_rev.add_argument("--workspace", default=".")
+    p_rev.add_argument("--kind", required=True)
+    p_rev.add_argument("--provider", default="claude")
+    p_rev.add_argument("--model", default="")
+    p_rev.add_argument("--effort", default="")
+    p_rev.add_argument("--target", action="append", default=[])
+    p_rev.add_argument("--auto-stamp", action="store_true")
+
     p_vpr = sub.add_parser("verify-pr-stamps")
     p_vpr.add_argument("--workspace", default=".")
 
@@ -4919,6 +5399,35 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(err, file=sys.stderr)
             return rc
         return 0
+
+    if args.subcommand == "tdd-stamp":
+        ok, err, rc = tdd_stamp_register(
+            Path(args.workspace),
+            verdict=args.verdict,
+            critical_gaps=args.critical_gaps,
+            important_gaps=args.important_gaps,
+            provider=args.provider,
+            model=args.model,
+            effort=args.effort,
+            explicit_files=args.file or None,
+        )
+        if not ok:
+            print(err, file=sys.stderr)
+            return rc
+        return 0
+
+    if args.subcommand == "external-review":
+        res, rc = run_external_review(
+            Path(args.workspace),
+            kind=args.kind,
+            provider=args.provider,
+            model=args.model,
+            effort=args.effort,
+            targets=args.target or None,
+            auto_stamp=args.auto_stamp,
+        )
+        print(json.dumps(res, ensure_ascii=False))
+        return rc
 
     if args.subcommand == "verify-pr-stamps":
         ok, err = verify_pr_stamps(Path(args.workspace))

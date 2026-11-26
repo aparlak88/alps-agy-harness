@@ -360,6 +360,7 @@ EOF
 
   "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$repo" --verdict PASS >/dev/null
   "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$repo" --verdict PASS --critical 0 --important 0 >/dev/null
+  "$REPO_ROOT/scripts/stamp-gate.sh" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high >/dev/null
 
   HARNESS_DAEMON_SOCK="$sock_path" \
   HARNESS_DAEMON_DATA_DIR="$data_dir" \
@@ -450,6 +451,7 @@ EOF
 
   "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$repo" --verdict PASS >/dev/null
   "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$repo" --verdict PASS --critical 0 --important 0 >/dev/null
+  "$REPO_ROOT/scripts/stamp-gate.sh" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high >/dev/null
   _wait_for_file_jq "$repo/.harness/cache/doc-validation.json" \
     '.docs["docs/walkthroughs/2026-11-19-stamps.md"].walkthroughValid == true' 50 || {
     echo "doc-validation.json did not cache walkthroughValid == true" >&2
@@ -1009,6 +1011,7 @@ EOF
 
   "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$wt_admin" --verdict PASS --allow-file "src/AdminPage.ts" >/dev/null
   "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$wt_admin" --verdict PASS --critical 0 --important 0 >/dev/null
+  "$REPO_ROOT/scripts/stamp-gate.sh" tdd --workspace "$wt_admin" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high >/dev/null
 
   HARNESS_DAEMON_SOCK="$sock_path" \
   HARNESS_DAEMON_DATA_DIR="$data_dir" \

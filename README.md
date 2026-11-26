@@ -226,7 +226,7 @@ Antigravity Swarm (`/swarm` veya çoklu ajan iş akışı) kullanılırken harne
 | **Ortak Çekirdek (`scripts/lib/`)** | `harness_core.py` | `harness-daemon` ile tüm yerel fallback kanca ve teşhis betikleri arasında paylaşılan tek doğruluk kaynağı. |
 | **Yardımcı Betikler** | `run-quiet.sh` | Derleme/test loglarını sessize alır; tek satır özet ve log kaydı döner. |
 | | `mobile-logs.sh` | iOS Simulator `.ips` crash ve Android Emulator logcat süzgeci. |
-| | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası (`canon`, `security`, koşullu `ui-pass.json`), `select-model` çözümleyicisi ve subagent dispatch yöneticisi. |
+| | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası (`canon`, `security`, koşullu `tdd-pass.json` ve `ui-pass.json`), `claude -p` / `agy -p` (`review`), `select-model` çözümleyicisi ve subagent dispatch yöneticisi. |
 | | `harness-doctor.sh` | 8 MCP, gizli anahtar, koşullu `impeccable_ui` ve ortam sağlığı kontrol aracı. |
 | **Alt Ajanlar (`agents/`)** | `canon-auditor.md` | Domain glossary, flows ve Clean Architecture denetçisi (`inherit`/`pro` + `HIGH` taban). |
 | | `security-reviewer.md` | PR diff güvenlik açığı ve secret tarayıcısı (frontier `inherit`/`pro` + `MAX`). |
