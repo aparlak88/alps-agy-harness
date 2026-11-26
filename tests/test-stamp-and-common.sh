@@ -1138,10 +1138,9 @@ EOF
   assert_json_field "$out_quota" ".fallbackChoices.agyClaudeModel" "claude-sonnet-5-5-high"
   assert_json_field "$out_quota" ".fallbackChoices.agyDefaultModel" "gemini-4-neon-medium"
 
-  # 5. agy -p explicit fallback (default timeout models + explicit Claude models + env scrubbing & --disable-slash-commands)
+  # 5. agy -p explicit fallback (default timeout models + explicit Claude models + env scrubbing, --disable-slash-commands, and --print=<prompt>)
   cat << EOF > "$mock_agy"
 #!/usr/bin/env bash
-cat >/dev/null
 printf 'TYPESAFE_API_KEY=%s\nGITHUB_TOKEN=%s\nAGY_ARGS=%s\n' "\${TYPESAFE_API_KEY:-}" "\${GITHUB_TOKEN:-}" "\$*" > "$arg_log"
 echo "Fallback review complete."
 echo 'VERDICT_JSON: {"verdict":"PASS","criticalGaps":0,"importantGaps":0,"summary":"TDD coverage verified"}'
@@ -1158,6 +1157,7 @@ EOF
   assert_contains "$(cat "$arg_log")" "--model gemini-4-carbon-high"
   assert_contains "$(cat "$arg_log")" "--mode plan"
   assert_contains "$(cat "$arg_log")" "--disable-slash-commands"
+  assert_contains "$(cat "$arg_log")" "--print=You are performing a read-only Spec & Implementation Plan Review"
   assert_not_contains "$(cat "$arg_log")" "ts_live_agy_secret"
   assert_not_contains "$(cat "$arg_log")" "ghp_agy_secret"
 

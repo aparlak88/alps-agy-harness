@@ -4029,7 +4029,6 @@ def run_external_review(
             )
         cmd = [
             agy_bin,
-            "-p",
             "--model",
             use_model,
             "--mode",
@@ -4040,10 +4039,10 @@ def run_external_review(
         ]
         if use_effort:
             cmd.extend(["--effort", use_effort])
+        cmd.append(f"--print={prompt_text}")
         try:
             res = subprocess.run(
                 cmd,
-                input=prompt_text,
                 cwd=str(workspace),
                 env=clean_env,
                 capture_output=True,
