@@ -1031,11 +1031,13 @@ EOF
 }
 
 test_claude_cli_review_fallback_and_tdd_stamp_gate() {
-  local repo mock_claude mock_agy arg_log
+  local repo mock_dir mock_claude mock_agy arg_log
   repo=$(make_temp_repo)
-  mock_claude="$repo/.mock-claude"
-  mock_agy="$repo/.mock-agy"
-  arg_log="$repo/.review-args.log"
+  mock_dir=$(mktemp -d)
+  _TEST_TEMP_DIRS+=("$mock_dir")
+  mock_claude="$mock_dir/mock-claude"
+  mock_agy="$mock_dir/mock-agy"
+  arg_log="$mock_dir/review-args.log"
 
   echo "# Init" > "$repo/README.md"
   git -C "$repo" add README.md
@@ -1050,7 +1052,7 @@ test_claude_cli_review_fallback_and_tdd_stamp_gate() {
   git -C "$repo" commit -m "feat: add Math and test" --quiet
 
   # 1. Primary claude -p Spec/Plan review (opus / medium, read-only flags, sensitive env scrubbed, stdin prompt verified)
-  local prompt_log="$repo/.review-prompt.log"
+  local prompt_log="$mock_dir/review-prompt.log"
   cat << EOF > "$mock_claude"
 #!/usr/bin/env bash
 cat > "$prompt_log"
@@ -1349,7 +1351,7 @@ EOF
   assert_json_field "$out_agy_err" ".status" "agy_error"
 
   # Symlink-safe atomic report write (symlink must be replaced, target untouched)
-  local outside_target="$repo/outside-sentinel.txt"
+  local outside_target="$mock_dir/outside-sentinel.txt"
   echo "DO_NOT_OVERWRITE" > "$outside_target"
   ln -sf "$outside_target" "$state_dir/tdd-review.md"
   cat << 'EOF' > "$mock_claude"
@@ -1370,6 +1372,15 @@ EOF
   out_narrow_auto=$(HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd --target "README.md" --auto-stamp)
   assert_json_field "$out_narrow_auto" ".stamped" "false" "Narrow --target review must not auto-stamp full branch"
   [ ! -f "$state_dir/tdd-pass.json" ] || { echo "Narrow --target review must not write tdd-pass.json" >&2; return 1; }
+
+  # Dirty working tree (uncommitted code/test edit) must block --auto-stamp
+  echo "// uncommitted edit" >> "$repo/tests/Math.test.ts"
+  local out_dirty_auto
+  out_dirty_auto=$(HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd --auto-stamp)
+  assert_json_field "$out_dirty_auto" ".dirtyWorkingTree" "true" "Uncommitted test edit must flag dirtyWorkingTree"
+  assert_json_field "$out_dirty_auto" ".stamped" "false" "Dirty working tree must block --auto-stamp"
+  [ ! -f "$state_dir/tdd-pass.json" ] || { echo "Dirty working tree must not write tdd-pass.json" >&2; return 1; }
+  git -C "$repo" checkout -- tests/Math.test.ts
 
   # 12. C4 & C5: dotfile/dot-dir exemptions & deletion-only code branch still requires TDD stamp
   local dot_chk

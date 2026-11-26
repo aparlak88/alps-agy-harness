@@ -3849,18 +3849,49 @@ def _build_external_review_prompt(workspace: Path, kind: str, targets: Optional[
 
 
 def _extract_verdict_json(output_text: str) -> Optional[dict[str, Any]]:
-    """Extract only the final ``VERDICT_JSON: {...}`` object; never fall back to earlier quoted lines."""
-    matches = VERDICT_JSON_RE.findall(output_text or "")
-    if not matches:
+    """Extract ``VERDICT_JSON: {...}`` strictly from the final non-empty output line."""
+    non_empty = [line.strip() for line in (output_text or "").splitlines() if line.strip()]
+    if not non_empty:
         return None
-    raw_last = matches[-1]
+    m = VERDICT_JSON_RE.search(non_empty[-1])
+    if not m:
+        return None
     try:
-        parsed = json.loads(raw_last)
+        parsed = json.loads(m.group(1))
     except Exception:
         return None
-    if isinstance(parsed, dict) and parsed.get("verdict") in ("PASS", "FAIL"):
-        return parsed
-    return None
+    if not isinstance(parsed, dict) or parsed.get("verdict") not in ("PASS", "FAIL"):
+        return None
+    crit = parsed.get("criticalGaps")
+    imp = parsed.get("importantGaps")
+    if type(crit) is not int or crit < 0 or type(imp) is not int or imp < 0:
+        return None
+    if parsed.get("verdict") == "PASS" and (crit != 0 or imp != 0):
+        return None
+    return parsed
+
+
+def _has_dirty_code_working_tree(workspace: Path) -> bool:
+    """Return True if tracked or untracked non-exempt code/test files have uncommitted changes."""
+    st = _run_git(workspace, ["status", "--porcelain"])
+    if st.returncode != 0:
+        return True
+    for raw_line in st.stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        path_part = raw_line[3:].strip()
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1].strip()
+        path_part = path_part.strip('"')
+        norm = _normalize_rel_path(path_part)
+        if not norm:
+            continue
+        if norm.startswith((".harness/", "docs/walkthroughs/")) or norm == "docs/parking-lot.md":
+            continue
+        req, _ = requires_tdd_stamp(workspace, diff_files=[norm])
+        if req:
+            return True
+    return False
 
 
 def _summarize_cli_failure(returncode: int, stderr_text: str, stdout_text: str) -> str:
@@ -4093,6 +4124,7 @@ def run_external_review(
 
     post_sha = compute_code_tree_sha(workspace)
     stale_during_review = pre_sha != post_sha
+    dirty_working_tree = _has_dirty_code_working_tree(workspace)
 
     parsed_verdict = _extract_verdict_json(report_text)
     verdict_val = str(parsed_verdict.get("verdict")) if parsed_verdict else "UNKNOWN"
@@ -4116,6 +4148,7 @@ def run_external_review(
         "reportPath": str(report_path),
         "stamped": False,
         "staleDuringReview": stale_during_review,
+        "dirtyWorkingTree": dirty_working_tree,
         "timestamp": utc_now_iso(),
     }
 
@@ -4128,6 +4161,7 @@ def run_external_review(
         and kind == "tdd"
         and covers_branch
         and not stale_during_review
+        and not dirty_working_tree
         and verdict_val == "PASS"
         and crit_gaps == 0
         and imp_gaps == 0

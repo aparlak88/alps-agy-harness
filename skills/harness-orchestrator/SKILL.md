@@ -40,7 +40,7 @@ Eğer sınıflandırma güven skoru `< 0.80` ise en güvenli yol olan `full_proj
 | **`full_project` (Architectural)** | Zorunlu (`brainstorming` + `ADR`) | Kapsamlı DDD Planı (`writing-plans`) | SDD (İzole Worktree) | Kapsamlı Walkthrough, tüm PR kapıları |
 
 > [!IMPORTANT]
-> **PR Sınır Kapıları Değişmezdir:** İş ne kadar küçük olursa olsun, `pre-pr-readiness` doğrulaması, `canon-pass.json`, `security-pass.json`, en az 2 Mermaid diyagramı içeren Walkthrough dokümanı ve PR sonrası `pr-auditor` değerlendirmesi **istisnasız her PR için zorunludur**.
+> **PR Sınır Kapıları Değişmezdir:** İş ne kadar küçük olursa olsun, `pre-pr-readiness` doğrulaması, `canon-pass.json`, `security-pass.json`, kod/betik değiştiyse koşullu `tdd-pass.json`, UI değiştiyse + `impeccable` kuruluysa koşullu `ui-pass.json`, en az 2 Mermaid diyagramı içeren Walkthrough dokümanı ve PR sonrası `pr-auditor` değerlendirmesi **istisnasız her PR için zorunludur**.
 
 ---
 
@@ -103,7 +103,7 @@ UI/Frontend içeren `small_change` veya `full_project` görevlerinde `impeccable
 - **Saf Backend İzolasyonu:** Backend/CLI görevlerinde `impeccable` tamamen pasiftir ve `ui-pass.json` üretilmez.
 
 Uygulama tamamlandığında:
-1. `pre-pr-readiness` skill'ini çağırın (`canon-auditor`, `security-reviewer`, UI değiştiyse + `impeccable` kuruluysa `stamp-gate.sh ui`, Walkthrough).
+1. `pre-pr-readiness` skill'ini çağırın (`canon-auditor`, `security-reviewer`, kod/betik değiştiyse `stamp-gate.sh review --kind tdd --auto-stamp` → `tdd-pass.json`, UI değiştiyse + `impeccable` kuruluysa `stamp-gate.sh ui`, Walkthrough).
 2. `gh pr create` komutunu çalıştırın.
 3. `stop-gate.sh` devreye girdiğinde `review-pr` skill'i ile `pr-auditor` denetimini gerçekleştirin.
 

@@ -80,8 +80,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Hem orkestratörün hem geliştiricilerin `claude -p` / `agy -p` incelemelerini ve `tdd-pass.json` damgalarını tek deterministik CLI üzerinden çalıştırabilmesi için güncellendi.
 
 ### `sidecars/harness-daemon/daemon.py` — [GÜNCELLENDİ] (`Background Daemon Layer`)
-- **Ne Değişti / Ne Üretildi?:** `HarnessDaemonState` durum dosyası `mtime` takip listesine `"tdd-pass.json"` eklendi ve `_read_json_body` içinde negatif `Content-Length` değerlerini `400` ile reddeden koruma eklendi.
-- **Neden Değişti / Neden Üretildi?:** Uzun ömürlü arka plan daemon'ının `tdd-pass.json` oluştuğunda veya değiştiğinde `tree-state.json` önbelleğini anında yenilemesi ve soket girdi doğrulamasının sıkılaştırılması için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `HarnessDaemonState` durum dosyası `mtime` takip listesine `"tdd-pass.json"` eklendi.
+- **Neden Değişti / Neden Üretildi?:** Uzun ömürlü arka plan daemon'ının `tdd-pass.json` oluştuğunda veya değiştiğinde `tree-state.json` önbelleğini anında yenilemesi için güncellendi.
 
 ### `skills/harness-orchestrator/SKILL.md` — [GÜNCELLENDİ] (`Skill Layer`)
 - **Ne Değişti / Ne Üretildi?:** `§10` bölümü eklenerek Spec/Plan (`opus/medium`) ve TDD (`sonnet/high`) incelemelerinin `stamp-gate.sh review` ile çalıştırılması, `exit 42` durumunda `reason` açıklanarak 30 sn `schedule` kurulması ve `agy -p` fallback model eşlemeleri belgelendi.
