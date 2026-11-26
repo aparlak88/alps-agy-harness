@@ -1992,7 +1992,7 @@ def evaluate_pre_command(
                                 "reason": f"Local merge stamps for '{target_branch}' do not match target branch codeTreeSha ({target_tree_sha}) or verdict is not PASS",
                             }
 
-                        need_ui, seg_ui_info, _ = requires_ui_stamp(seg_ws, diff_files=diff_files)
+                        need_ui, seg_ui_info, _ = requires_ui_stamp(wt_for_branch or seg_ws, diff_files=diff_files)
                         ui_path = target_state_dir / "ui-pass.json"
                         if not ui_path.is_file() and wt_for_branch is not None:
                             wt_ui = wt_for_branch / ".harness" / "state" / target_slug / "ui-pass.json"
@@ -2389,7 +2389,9 @@ ORCHESTRATOR_FAMILIES = frozenset(
     ("orchestrator", "orchestrator_neon", "orchestrator_carbon", "orchestrator_argon")
 )
 VALID_SUBAGENT_MODEL_TIERS = frozenset(("inherit", "flash_lite", "flash", "pro"))
-FORBIDDEN_WORKFLOW_MODULES = frozenset(("subprocess", "pty", "shutil", "commands", "ctypes", "importlib", "popen2"))
+FORBIDDEN_WORKFLOW_MODULES = frozenset(
+    ("subprocess", "pty", "shutil", "commands", "ctypes", "importlib", "popen2", "builtins", "posix", "nt", "_posixsubprocess")
+)
 FORBIDDEN_WORKFLOW_OS_ATTRS = frozenset(("system", "popen", "fork", "forkpty"))
 FORBIDDEN_WORKFLOW_OS_PREFIXES = ("exec", "spawn", "posix_spawn")
 FORBIDDEN_WORKFLOW_BUILTINS = frozenset(("eval", "exec", "compile", "__import__", "getattr"))
@@ -2923,8 +2925,25 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
                         }
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute):
+        if isinstance(node, ast.Name):
+            if node.id in FORBIDDEN_WORKFLOW_BUILTINS:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Dynamic execution primitive '{node.id}' is blocked inside run_workflow scripts "
+                        "to prevent pre-command-guard.sh evasion."
+                    ),
+                }
+        elif isinstance(node, ast.Attribute):
             attr = node.attr
+            if attr in FORBIDDEN_WORKFLOW_BUILTINS or attr == "__dict__" or (attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys"):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Dynamic lookup/execution attribute '.{attr}' is blocked inside run_workflow scripts "
+                        "to prevent pre-command-guard.sh evasion."
+                    ),
+                }
             if attr.startswith("create_subprocess"):
                 return {
                     "decision": "deny",
@@ -2940,20 +2959,20 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
                         ),
                     }
         elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_WORKFLOW_BUILTINS:
-                return {
-                    "decision": "deny",
-                    "reason": (
-                        f"Dynamic execution primitive '{node.func.id}()' is blocked inside run_workflow scripts "
-                        "to prevent pre-command-guard.sh evasion."
-                    ),
-                }
             is_agent_call = (
                 (isinstance(node.func, ast.Name) and node.func.id == "agent")
                 or (isinstance(node.func, ast.Attribute) and node.func.attr == "agent")
             )
             if is_agent_call:
                 for kw in node.keywords:
+                    if kw.arg is None:
+                        return {
+                            "decision": "deny",
+                            "reason": (
+                                "run_workflow agent(**kwargs) unpacking is blocked; "
+                                "pass explicit static string literals for agent(model=...)."
+                            ),
+                        }
                     if kw.arg == "model":
                         if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, str):
                             return {
@@ -3520,13 +3539,18 @@ def ui_stamp_register(
 
     branch_files = _collect_branch_diff_files(workspace, "HEAD")
     if explicit_targets:
-        norm_targets = [p.strip().lstrip("./") for p in explicit_targets if p.strip()]
+        norm_targets: list[str] = []
+        for raw_t in explicit_targets:
+            nt = raw_t.strip()
+            while nt.startswith("./"):
+                nt = nt[2:]
+            if nt:
+                norm_targets.append(nt)
         candidates = list(dict.fromkeys([*branch_files, *norm_targets])) if verdict == "PASS" else norm_targets
     else:
         candidates = branch_files
 
     ui_info = classify_ui_files(candidates)
-    detector_findings = 0
     scanned_web: list[str] = []
 
     if verdict == "PASS":
@@ -3556,7 +3580,8 @@ def ui_stamp_register(
         "codeTreeSha": compute_code_tree_sha(workspace),
         "p0Count": p0,
         "p1Count": p1,
-        "detectorFindings": detector_findings,
+        # PASS rejects rc == 2 above; FAIL records pre-scan status as 0 findings.
+        "detectorFindings": 0,
         "scannedWebFiles": scanned_web,
         "auditedNativeFiles": ui_info["nativeFiles"],
         "timestamp": utc_now_iso(),

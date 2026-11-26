@@ -1754,6 +1754,11 @@ sp.run(["echo", "hi"])' \
     'from os import system
 system("echo hi")' \
     'eval("__import__(\"os\").system(\"id\")")' \
+    'import os, builtins
+builtins.getattr(os, "system")("id")' \
+    'from builtins import eval as e
+e("__import__(\"os\").system(\"id\")")' \
+    'agent(prompt="Scan", **{"model": "gpt4"})' \
     'agent(prompt="Scan", model="""gpt4""")' \
     'm = "gpt4"
 agent(prompt="Scan", model=m)' \

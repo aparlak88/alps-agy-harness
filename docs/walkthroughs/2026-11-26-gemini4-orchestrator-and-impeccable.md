@@ -250,7 +250,7 @@ sequenceDiagram
 ### Çalıştırılan Komutlar ve Çıktı Özetleri
 - **Tam Birim ve Entegrasyon Paketi:**
   - Komut: `./scripts/run-quiet.sh full-tests -- bash tests/run-all.sh`
-  - Gerçek Çıktı Özeti: `✅ PASS [full-tests] (süre: 211.6s, warnings: 0 — log: .harness/logs/last.log)` — 9 paket, 97 testin tamamı geçti (`0 failed`).
+  - Gerçek Çıktı Özeti: `✅ PASS [full-tests] (süre: 214.6s, warnings: 0 — log: .harness/logs/last.log)` — 9 paket, 97 testin tamamı geçti (`0 failed`).
 - **Sözleşme ve Boyut Kontrolleri:**
   - `wc -c rules/AGENTS.md` -> `7624` bayt (`< 8192`).
   - Çekirdek eklenti dosya sayısı -> `53`.
