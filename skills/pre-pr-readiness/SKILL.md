@@ -92,6 +92,23 @@ Okuyucunun IDE'yi açmadan tüm işi, mimari kararları ve her bir dosyadaki de�
 
 ---
 
+### Adım 4b (Kod/Betik Değiştiyse Zorunlu): TDD Birim Test Kapsam Denetimi (`tdd-pass.json`)
+Dal farkında doküman-dışı üretim kodu veya betik dosyası değiştiyse `verify-pr-stamps`, `gh pr create` ve yerel `git merge` taze `tdd-pass.json` damgasını zorunlu kılar (salt doküman PR'larında pasiftir):
+1. Birincil olarak yerel Claude Code CLI (`claude -p --model sonnet --effort high`, salt-okunur) çalıştırın:
+   ```bash
+   ./scripts/stamp-gate.sh review --kind tdd --auto-stamp
+   ```
+2. Komut `exit 42` (`claude_unavailable`) dönerse sessizce geçmeyin: dönen `reason` bilgisini kullanıcıya açıklayıp Antigravity'deki **Claude (`claude-sonnet-5-5-high`)** mı yoksa **Gemini 4 (`gemini-4-neon-medium`)** mı kullanılacağını sorun ve aynı turda `schedule(DurationSeconds=30, TimerCondition="any")` kurun. Seçime veya 30 sn dolumunda varsayılan `gemini-4-neon-medium` modeline göre çalıştırın:
+   ```bash
+   ./scripts/stamp-gate.sh review --kind tdd --provider agy --model <claude-sonnet-5-5-high|gemini-4-neon-medium> --auto-stamp
+   ```
+3. Kritik veya önemli test açığı varsa eksikleri tamamlayıp tekrar çalıştırın (veya denetim sonucunu doğrudan damgalayın):
+   ```bash
+   ./scripts/stamp-gate.sh tdd --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
+   ```
+
+---
+
 ### Adım 5 (Koşullu): UI/Frontend Kalite ve Anti-Pattern Damgası (`stamp-gate.sh ui`)
 Bu adım **yalnızca** dal farkında üretim UI dosyaları (`.html`, `.tsx`, `.css`, `.scss`, `.component.ts`, `.xaml`, SwiftUI `Features`/`Views`, Compose `features`/`ui`) değiştiyse **VE** ortamda `impeccable` kuruluysa zorunludur (saf backend görevlerinde ve `impeccable` kurulu değilken atlanır):
 1. Impeccable `critique` / `audit` bulgularında `P0 = 0` ve `P1 = 0` olduğunu doğrulayın (`PRODUCT.md` / `DESIGN.md` uyumu dahil).

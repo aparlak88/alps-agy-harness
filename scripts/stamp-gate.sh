@@ -29,6 +29,8 @@ Usage:
   stamp-gate.sh tree-sha [--workspace <dir>]
   stamp-gate.sh canon --verdict PASS|FAIL [--plan <path>] [--allow-file <relpath> ...] [--workspace <dir>]
   stamp-gate.sh security --verdict PASS|FAIL --critical <n> --important <n> [--workspace <dir>]
+  stamp-gate.sh tdd --verdict PASS|FAIL --critical-gaps <n> --important-gaps <n> --provider claude-cli|agy-cli|subagent --model <id> [--effort <level>] [--file <relpath> ...] [--workspace <dir>]
+  stamp-gate.sh review --kind spec-plan|tdd [--provider claude|agy] [--model <id>] [--effort <level>] [--target <relpath> ...] [--auto-stamp] [--workspace <dir>]
   stamp-gate.sh ui --verdict PASS|FAIL --p0 <n> --p1 <n> [--target <relpath> ...] [--workspace <dir>]
   stamp-gate.sh context7 --package <name> --version <ver> --source locked|greenfield-latest [--workspace <dir>]
   stamp-gate.sh dispatch --role <role> --type <typeName> --tier <tier> [--parent-model <modelName>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--conversation-id <id>] [--workspace <dir>]
@@ -581,6 +583,200 @@ cmd_ui() {
   python3 -B "$(harness_core_python)" "${py_args[@]}"
 }
 
+cmd_tdd() {
+  local verdict=""
+  local critical_gaps=""
+  local important_gaps=""
+  local provider=""
+  local model=""
+  local effort=""
+  local files=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --verdict)
+        [ $# -ge 2 ] || { echo "Error: --verdict requires PASS or FAIL" >&2; exit 1; }
+        verdict="$2"
+        shift 2
+        ;;
+      --verdict=*)
+        verdict="${1#--verdict=}"
+        shift
+        ;;
+      --critical-gaps)
+        [ $# -ge 2 ] || { echo "Error: --critical-gaps requires a non-negative integer" >&2; exit 1; }
+        critical_gaps="$2"
+        shift 2
+        ;;
+      --critical-gaps=*)
+        critical_gaps="${1#--critical-gaps=}"
+        shift
+        ;;
+      --important-gaps)
+        [ $# -ge 2 ] || { echo "Error: --important-gaps requires a non-negative integer" >&2; exit 1; }
+        important_gaps="$2"
+        shift 2
+        ;;
+      --important-gaps=*)
+        important_gaps="${1#--important-gaps=}"
+        shift
+        ;;
+      --provider)
+        [ $# -ge 2 ] || { echo "Error: --provider requires claude-cli, agy-cli, or subagent" >&2; exit 1; }
+        provider="$2"
+        shift 2
+        ;;
+      --provider=*)
+        provider="${1#--provider=}"
+        shift
+        ;;
+      --model)
+        [ $# -ge 2 ] || { echo "Error: --model requires a model identifier" >&2; exit 1; }
+        model="$2"
+        shift 2
+        ;;
+      --model=*)
+        model="${1#--model=}"
+        shift
+        ;;
+      --effort)
+        [ $# -ge 2 ] || { echo "Error: --effort requires an effort level" >&2; exit 1; }
+        effort="$2"
+        shift 2
+        ;;
+      --effort=*)
+        effort="${1#--effort=}"
+        shift
+        ;;
+      --file)
+        [ $# -ge 2 ] || { echo "Error: --file requires a relative file path" >&2; exit 1; }
+        local norm_f="$2"
+        while [[ "$norm_f" == ./* ]]; do norm_f="${norm_f#./}"; done
+        files+=("$norm_f")
+        shift 2
+        ;;
+      --file=*)
+        local norm_f="${1#--file=}"
+        while [[ "$norm_f" == ./* ]]; do norm_f="${norm_f#./}"; done
+        files+=("$norm_f")
+        shift
+        ;;
+      *)
+        echo "Error: unknown argument for tdd: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ "$verdict" != "PASS" ] && [ "$verdict" != "FAIL" ]; then
+    echo "Error: tdd --verdict must be PASS or FAIL (got '$verdict')" >&2
+    exit 1
+  fi
+  if [[ ! "$critical_gaps" =~ ^[0-9]+$ ]] || [[ ! "$important_gaps" =~ ^[0-9]+$ ]]; then
+    echo "Error: tdd --critical-gaps and --important-gaps must be non-negative integers" >&2
+    exit 1
+  fi
+  if [ -z "$provider" ] || [ -z "$model" ]; then
+    echo "Error: tdd requires non-empty --provider and --model" >&2
+    exit 1
+  fi
+
+  local py_args=(tdd-stamp --workspace="$WORKSPACE" --verdict="$verdict" --critical-gaps="$critical_gaps" --important-gaps="$important_gaps" --provider="$provider" --model="$model" --effort="$effort")
+  local f
+  for f in ${files[@]+"${files[@]}"}; do
+    py_args+=(--file="$f")
+  done
+
+  python3 -B "$(harness_core_python)" "${py_args[@]}"
+}
+
+cmd_review() {
+  local kind=""
+  local provider="claude"
+  local model=""
+  local effort=""
+  local auto_stamp="false"
+  local targets=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kind)
+        [ $# -ge 2 ] || { echo "Error: --kind requires spec-plan or tdd" >&2; exit 1; }
+        kind="$2"
+        shift 2
+        ;;
+      --kind=*)
+        kind="${1#--kind=}"
+        shift
+        ;;
+      --provider)
+        [ $# -ge 2 ] || { echo "Error: --provider requires claude or agy" >&2; exit 1; }
+        provider="$2"
+        shift 2
+        ;;
+      --provider=*)
+        provider="${1#--provider=}"
+        shift
+        ;;
+      --model)
+        [ $# -ge 2 ] || { echo "Error: --model requires a model identifier" >&2; exit 1; }
+        model="$2"
+        shift 2
+        ;;
+      --model=*)
+        model="${1#--model=}"
+        shift
+        ;;
+      --effort)
+        [ $# -ge 2 ] || { echo "Error: --effort requires an effort level" >&2; exit 1; }
+        effort="$2"
+        shift 2
+        ;;
+      --effort=*)
+        effort="${1#--effort=}"
+        shift
+        ;;
+      --target)
+        [ $# -ge 2 ] || { echo "Error: --target requires a relative file path" >&2; exit 1; }
+        local norm_t="$2"
+        while [[ "$norm_t" == ./* ]]; do norm_t="${norm_t#./}"; done
+        targets+=("$norm_t")
+        shift 2
+        ;;
+      --target=*)
+        local norm_t="${1#--target=}"
+        while [[ "$norm_t" == ./* ]]; do norm_t="${norm_t#./}"; done
+        targets+=("$norm_t")
+        shift
+        ;;
+      --auto-stamp)
+        auto_stamp="true"
+        shift
+        ;;
+      *)
+        echo "Error: unknown argument for review: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ "$kind" != "spec-plan" ] && [ "$kind" != "tdd" ]; then
+    echo "Error: review --kind must be spec-plan or tdd (got '$kind')" >&2
+    exit 1
+  fi
+
+  local py_args=(external-review --workspace="$WORKSPACE" --kind="$kind" --provider="$provider" --model="$model" --effort="$effort")
+  if [ "$auto_stamp" = "true" ]; then
+    py_args+=(--auto-stamp)
+  fi
+  local t
+  for t in ${targets[@]+"${targets[@]}"}; do
+    py_args+=(--target="$t")
+  done
+
+  python3 -B "$(harness_core_python)" "${py_args[@]}"
+}
+
 cmd_clear_pr_audit() {
   if [ $# -gt 0 ]; then
     echo "Error: unexpected arguments for clear-pr-audit: $*" >&2
@@ -598,6 +794,12 @@ case "$SUBCMD" in
     ;;
   security)
     cmd_security ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
+    ;;
+  tdd)
+    cmd_tdd ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
+    ;;
+  review)
+    cmd_review ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
     ;;
   ui)
     cmd_ui ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}

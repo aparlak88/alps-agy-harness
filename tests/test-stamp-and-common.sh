@@ -863,6 +863,7 @@ test_ui_stamp_web_detect_enforcement_and_native_p0_p1_validation() {
   git -C "$repo" commit -m "feat: backend order" --quiet
   "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs"
   "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
 
   cat << 'EOF' > "$mock_bin"
 #!/usr/bin/env bash
@@ -880,6 +881,7 @@ EOF
   git -C "$repo" commit -m "feat: add Hero.html" --quiet
   "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs" --allow-file "src/app/Hero.html"
   "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
 
   # Without Impeccable installed -> verify-pr-stamps passes without ui-pass.json
   HARNESS_CONFIG_DIR="$mock_cfg" env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR \
@@ -960,6 +962,7 @@ EOF
   git -C "$repo" commit -m "feat: update Hero.html" --quiet
   "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs" --allow-file "src/app/Hero.html"
   "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
 
   local stale_err
   if stale_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
@@ -984,6 +987,7 @@ EOF
   git -C "$native_repo" commit -m "feat: add PaywallView" --quiet
   "$STAMP_GATE" canon --workspace "$native_repo" --verdict PASS --allow-file "Sources/Features/PaywallView.swift"
   "$STAMP_GATE" security --workspace "$native_repo" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$native_repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
 
   if HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$native_skill_dir" \
       "$STAMP_GATE" verify-pr-stamps --workspace "$native_repo" >/dev/null 2>&1; then
@@ -1024,6 +1028,382 @@ EOF
   comp_cls=$(python3 -B -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(json.dumps(harness_core.classify_ui_files(["src/app/hero.component.ts"])))' "$REPO_ROOT/scripts/lib")
   assert_json_field "$comp_cls" ".webFiles[0]" "src/app/hero.component.ts" ".component.ts classifies into webFiles"
   assert_eq "0" "$(printf '%s\n' "$comp_cls" | jq '.nativeFiles | length')" ".component.ts must not fall into nativeFiles"
+}
+
+test_claude_cli_review_fallback_and_tdd_stamp_gate() {
+  local repo mock_dir mock_claude mock_agy arg_log
+  repo=$(make_temp_repo)
+  mock_dir=$(mktemp -d)
+  _TEST_TEMP_DIRS+=("$mock_dir")
+  mock_claude="$mock_dir/mock-claude"
+  mock_agy="$mock_dir/mock-agy"
+  arg_log="$mock_dir/review-args.log"
+
+  echo "# Init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/review-tdd" --quiet
+
+  mkdir -p "$repo/src" "$repo/tests" "$repo/docs/superpowers/specs"
+  echo "export const double = (n: number) => n * 2;" > "$repo/src/Math.ts"
+  echo "test('double', () => expect(double(2)).toBe(4));" > "$repo/tests/Math.test.ts"
+  echo "# Spec" > "$repo/docs/superpowers/specs/math-spec.md"
+  git -C "$repo" add src/Math.ts tests/Math.test.ts docs/superpowers/specs/math-spec.md
+  git -C "$repo" commit -m "feat: add Math and test" --quiet
+
+  # 1. Primary claude -p Spec/Plan review (opus / medium, read-only flags, sensitive env scrubbed, stdin prompt verified)
+  local prompt_log="$mock_dir/review-prompt.log"
+  cat << EOF > "$mock_claude"
+#!/usr/bin/env bash
+cat > "$prompt_log"
+printf 'CLAUDECODE=%s\nTYPESAFE_API_KEY=%s\nGITHUB_TOKEN=%s\nAWS_SECRET_ACCESS_KEY=%s\nOPENAI_API_KEY=%s\nSTRIPE_SECRET_KEY=%s\nARGS=%s\n' \
+  "\${CLAUDECODE:-}" "\${TYPESAFE_API_KEY:-}" "\${GITHUB_TOKEN:-}" "\${AWS_SECRET_ACCESS_KEY:-}" "\${OPENAI_API_KEY:-}" "\${STRIPE_SECRET_KEY:-}" "\$*" > "$arg_log"
+echo "Spec looks solid."
+echo 'VERDICT_JSON: {"verdict":"PASS","criticalGaps":0,"importantGaps":0,"summary":"Spec approved"}'
+exit 0
+EOF
+  chmod +x "$mock_claude"
+
+  local out_spec_ok
+  out_spec_ok=$(CLAUDECODE="nested-parent" TYPESAFE_API_KEY="ts_live_secret_must_not_leak" GITHUB_TOKEN="ghp_secret" AWS_SECRET_ACCESS_KEY="aws_secret" OPENAI_API_KEY="sk-openai" STRIPE_SECRET_KEY="sk-stripe" HARNESS_CLAUDE_BIN="$mock_claude" \
+    "$STAMP_GATE" review --workspace "$repo" --kind spec-plan --target "docs/superpowers/specs/math-spec.md" --auto-stamp)
+  assert_json_field "$out_spec_ok" ".status" "ok"
+  assert_json_field "$out_spec_ok" ".provider" "claude-cli"
+  assert_json_field "$out_spec_ok" ".model" "opus"
+  assert_json_field "$out_spec_ok" ".effort" "medium"
+  assert_json_field "$out_spec_ok" ".verdict" "PASS"
+  assert_json_field "$out_spec_ok" ".stamped" "false" "spec-plan --auto-stamp must never write tdd-pass.json"
+  [ ! -f "$repo/.harness/state/feat-review-tdd/tdd-pass.json" ] || { echo "spec-plan --auto-stamp must not create tdd-pass.json" >&2; return 1; }
+
+  local logged_spec logged_prompt
+  logged_spec=$(cat "$arg_log")
+  logged_prompt=$(cat "$prompt_log")
+  assert_contains "$logged_spec" "CLAUDECODE="
+  assert_not_contains "$logged_spec" "nested-parent"
+  assert_not_contains "$logged_spec" "ts_live_secret_must_not_leak"
+  assert_not_contains "$logged_spec" "ghp_secret"
+  assert_not_contains "$logged_spec" "aws_secret"
+  assert_not_contains "$logged_spec" "sk-openai"
+  assert_not_contains "$logged_spec" "sk-stripe"
+  assert_contains "$logged_spec" "--model opus"
+  assert_contains "$logged_spec" "--effort medium"
+  assert_contains "$logged_spec" "--permission-mode plan"
+  assert_contains "$logged_spec" "--no-session-persistence"
+  assert_contains "$logged_spec" "--tools Read,Grep,Glob"
+  assert_contains "$logged_prompt" "docs/superpowers/specs/math-spec.md"
+  assert_contains "$logged_prompt" "Spec & Implementation Plan Review"
+
+  # 2. Primary claude -p TDD review (sonnet / high + --auto-stamp writes tdd-pass.json, prompt lists changed code/tests)
+  local out_tdd_ok state_dir
+  out_tdd_ok=$(HARNESS_CLAUDE_BIN="$mock_claude" \
+    "$STAMP_GATE" review --workspace "$repo" --kind tdd --auto-stamp)
+  assert_json_field "$out_tdd_ok" ".status" "ok"
+  assert_json_field "$out_tdd_ok" ".model" "sonnet"
+  assert_json_field "$out_tdd_ok" ".effort" "high"
+  assert_json_field "$out_tdd_ok" ".stamped" "true"
+  assert_contains "$(cat "$prompt_log")" "src/Math.ts"
+  assert_contains "$(cat "$prompt_log")" "tests/Math.test.ts"
+  state_dir="$repo/.harness/state/feat-review-tdd"
+  [ -f "$state_dir/tdd-pass.json" ] || { echo "Expected tdd-pass.json after --auto-stamp" >&2; return 1; }
+  assert_json_field "$state_dir/tdd-pass.json" ".verdict" "PASS"
+  assert_json_field "$state_dir/tdd-pass.json" ".provider" "claude-cli"
+
+  # 3. Missing claude CLI -> exit 42 with structured reason & fallbackChoices (no silent fallback)
+  set +e
+  local out_missing rc_missing=0
+  out_missing=$(PATH="/usr/bin:/bin" HARNESS_CLAUDE_BIN="" \
+    "$STAMP_GATE" review --workspace "$repo" --kind spec-plan 2>/dev/null)
+  rc_missing=$?
+  set -e
+  assert_eq "42" "$rc_missing" "Missing claude binary must exit 42"
+  assert_json_field "$out_missing" ".status" "claude_unavailable"
+  assert_json_field "$out_missing" ".fallbackChoices.agyClaudeModel" "claude-opus-5-5-medium"
+  assert_json_field "$out_missing" ".fallbackChoices.agyDefaultModel" "gemini-4-carbon-high"
+  assert_json_field "$out_missing" ".fallbackChoices.timeoutSeconds" "30"
+
+  # 4. Failing claude CLI (quota/rate limit) -> exit 42 with exact stderr reason
+  cat << 'EOF' > "$mock_claude"
+#!/usr/bin/env bash
+echo "Error: rate limit exceeded for Claude Pro" >&2
+exit 1
+EOF
+  chmod +x "$mock_claude"
+  set +e
+  local out_quota rc_quota=0
+  out_quota=$(HARNESS_CLAUDE_BIN="$mock_claude" \
+    "$STAMP_GATE" review --workspace "$repo" --kind tdd 2>/dev/null)
+  rc_quota=$?
+  set -e
+  assert_eq "42" "$rc_quota" "Failing claude -p must exit 42"
+  assert_json_field "$out_quota" ".status" "claude_unavailable"
+  assert_contains "$(printf '%s' "$out_quota" | jq -r '.reason')" "rate limit exceeded"
+  assert_json_field "$out_quota" ".fallbackChoices.agyClaudeModel" "claude-sonnet-5-5-high"
+  assert_json_field "$out_quota" ".fallbackChoices.agyDefaultModel" "gemini-4-neon-medium"
+
+  # 5. agy -p explicit fallback (default timeout models + explicit Claude models + env scrubbing, --disable-slash-commands, and --print=<prompt>)
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+printf 'TYPESAFE_API_KEY=%s\nGITHUB_TOKEN=%s\nAGY_ARGS=%s\n' "\${TYPESAFE_API_KEY:-}" "\${GITHUB_TOKEN:-}" "\$*" > "$arg_log"
+echo "Fallback review complete."
+echo 'VERDICT_JSON: {"verdict":"PASS","criticalGaps":0,"importantGaps":0,"summary":"TDD coverage verified"}'
+exit 0
+EOF
+  chmod +x "$mock_agy"
+
+  local out_agy_spec out_agy_tdd out_agy_explicit
+  out_agy_spec=$(TYPESAFE_API_KEY="ts_live_agy_secret" GITHUB_TOKEN="ghp_agy_secret" HARNESS_AGY_BIN="$mock_agy" \
+    "$STAMP_GATE" review --workspace "$repo" --kind spec-plan --provider agy)
+  assert_json_field "$out_agy_spec" ".status" "ok"
+  assert_json_field "$out_agy_spec" ".provider" "agy-cli"
+  assert_json_field "$out_agy_spec" ".model" "gemini-4-carbon-high"
+  assert_contains "$(cat "$arg_log")" "--model gemini-4-carbon-high"
+  assert_contains "$(cat "$arg_log")" "--mode plan"
+  assert_contains "$(cat "$arg_log")" "--disable-slash-commands"
+  assert_contains "$(cat "$arg_log")" "--print=You are performing a read-only Spec & Implementation Plan Review"
+  assert_not_contains "$(cat "$arg_log")" "ts_live_agy_secret"
+  assert_not_contains "$(cat "$arg_log")" "ghp_agy_secret"
+
+  out_agy_explicit=$(HARNESS_AGY_BIN="$mock_agy" \
+    "$STAMP_GATE" review --workspace "$repo" --kind tdd --provider agy --model claude-sonnet-5-5-high --effort high)
+  assert_json_field "$out_agy_explicit" ".model" "claude-sonnet-5-5-high"
+  assert_contains "$(cat "$arg_log")" "--model claude-sonnet-5-5-high"
+  assert_contains "$(cat "$arg_log")" "--effort high"
+
+  out_agy_tdd=$(HARNESS_AGY_BIN="$mock_agy" \
+    "$STAMP_GATE" review --workspace "$repo" --kind tdd --provider agy --auto-stamp)
+  assert_json_field "$out_agy_tdd" ".status" "ok"
+  assert_json_field "$out_agy_tdd" ".provider" "agy-cli"
+  assert_json_field "$out_agy_tdd" ".model" "gemini-4-neon-medium"
+  assert_json_field "$out_agy_tdd" ".stamped" "true"
+  assert_json_field "$state_dir/tdd-pass.json" ".provider" "agy-cli"
+  assert_json_field "$state_dir/tdd-pass.json" ".model" "gemini-4-neon-medium"
+
+  # 6. Fail-closed tdd stamp: PASS with non-zero critical/important gaps must be rejected
+  rm -f "$state_dir/tdd-pass.json"
+  if "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 1 --important-gaps 0 --provider claude-cli --model sonnet >/dev/null 2>&1; then
+    echo "tdd PASS with criticalGaps=1 must be rejected" >&2
+    return 1
+  fi
+  if "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 2 --provider claude-cli --model sonnet >/dev/null 2>&1; then
+    echo "tdd PASS with importantGaps=2 must be rejected" >&2
+    return 1
+  fi
+  [ ! -f "$state_dir/tdd-pass.json" ] || { echo "Rejected tdd PASS must not write tdd-pass.json" >&2; return 1; }
+
+  # 7. verify-pr-stamps requires fresh tdd-pass.json on code changes; modifying code invalidates it
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Math.ts" --allow-file "tests/Math.test.ts"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  if "$STAMP_GATE" verify-pr-stamps --workspace "$repo" >/dev/null 2>&1; then
+    echo "verify-pr-stamps must fail when tdd-pass.json is missing on code branch" >&2
+    return 1
+  fi
+
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
+  "$STAMP_GATE" verify-pr-stamps --workspace "$repo"
+
+  echo "export const double = (n: number) => n + n;" > "$repo/src/Math.ts"
+  git -C "$repo" add src/Math.ts
+  git -C "$repo" commit -m "refactor: double implementation" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Math.ts" --allow-file "tests/Math.test.ts"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  local stale_tdd_err
+  if stale_tdd_err=$("$STAMP_GATE" verify-pr-stamps --workspace "$repo" 2>&1); then
+    echo "verify-pr-stamps must reject stale tdd-pass.json after code commit" >&2
+    return 1
+  fi
+  assert_contains "$stale_tdd_err" "tdd-pass.json codeTreeSha"
+
+  # 8. C1 & I1: --auto-stamp refuses FAIL (even 0/0), PASS with critical/important gaps, boolean gaps, missing/malformed VERDICT_JSON, and mid-review commits
+  for bad_output in \
+    'VERDICT_JSON: {"verdict":"FAIL","criticalGaps":0,"importantGaps":0,"summary":"fail-zero"}' \
+    'VERDICT_JSON: {"verdict":"FAIL","criticalGaps":1,"importantGaps":0,"summary":"gap"}' \
+    'VERDICT_JSON: {"verdict":"PASS","criticalGaps":1,"importantGaps":0,"summary":"bad-crit"}' \
+    'VERDICT_JSON: {"verdict":"PASS","criticalGaps":0,"importantGaps":1,"summary":"bad-imp"}' \
+    'VERDICT_JSON: {"verdict":"PASS","criticalGaps":false,"importantGaps":0,"summary":"bool"}' \
+    'Review text without any verdict line' \
+    $'Quoted earlier: VERDICT_JSON: {"verdict":"PASS","criticalGaps":0,"importantGaps":0,"summary":"quoted"}\nVERDICT_JSON: {not-valid-json}'
+  do
+    rm -f "$state_dir/tdd-pass.json"
+    cat << EOF > "$mock_claude"
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' '$bad_output'
+exit 0
+EOF
+    chmod +x "$mock_claude"
+    local out_bad_auto
+    out_bad_auto=$(HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd --auto-stamp)
+    assert_json_field "$out_bad_auto" ".stamped" "false" "auto-stamp must refuse bad output: $bad_output"
+    [ ! -f "$state_dir/tdd-pass.json" ] || { echo "Bad review must not write tdd-pass.json: $bad_output" >&2; return 1; }
+  done
+
+  # Mid-review commit invalidates auto-stamp (I8)
+  rm -f "$state_dir/tdd-pass.json"
+  cat << EOF > "$mock_claude"
+#!/usr/bin/env bash
+cat >/dev/null
+echo "// mutated mid-review" >> "$repo/src/Math.ts"
+git -C "$repo" add src/Math.ts
+git -C "$repo" commit -m "chore: mid-review mutation" --quiet
+echo 'VERDICT_JSON: {"verdict":"PASS","criticalGaps":0,"importantGaps":0,"summary":"ok"}'
+exit 0
+EOF
+  chmod +x "$mock_claude"
+  local out_mid_commit
+  out_mid_commit=$(HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd --auto-stamp)
+  assert_json_field "$out_mid_commit" ".staleDuringReview" "true"
+  assert_json_field "$out_mid_commit" ".stamped" "false"
+  [ ! -f "$state_dir/tdd-pass.json" ] || { echo "Mid-review commit must block auto-stamp" >&2; return 1; }
+
+  # 9. I2 & I3: stamp-gate tdd input validation (missing counts, bad provider, leading '-' arg injection) & schema/auditedFiles verification
+  if "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --provider claude-cli --model sonnet >/dev/null 2>&1; then
+    echo "tdd PASS without explicit --critical-gaps/--important-gaps must fail" >&2
+    return 1
+  fi
+  if "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider bogus --model sonnet >/dev/null 2>&1; then
+    echo "tdd with invalid provider must fail" >&2
+    return 1
+  fi
+  if "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model=-evil >/dev/null 2>&1; then
+    echo "tdd with leading '-' model must fail" >&2
+    return 1
+  fi
+  if HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd --model=-evil >/dev/null 2>&1; then
+    echo "review with leading '-' model must fail" >&2
+    return 1
+  fi
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Math.ts" --allow-file "tests/Math.test.ts"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high --file "src/Math.ts" --file "tests/Math.test.ts"
+  assert_json_field "$state_dir/tdd-pass.json" ".criticalGaps" "0"
+  assert_json_field "$state_dir/tdd-pass.json" ".importantGaps" "0"
+  assert_json_field "$state_dir/tdd-pass.json" ".effort" "high"
+  assert_json_field "$state_dir/tdd-pass.json" ".auditedFiles[0]" "src/Math.ts"
+  assert_json_field "$state_dir/tdd-pass.json" ".auditedFiles[1]" "tests/Math.test.ts"
+  assert_json_field "$state_dir/tdd-pass.json" ".codeTreeSha" "$("$STAMP_GATE" tree-sha --workspace "$repo")"
+
+  # 10. C2: verify-pr-stamps rejects FAIL 0/0, PASS with importantGaps=1, PASS with boolean gaps, and corrupt JSON (each unmasked)
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict FAIL --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet
+  if "$STAMP_GATE" verify-pr-stamps --workspace "$repo" >/dev/null 2>&1; then
+    echo "verify-pr-stamps must reject FAIL 0/0 tdd-pass.json" >&2
+    return 1
+  fi
+  jq -c '.verdict = "PASS" | .criticalGaps = 0 | .importantGaps = 1' "$state_dir/tdd-pass.json" > "$state_dir/tdd-pass.json.tmp" && mv "$state_dir/tdd-pass.json.tmp" "$state_dir/tdd-pass.json"
+  if "$STAMP_GATE" verify-pr-stamps --workspace "$repo" >/dev/null 2>&1; then
+    echo "verify-pr-stamps must reject importantGaps=1 in tdd-pass.json" >&2
+    return 1
+  fi
+  jq -c '.verdict = "PASS" | .criticalGaps = false | .importantGaps = 0' "$state_dir/tdd-pass.json" > "$state_dir/tdd-pass.json.tmp" && mv "$state_dir/tdd-pass.json.tmp" "$state_dir/tdd-pass.json"
+  if "$STAMP_GATE" verify-pr-stamps --workspace "$repo" >/dev/null 2>&1; then
+    echo "verify-pr-stamps must reject boolean criticalGaps in tdd-pass.json" >&2
+    return 1
+  fi
+  printf '{corrupt-json\n' > "$state_dir/tdd-pass.json"
+  if "$STAMP_GATE" verify-pr-stamps --workspace "$repo" >/dev/null 2>&1; then
+    echo "verify-pr-stamps must reject corrupt tdd-pass.json" >&2
+    return 1
+  fi
+
+  # 11. I4 & Security: secret redaction in failure reason, claude timeout, agy error paths, and symlink-safe report write
+  cat << 'EOF' > "$mock_claude"
+#!/usr/bin/env bash
+echo "Auth failed for Bearer secret_tok_123456789 and ts_live_abcdef1234567890" >&2
+exit 1
+EOF
+  chmod +x "$mock_claude"
+  set +e
+  local out_redact rc_redact=0
+  out_redact=$(HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd 2>/dev/null)
+  rc_redact=$?
+  set -e
+  assert_eq "42" "$rc_redact"
+  assert_not_contains "$out_redact" "secret_tok_123456789"
+  assert_not_contains "$out_redact" "ts_live_abcdef1234567890"
+  assert_contains "$out_redact" "[REDACTED]"
+
+  # Timeout path for claude
+  cat << 'EOF' > "$mock_claude"
+#!/usr/bin/env bash
+sleep 3
+EOF
+  chmod +x "$mock_claude"
+  set +e
+  local out_to rc_to=0
+  out_to=$(HARNESS_REVIEW_TIMEOUT_SEC=1 HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd 2>/dev/null)
+  rc_to=$?
+  set -e
+  assert_eq "42" "$rc_to"
+  assert_contains "$out_to" "timed out"
+
+  # agy failure path (exit 1)
+  cat << 'EOF' > "$mock_agy"
+#!/usr/bin/env bash
+echo "agy backend unavailable" >&2
+exit 1
+EOF
+  chmod +x "$mock_agy"
+  set +e
+  local out_agy_err rc_agy_err=0
+  out_agy_err=$(HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" review --workspace "$repo" --kind tdd --provider agy 2>/dev/null)
+  rc_agy_err=$?
+  set -e
+  assert_eq "1" "$rc_agy_err"
+  assert_json_field "$out_agy_err" ".status" "agy_error"
+
+  # Symlink-safe atomic report write (symlink must be replaced, target untouched)
+  local outside_target="$mock_dir/outside-sentinel.txt"
+  echo "DO_NOT_OVERWRITE" > "$outside_target"
+  ln -sf "$outside_target" "$state_dir/tdd-review.md"
+  cat << 'EOF' > "$mock_claude"
+#!/usr/bin/env bash
+cat >/dev/null
+echo 'Clean report'
+echo 'VERDICT_JSON: {"verdict":"PASS","criticalGaps":0,"importantGaps":0,"summary":"ok"}'
+exit 0
+EOF
+  chmod +x "$mock_claude"
+  HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd >/dev/null
+  assert_eq "DO_NOT_OVERWRITE" "$(cat "$outside_target")" "Atomic report write must not follow symlink target"
+  [ ! -L "$state_dir/tdd-review.md" ] || { echo "Report symlink should be atomically replaced" >&2; return 1; }
+
+  # Narrow --target review must not auto-stamp the entire branch
+  rm -f "$state_dir/tdd-pass.json"
+  local out_narrow_auto
+  out_narrow_auto=$(HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd --target "README.md" --auto-stamp)
+  assert_json_field "$out_narrow_auto" ".stamped" "false" "Narrow --target review must not auto-stamp full branch"
+  [ ! -f "$state_dir/tdd-pass.json" ] || { echo "Narrow --target review must not write tdd-pass.json" >&2; return 1; }
+
+  # Dirty working tree (uncommitted code/test edit) must block --auto-stamp
+  echo "// uncommitted edit" >> "$repo/tests/Math.test.ts"
+  local out_dirty_auto
+  out_dirty_auto=$(HARNESS_CLAUDE_BIN="$mock_claude" "$STAMP_GATE" review --workspace "$repo" --kind tdd --auto-stamp)
+  assert_json_field "$out_dirty_auto" ".dirtyWorkingTree" "true" "Uncommitted test edit must flag dirtyWorkingTree"
+  assert_json_field "$out_dirty_auto" ".stamped" "false" "Dirty working tree must block --auto-stamp"
+  [ ! -f "$state_dir/tdd-pass.json" ] || { echo "Dirty working tree must not write tdd-pass.json" >&2; return 1; }
+  git -C "$repo" checkout -- tests/Math.test.ts
+
+  # 12. C4 & C5: dotfile/dot-dir exemptions & deletion-only code branch still requires TDD stamp
+  local dot_chk
+  dot_chk=$(python3 -B -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import harness_core; req, files = harness_core.requires_tdd_stamp(harness_core.Path("."), [".gitignore", ".harness-ignore", ".impeccable/cfg.json", ".superpowers/s.json", ".harness/state/x.json", "./docs/a.md", "./.github/workflows/ci.yml"]); print(json.dumps({"req": req, "files": files}))' "$REPO_ROOT/scripts/lib")
+  assert_json_field "$dot_chk" ".req" "true"
+  assert_eq "1" "$(printf '%s\n' "$dot_chk" | jq '.files | length')" "Only .github/workflows/ci.yml should remain non-exempt"
+  assert_json_field "$dot_chk" ".files[0]" ".github/workflows/ci.yml" "Dotfile prefix must be preserved intact"
+
+  local del_repo
+  del_repo=$(make_temp_repo)
+  mkdir -p "$del_repo/src"
+  echo "export const x = 1;" > "$del_repo/src/Old.ts"
+  git -C "$del_repo" add src/Old.ts
+  git -C "$del_repo" commit -m "chore: init" --quiet
+  git -C "$del_repo" checkout -b "feat/delete-only" --quiet
+  git -C "$del_repo" rm -f src/Old.ts --quiet
+  git -C "$del_repo" commit -m "refactor: delete Old.ts" --quiet
+  "$STAMP_GATE" canon --workspace "$del_repo" --verdict PASS --allow-file "src/Old.ts"
+  "$STAMP_GATE" security --workspace "$del_repo" --verdict PASS --critical 0 --important 0
+  if "$STAMP_GATE" verify-pr-stamps --workspace "$del_repo" >/dev/null 2>&1; then
+    echo "Deletion-only code branch must still require tdd-pass.json" >&2
+    return 1
+  fi
 }
 
 run_tests "$@"

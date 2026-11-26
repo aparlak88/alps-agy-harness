@@ -40,7 +40,7 @@ Eğer sınıflandırma güven skoru `< 0.80` ise en güvenli yol olan `full_proj
 | **`full_project` (Architectural)** | Zorunlu (`brainstorming` + `ADR`) | Kapsamlı DDD Planı (`writing-plans`) | SDD (İzole Worktree) | Kapsamlı Walkthrough, tüm PR kapıları |
 
 > [!IMPORTANT]
-> **PR Sınır Kapıları Değişmezdir:** İş ne kadar küçük olursa olsun, `pre-pr-readiness` doğrulaması, `canon-pass.json`, `security-pass.json`, en az 2 Mermaid diyagramı içeren Walkthrough dokümanı ve PR sonrası `pr-auditor` değerlendirmesi **istisnasız her PR için zorunludur**.
+> **PR Sınır Kapıları Değişmezdir:** İş ne kadar küçük olursa olsun, `pre-pr-readiness` doğrulaması, `canon-pass.json`, `security-pass.json`, kod/betik değiştiyse koşullu `tdd-pass.json`, UI değiştiyse + `impeccable` kuruluysa koşullu `ui-pass.json`, en az 2 Mermaid diyagramı içeren Walkthrough dokümanı ve PR sonrası `pr-auditor` değerlendirmesi **istisnasız her PR için zorunludur**.
 
 ---
 
@@ -103,7 +103,7 @@ UI/Frontend içeren `small_change` veya `full_project` görevlerinde `impeccable
 - **Saf Backend İzolasyonu:** Backend/CLI görevlerinde `impeccable` tamamen pasiftir ve `ui-pass.json` üretilmez.
 
 Uygulama tamamlandığında:
-1. `pre-pr-readiness` skill'ini çağırın (`canon-auditor`, `security-reviewer`, UI değiştiyse + `impeccable` kuruluysa `stamp-gate.sh ui`, Walkthrough).
+1. `pre-pr-readiness` skill'ini çağırın (`canon-auditor`, `security-reviewer`, kod/betik değiştiyse `stamp-gate.sh review --kind tdd --auto-stamp` → `tdd-pass.json`, UI değiştiyse + `impeccable` kuruluysa `stamp-gate.sh ui`, Walkthrough).
 2. `gh pr create` komutunu çalıştırın.
 3. `stop-gate.sh` devreye girdiğinde `review-pr` skill'i ile `pr-auditor` denetimini gerçekleştirin.
 
@@ -131,3 +131,25 @@ Kullanıcı `/swarm` veya çoklu ajan koordinasyonu başlattığında ana ajan *
   1. **Planner Fazı (Salt-Okunur):** `jev_classify`, kod tabanı keşfi, `jev_check` (`ADR`), `context7` doküman sorguları ve `ask_question` kararlarını tamamlayıp `Re-plan if:` tetikleyicileriyle `exit_plan_mode` üzerinden yürütmeye devredin.
   2. **Executor Fazı:** İzole `feat/*` dalı/worktree açıp Spec/Plan/kod yazın, `stamp-gate.sh` ve `run-quiet.sh` doğrulamalarını çalıştırın; başarısız doğrulama veya plan dışı karar gereksiniminde `enter_plan_mode` ile Planner'a dönün.
 - **`run_workflow` Koruması:** `hooks.json` (`invoke_subagent|swarm|run_workflow`) dinamik Python iş akışı betiklerinde doğrudan `subprocess`/`os.system` kabuk atlatmalarını, `pty`/`eval`/`exec` kaçışlarını, gömülü gizli anahtarları ve geçersiz statik `agent(model=...)` katmanlarını AST tabanlı analizle fiziksel olarak reddeder.
+
+---
+
+## 10. Claude Code CLI (`claude -p`) Spec/Plan & TDD Kapsam İncelemesi ve 30 sn Fallback
+
+Spec/Plan onayı öncesi ve TDD uygulama sonrası birim test kapsam denetimi birincil olarak yerel `claude -p` (salt-okunur `--permission-mode plan --tools Read,Grep,Glob`) üzerinden yürütülür:
+
+```bash
+# 1. Spec / Plan İncelemesi (opus / medium — kayıt: spec-plan-review.json)
+./scripts/stamp-gate.sh review --kind spec-plan --target "docs/superpowers/specs/<spec>.md" --target "docs/superpowers/plans/<plan>.md"
+
+# 2. TDD Birim Test Kapsam Denetimi (sonnet / high — temizse tdd-pass.json damgalar)
+./scripts/stamp-gate.sh review --kind tdd --auto-stamp
+```
+
+### `exit 42` (`claude_unavailable`) Durumunda 30 Saniyelik Fallback Protokolü
+1. `claude` CLI kurulu değilse veya herhangi bir sebeple (oturum/auth, kota/rate-limit, ağ, zaman aşımı, sıfır dışı çıkış) çalışmazsa komut **sessiz fallback yapmaz**; `reason` ve `fallbackChoices` içeren JSON dönüp `exit 42` ile çıkar.
+2. Ana ajan, `reason` değerini kullanıcıya açıkça bildirerek Antigravity'deki **Claude** modelini mi yoksa **Gemini 4** modelini mi kullanacağını sorar ve **aynı turda** `schedule(DurationSeconds=30, TimerCondition="any")` zamanlayıcısını kurup turu bitirir.
+3. Kullanıcı 30 saniye içinde seçim yaparsa o modelle, yanıt gelmezse otomatik varsayılanla `agy -p` çalıştırılır:
+   - **Spec / Plan Review:** Antigravity Claude → `--provider agy --model claude-opus-5-5-medium` | Gemini / 30 sn timeout → `--provider agy --model gemini-4-carbon-high`
+   - **TDD Kapsam Denetimi:** Antigravity Claude → `--provider agy --model claude-sonnet-5-5-high` | Gemini / 30 sn timeout → `--provider agy --model gemini-4-neon-medium`
+4. Kod/betik dosyası değişen her dalda `gh pr create` ve yerel `git merge` öncesi taze `tdd-pass.json` (`criticalGaps == 0`, `importantGaps == 0`, güncel `codeTreeSha`) zorunludur.

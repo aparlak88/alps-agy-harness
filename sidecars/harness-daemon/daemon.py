@@ -412,7 +412,7 @@ class HarnessDaemonState:
         slug = harness_core.get_branch_slug(ws_path)
         state_mtimes: dict[str, int] = {}
         state_dir = ws_path / ".harness" / "state" / slug
-        for fn in ("canon-pass.json", "security-pass.json", "ui-pass.json", "pr-audit-pending.json"):
+        for fn in ("canon-pass.json", "security-pass.json", "tdd-pass.json", "ui-pass.json", "pr-audit-pending.json"):
             p = state_dir / fn
             if p.is_file():
                 try:

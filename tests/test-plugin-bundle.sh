@@ -417,9 +417,10 @@ EOF
   out_pr_blocked=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_pr_blocked" ".decision" "deny" "gh pr create before stamps must be denied"
 
-  # Stamp canon and security
+  # Stamp canon, security, and tdd
   "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Billing.ts"
   "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
 
   # PR create after stamps -> allowed
   local out_pr_allowed

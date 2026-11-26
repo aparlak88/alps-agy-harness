@@ -360,6 +360,7 @@ EOF
 
   "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$repo" --verdict PASS >/dev/null
   "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$repo" --verdict PASS --critical 0 --important 0 >/dev/null
+  "$REPO_ROOT/scripts/stamp-gate.sh" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high >/dev/null
 
   HARNESS_DAEMON_SOCK="$sock_path" \
   HARNESS_DAEMON_DATA_DIR="$data_dir" \
@@ -375,7 +376,7 @@ EOF
     "http://localhost/event/workspace-touch" >/dev/null
 
   local tree_cache="$repo/.harness/cache/tree-state.json"
-  _wait_for_file_jq "$tree_cache" '.canonStampValid == true and .securityStampValid == true' 40 || {
+  _wait_for_file_jq "$tree_cache" '.canonStampValid == true and .securityStampValid == true and .tddStampValid == true and .tddStampStatus == "fresh"' 40 || {
     echo "tree-state.json should report fresh stamps" >&2
     return 1
   }
@@ -386,7 +387,7 @@ EOF
 
   local new_head
   new_head=$(git -C "$repo" rev-parse HEAD)
-  _wait_for_file_jq "$tree_cache" ".headOid == \"$new_head\" and .canonStampStatus == \"stale\"" 50 || {
+  _wait_for_file_jq "$tree_cache" ".headOid == \"$new_head\" and .canonStampStatus == \"stale\" and .tddStampStatus == \"stale\"" 50 || {
     echo "tree-state.json did not invalidate stale stamps after new commit" >&2
     return 1
   }
@@ -395,6 +396,7 @@ EOF
   start_out=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' | HARNESS_DAEMON_SOCK="$sock_path" "$SESSION_START")
   start_msg=$(printf '%s' "$start_out" | jq -r '.injectSteps[0].systemMessage.systemMessage')
   assert_contains "$start_msg" "[DAEMON STAMP NOTICE]" "SessionStart must warn when stamps are stale"
+  assert_contains "$start_msg" "tdd-pass" "SessionStart stale stamp notice must include tdd-pass"
 
   mkdir -p "$repo/docs/walkthroughs"
   cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-19-stamps.md"
@@ -450,6 +452,10 @@ EOF
 
   "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$repo" --verdict PASS >/dev/null
   "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$repo" --verdict PASS --critical 0 --important 0 >/dev/null
+  "$REPO_ROOT/scripts/stamp-gate.sh" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high >/dev/null
+
+  _wait_for_file_jq "$repo/.harness/cache/tree-state.json" '.tddStampStatus == "fresh" and .tddStampValid == true' 50 \
+    || { echo "tree-state.json did not record fresh tddStampStatus" >&2; return 1; }
   _wait_for_file_jq "$repo/.harness/cache/doc-validation.json" \
     '.docs["docs/walkthroughs/2026-11-19-stamps.md"].walkthroughValid == true' 50 || {
     echo "doc-validation.json did not cache walkthroughValid == true" >&2
@@ -1009,6 +1015,7 @@ EOF
 
   "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$wt_admin" --verdict PASS --allow-file "src/AdminPage.ts" >/dev/null
   "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$wt_admin" --verdict PASS --critical 0 --important 0 >/dev/null
+  "$REPO_ROOT/scripts/stamp-gate.sh" tdd --workspace "$wt_admin" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high >/dev/null
 
   HARNESS_DAEMON_SOCK="$sock_path" \
   HARNESS_DAEMON_DATA_DIR="$data_dir" \

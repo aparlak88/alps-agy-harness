@@ -92,6 +92,11 @@ test_agents_md_no_frontmatter_and_under_8kb() {
   assert_contains "$content" "exit_plan_mode" "AGENTS.md must document two-phase Orchestrator exit_plan_mode handoff"
   assert_contains "$content" "run_workflow" "AGENTS.md must document run_workflow guard and model tiers"
   assert_contains "$content" "2026-11-30" "AGENTS.md must document 2026-11-30 model deprecation window"
+  assert_contains "$content" "stamp-gate.sh review" "AGENTS.md must document stamp-gate.sh review command"
+  assert_contains "$content" "tdd-pass.json" "AGENTS.md must document tdd-pass.json stamp"
+  assert_contains "$content" "claude -p" "AGENTS.md must document claude -p primary reviewer"
+  assert_contains "$content" "gemini-4-carbon-high" "AGENTS.md must document gemini-4-carbon-high timeout fallback"
+  assert_contains "$content" "gemini-4-neon-medium" "AGENTS.md must document gemini-4-neon-medium timeout fallback"
 }
 
 assert_platform_rule_contract() {

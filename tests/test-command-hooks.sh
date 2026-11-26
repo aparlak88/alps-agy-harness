@@ -411,6 +411,7 @@ EOF
   # Create valid stamps for current codeTreeSha
   "$STAMP_GATE" canon --verdict PASS --workspace "$repo"
   "$STAMP_GATE" security --verdict PASS --critical 0 --important 0 --workspace "$repo"
+  "$STAMP_GATE" tdd --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high --workspace "$repo"
 
   # Check 5: Drive-by modified file outside allowedFiles -> deny (even if documented in walkthrough)
   mkdir -p "$repo/src"
@@ -429,8 +430,9 @@ open(p, "w", encoding="utf-8").write(s.replace("## 4. Kritik İş Mantığı", e
   git -C "$repo" commit -m "drive by edit" --quiet
   # Restamp canon with allowedFiles restricting to src.js (current sha, but unrelated.ts not in allowedFiles)
   "$STAMP_GATE" canon --verdict PASS --allow-file "src.js" --workspace "$repo"
-  # Re-stamp security for current sha so stamp is fresh, but allowedFiles violation remains
+  # Re-stamp security & tdd for current sha so stamps are fresh, but allowedFiles violation remains
   "$STAMP_GATE" security --verdict PASS --critical 0 --important 0 --workspace "$repo"
+  "$STAMP_GATE" tdd --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high --workspace "$repo"
 
   local out_driveby
   out_driveby=$(printf '%s' "$p_pr_create" | "$PRE_COMMAND_GUARD")
@@ -442,6 +444,7 @@ open(p, "w", encoding="utf-8").write(s.replace("## 4. Kritik İş Mantığı", e
 
   "$STAMP_GATE" canon --verdict PASS --allow-file "src.js" --workspace "$repo"
   "$STAMP_GATE" security --verdict PASS --critical 0 --important 0 --workspace "$repo"
+  "$STAMP_GATE" tdd --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high --workspace "$repo"
 
   # All 5 checks satisfied -> allow!
   local out_all_pass
@@ -490,6 +493,7 @@ EOF
     --allow-file "src/LegacyHelper.ts" \
     --workspace "$repo"
   "$STAMP_GATE" security --verdict PASS --critical 0 --important 0 --workspace "$repo"
+  "$STAMP_GATE" tdd --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high --workspace "$repo"
 
   # Case 1: Walkthrough has 2 Mermaids + Glossary, but NO '## Dosya Bazlı Değişiklik Analizi' heading -> deny
   cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-12-orders.md"
@@ -902,6 +906,7 @@ EOF
 
   "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Feature.ts"
   "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
 
   local p_pr_create
   p_pr_create=$(jq -nc --arg ws "$repo" --arg cmd "gh pr create --fill" \
@@ -1145,6 +1150,7 @@ EOF
   git -C "$wt_feat" commit -m "feat: add feature and walkthrough" --quiet
   "$STAMP_GATE" canon --workspace "$wt_feat" --verdict PASS --allow-file "src/Feature.ts"
   "$STAMP_GATE" security --workspace "$wt_feat" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$wt_feat" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
 
   local out_pr_wt out_post_pr pending_wt
   out_pr_wt=$(jq -nc --arg ws "$main_repo" --arg cwd "$wt_feat" \
@@ -1229,6 +1235,7 @@ EOF
 
   "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/ui/Card.tsx"
   "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
 
   local p_pr p_merge out_pr_no_imp out_pr_deny out_merge_deny out_pr_allow out_merge_allow
   p_pr=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}}')
@@ -1302,6 +1309,185 @@ EOF
     out_byp_cmd=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_cmd" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' | "$PRE_COMMAND_GUARD")
     assert_json_field "$out_byp_cmd" ".decision" "deny" "Live guard must deny bypass: $bypass_cmd"
   done
+}
+
+test_tdd_gate_blocks_code_pr_and_merge_but_allows_doc_only() {
+  local repo
+  repo=$(make_temp_repo)
+  cat << 'EOF' > "$repo/README.md"
+# TDD Gate Test
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| TDD | Test güdümlü geliştirme |
+EOF
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+
+  # 1. Code branch without tdd-pass.json -> both gh pr create and local git merge denied
+  git -C "$repo" checkout -b "feat/calc" --quiet
+  mkdir -p "$repo/src" "$repo/docs/walkthroughs"
+  echo "export const add = (a: number, b: number) => a + b;" > "$repo/src/Calc.ts"
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-26-calc.md"
+# Walkthrough
+
+```mermaid
+flowchart LR
+  Input --> Calc
+```
+
+```mermaid
+sequenceDiagram
+  Caller->>Calc: add(1, 2)
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/Calc.ts` — [ÜRETİLDİ] (`Domain`)
+- **Ne Değişti / Ne Üretildi?:** Toplama işlemini gerçekleştiren saf `add` fonksiyonu `src/Calc.ts` dosyasına eklendi.
+- **Neden Değişti / Neden Üretildi?:** Kod değişikliği içeren dallarda `tdd-pass.json` PR ve yerel merge kapısını doğrulamak için üretildi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| TDD | Test güdümlü geliştirme |
+EOF
+  git -C "$repo" add src/Calc.ts docs/walkthroughs/2026-11-26-calc.md
+  git -C "$repo" commit -m "feat: add Calc" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Calc.ts"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  local p_pr p_merge out_pr_deny out_merge_deny out_pr_allow out_merge_allow
+  p_pr=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}}')
+  p_merge=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "git merge feat/calc"}}}')
+
+  out_pr_deny=$(printf '%s' "$p_pr" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_deny" ".decision" "deny" "gh pr create must deny without tdd-pass.json when code changed"
+  assert_contains "$(printf '%s' "$out_pr_deny" | jq -r '.reason')" "tdd stamp"
+
+  git -C "$repo" checkout main --quiet
+  out_merge_deny=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_deny" ".decision" "deny" "Local merge must deny without tdd-pass.json when code changed"
+  assert_contains "$(printf '%s' "$out_merge_deny" | jq -r '.reason')" "tdd-pass.json"
+
+  # 2. Stamp tdd-pass.json -> both gh pr create and local git merge allow
+  git -C "$repo" checkout feat/calc --quiet
+  "$STAMP_GATE" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high
+  out_pr_allow=$(printf '%s' "$p_pr" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_allow" ".decision" "allow" "gh pr create must allow after tdd-pass.json stamp"
+
+  git -C "$repo" checkout main --quiet
+  out_merge_allow=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_allow" ".decision" "allow" "Local merge must allow after tdd-pass.json stamp"
+
+  # 2b. C3 & I2: Local merge must deny FAIL 0/0, PASS with importantGaps=1, and stale tdd-pass.json (each unmasked)
+  local tdd_file="$repo/.harness/state/feat-calc/tdd-pass.json"
+  local out_merge_fail out_merge_imp out_merge_stale
+  jq -c '.verdict = "FAIL" | .criticalGaps = 0 | .importantGaps = 0' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
+  out_merge_fail=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_fail" ".decision" "deny" "Local merge must deny FAIL 0/0 tdd-pass.json"
+  jq -c '.verdict = "PASS" | .criticalGaps = 0 | .importantGaps = 1' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
+  out_merge_imp=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_imp" ".decision" "deny" "Local merge must deny importantGaps=1 tdd-pass.json"
+  jq -c '.verdict = "PASS" | .criticalGaps = 0 | .importantGaps = 0 | .codeTreeSha = "0000000000000000000000000000000000000000"' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
+  out_merge_stale=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_stale" ".decision" "deny" "Local merge must deny stale tdd-pass.json"
+
+  # 2c. C4: Deletion-only code branch must deny both gh pr create and local git merge without tdd-pass.json
+  mkdir -p "$repo/src"
+  echo "export const legacy = 1;" > "$repo/src/Legacy.ts"
+  git -C "$repo" add src/Legacy.ts
+  git -C "$repo" commit -m "chore: add Legacy.ts on main" --quiet
+  git -C "$repo" checkout -b "feat/del-legacy" --quiet
+  git -C "$repo" rm -f src/Legacy.ts --quiet
+  mkdir -p "$repo/docs/walkthroughs"
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-26-del.md"
+# Deletion Walkthrough
+
+```mermaid
+flowchart LR
+  Legacy --> Removed
+```
+
+```mermaid
+sequenceDiagram
+  Dev->>Git: rm Legacy.ts
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/Legacy.ts` — [SİLİNDİ] (`Domain`)
+- **Ne Değişti / Ne Üretildi?:** Eski `src/Legacy.ts` modülü tamamen kaldırıldı.
+- **Neden Değişti / Neden Üretildi?:** Silme-only kod dalında `tdd-pass.json` zorunluluğunu test etmek için silindi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Legacy | Kaldırılan eski modül |
+EOF
+  git -C "$repo" add docs/walkthroughs/2026-11-26-del.md
+  git -C "$repo" commit -m "refactor: remove Legacy.ts" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Legacy.ts"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  local out_del_pr out_del_merge p_del_merge
+  out_del_pr=$(printf '%s' "$p_pr" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_del_pr" ".decision" "deny" "Deletion-only code branch must deny gh pr create without tdd-pass.json"
+  assert_contains "$(printf '%s' "$out_del_pr" | jq -r '.reason')" "tdd stamp"
+  git -C "$repo" checkout main --quiet
+  p_del_merge=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "git merge feat/del-legacy"}}}')
+  out_del_merge=$(printf '%s' "$p_del_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_del_merge" ".decision" "deny" "Deletion-only code branch must deny local git merge without tdd-pass.json"
+  assert_contains "$(printf '%s' "$out_del_merge" | jq -r '.reason')" "tdd-pass.json"
+
+  # 3. Doc-only branch -> gh pr create allows without tdd-pass.json
+  git -C "$repo" checkout -b "docs/notes-only" --quiet
+  mkdir -p "$repo/docs/walkthroughs"
+  cat << 'EOF' > "$repo/docs/guide.md"
+# Guide
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Guide | Rehber |
+EOF
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-26-guide.md"
+# Doc Walkthrough
+
+```mermaid
+flowchart LR
+  Docs --> Guide
+```
+
+```mermaid
+sequenceDiagram
+  Reader->>Guide: read()
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `docs/guide.md` — [ÜRETİLDİ] (`Docs`)
+- **Ne Değişti / Ne Üretildi?:** Salt dokümantasyon rehberi `docs/guide.md` oluşturuldu.
+- **Neden Değişti / Neden Üretildi?:** Salt doküman PR'larında `tdd-pass.json` muafiyetini kanıtlamak için eklendi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Guide | Rehber |
+EOF
+  git -C "$repo" add docs/guide.md docs/walkthroughs/2026-11-26-guide.md
+  git -C "$repo" commit -m "docs: add guide" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  local out_doc_pr
+  out_doc_pr=$(printf '%s' "$p_pr" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_doc_pr" ".decision" "allow" "Doc-only PR must allow without tdd-pass.json"
 }
 
 run_tests
