@@ -260,6 +260,46 @@ def resolve_linked_worktree(
     return None
 
 
+def _is_path_within(parent: Path, child: Path) -> bool:
+    """Return True if ``child`` is equal to or nested inside ``parent``."""
+    try:
+        return os.path.commonpath([str(parent), str(child)]) == str(parent)
+    except ValueError:
+        return False
+
+
+def resolve_registered_submodule(
+    base_workspace: Path,
+    target_path: Path,
+    base_common_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Return the submodule root if ``target_path`` lies inside a registered Git submodule of ``base_workspace``."""
+    base_top, resolved_base_common = get_git_repo_identity(base_workspace)
+    if base_common_dir is None:
+        base_common_dir = resolved_base_common
+    if base_top is None or base_common_dir is None:
+        return None
+
+    target_top, target_common = get_git_repo_identity(target_path)
+    if target_top is None or target_common is None:
+        return None
+    if target_top == base_top or target_common == base_common_dir:
+        return None
+    if not _is_path_within(base_top, target_top):
+        return None
+
+    if _is_path_within(base_common_dir, target_common):
+        return target_top
+
+    rel_sub = os.path.relpath(str(target_top), str(base_top)).replace(os.sep, "/")
+    ls_res = _run_git(base_top, ["ls-files", "--stage", "--", rel_sub])
+    if ls_res.returncode == 0:
+        for line in ls_res.stdout.splitlines():
+            if line.startswith("160000 "):
+                return target_top
+    return None
+
+
 def list_linked_worktrees(workspace: Path) -> list[dict[str, str]]:
     """Return active non-bare git worktrees sharing ``workspace``'s repository."""
     res = _run_git(workspace, ["worktree", "list", "--porcelain"])
@@ -1485,6 +1525,10 @@ def evaluate_pre_edit(
                 if cand_wt is not None and cand_wt != real_ws:
                     linked_wt = cand_wt
                     break
+                cand_sub = resolve_registered_submodule(workspace, real_candidate)
+                if cand_sub is not None and cand_sub != real_ws:
+                    linked_wt = cand_sub
+                    break
             cur = cur.parent
 
     if linked_wt is not None:
@@ -2429,6 +2473,7 @@ SWARM_BRANCH_GUARD_HEADER = (
     "[SWARM_BRANCH_GUARD — Koda dokunmadan önce kendi özellik dalını aç "
     "(git checkout -b feat/<konu>-<ad>); detached HEAD veya main üzerinde kalma.]"
 )
+SWARM_SYSTEM_ROLE_RE = re.compile(r"^(?:monitor|narrator)(?:-\d+)?$")
 TIER_DEFAULT_EFFORT = {
     "trivial_lookup": "LOW",
     "bounded_execution": "MEDIUM",
@@ -2806,6 +2851,20 @@ def _try_consume_optional_dispatch(
     return entry, wt
 
 
+def _leading_bracket_header_block(text: str) -> str:
+    """Return contiguous leading ``[...]`` header lines before the first blank or body line."""
+    header_lines: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            break
+        if stripped.startswith("[") and stripped.endswith("]"):
+            header_lines.append(stripped)
+        else:
+            break
+    return "\n".join(header_lines)
+
+
 def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
     """Evaluate ``swarm`` PreToolUse guard with non-blocking brief enrichment."""
     if is_harness_ignored(workspace):
@@ -2826,11 +2885,14 @@ def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str,
     if action != "add":
         return {"decision": "allow"}
 
+    worker_name = str(args.get("name") or "").strip()
+    if worker_name and SWARM_SYSTEM_ROLE_RE.match(worker_name.lower()):
+        return {"decision": "allow"}
+
     brief = str(args.get("brief") or "")
     if not brief.strip():
         return {"decision": "allow"}
 
-    worker_name = str(args.get("name") or "").strip()
     ws_mode = str(args.get("workspace") or "inherit").strip().lower()
 
     effort = "MEDIUM"
@@ -2848,12 +2910,13 @@ def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str,
             if is_valid_effort_profile(reg_effort):
                 effort = reg_effort
 
+    leading_headers = _leading_bracket_header_block(brief)
     headers: list[str] = []
-    if "[EFFORT_PROFILE:" not in brief:
+    if "[EFFORT_PROFILE:" not in leading_headers:
         headers.append(EFFORT_PROFILE_HEADERS[effort])
-    if "[SWARM_WORKER_CONTRACT" not in brief:
+    if "[SWARM_WORKER_CONTRACT" not in leading_headers:
         headers.append(SWARM_WORKER_CONTRACT_HEADER)
-    if ws_mode in ("share", "branch") and "[SWARM_BRANCH_GUARD" not in brief:
+    if ws_mode in ("share", "branch") and "[SWARM_BRANCH_GUARD" not in leading_headers:
         headers.append(SWARM_BRANCH_GUARD_HEADER)
 
     if not headers:
@@ -4764,6 +4827,23 @@ def run_doctor_checks(
         add_check("gh_auth", "cli", "FAIL", f"GitHub CLI ({gh_cmd}) not installed", "brew install gh")
 
     # 2. Plugin Dependencies
+    def _plugin_entry_allows(plugin_name: str, include_only: Any, exclude: Any) -> bool:
+        def _pat_match(pat: str, target: str) -> bool:
+            if pat == target:
+                return True
+            try:
+                return bool(re.fullmatch(pat, target))
+            except re.error:
+                return False
+
+        if isinstance(include_only, list) and include_only:
+            if not any(isinstance(p, str) and _pat_match(p, plugin_name) for p in include_only):
+                return False
+        if isinstance(exclude, list):
+            if any(isinstance(p, str) and _pat_match(p, plugin_name) for p in exclude):
+                return False
+        return True
+
     def check_plugin(name: str) -> bool:
         if (cfg_dir / "plugins" / name).is_dir() or (workspace / ".agents" / "plugins" / name).is_dir():
             return True
@@ -4781,6 +4861,24 @@ def run_doctor_checks(
                                 for p in plugins_val:
                                     if (isinstance(p, dict) and p.get("name") == name) or p == name:
                                         return True
+                            entries_val = data.get("entries")
+                            if isinstance(entries_val, list):
+                                for entry in entries_val:
+                                    if not isinstance(entry, dict):
+                                        continue
+                                    raw_path = entry.get("path")
+                                    if not isinstance(raw_path, str) or not raw_path.strip():
+                                        continue
+                                    if not _plugin_entry_allows(name, entry.get("include_only"), entry.get("exclude")):
+                                        continue
+                                    expanded_p = os.path.expanduser(raw_path.strip())
+                                    if os.path.isabs(expanded_p):
+                                        cand_dirs = [Path(expanded_p)]
+                                    else:
+                                        cand_dirs = [base.parent / expanded_p, base / expanded_p, workspace / expanded_p]
+                                    for cdir in cand_dirs:
+                                        if (cdir / name).is_dir() or (cdir.name == name and cdir.is_dir()):
+                                            return True
                         elif isinstance(data, list) and name in data:
                             return True
                     except Exception:

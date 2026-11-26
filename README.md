@@ -1,4 +1,4 @@
-# Alps AGY Engineering Harness (`alps-agy-harness` — `v1.3.0`)
+# Alps AGY Engineering Harness (`alps-agy-harness` — `v1.3.1`)
 
 Google Antigravity (AGY) ortamı için kurumsal düzeyde deterministik mühendislik harness eklentisi.
 
@@ -48,20 +48,19 @@ Bu dosya mevcut olduğunda tüm hook'lar sessizce pasif geçer (`decision: allow
 ---
 
 ### Seçenek B: Proje Bazlı Kurulum
-Eklentiyi yalnızca belirli bir ekip projesine dahil etmek için projenin `.agents/plugins/` dizinine yerleştirin veya takım manifestosuna (`.agents/plugins.json`) kaydedin:
+Eklentiyi yalnızca belirli bir ekip projesine dahil etmek için projenin `.agents/plugins/` dizinine yerleştirin — Antigravity `.agents/plugins/alps-agy-harness` dizinini ek bir manifesto gerektirmeden **otomatik keşfeder**:
 
 ```bash
 mkdir -p .agents/plugins
 git submodule add https://github.com/aparlak88/alps-agy-harness.git .agents/plugins/alps-agy-harness
 ```
 
-Takım manifestosu (`.agents/plugins.json`):
+Eklentiyi standart `.agents/plugins/` dışında özel/paylaşılan bir dizinde barındırıyorsanız `.agents/plugins.json` dosyasını Antigravity'nin `entries` şemasıyla tanımlayın:
 ```json
 {
-  "plugins": [
+  "entries": [
     {
-      "name": "alps-agy-harness",
-      "path": "./.agents/plugins/alps-agy-harness"
+      "path": "tools/agents/plugins"
     }
   ]
 }
@@ -208,8 +207,8 @@ flowchart TD
 Antigravity Swarm (`/swarm` veya çoklu ajan iş akışı) kullanılırken harness hem koordinatörü hem paralel işçileri deterministik sınırlar içinde tutar:
 
 - **Tek Entegrasyon Dalı Topolojisi (`feat/*`):** Koordinatör `main` üzerinden tek bir `feat/<konu>` entegrasyon dalına geçer; `jev_classify`, `superpowers:brainstorming`, Spec ve Plan yalnızca burada bir kez yürütülür. Tüm işçi dalları tamamlandığında önce koordinatörün entegrasyon dalında birleştirilir; ardından tek bir bütünleşik `docs/walkthroughs/*.md` rehberi, `canon-auditor`, `security-reviewer`, `gh pr create` ve `pr-auditor` çalıştırılır.
-- **İzole Yazıcı Kopyaları (`workspace: "share"` + alt dal):** Kod yazan veya derleme/test çalıştıran işçiler `workspace: "share"` (veya tam izole klon için `"branch"`) ile başlatılır ve koda dokunmadan önce kendi alt dallarını (`git checkout -b feat/<konu>-<işçi>`) açar. Salt-okunur inceleme ve keşif işçileri ise `workspace: "inherit"` kullanır.
-- **`invoke_subagent|swarm|run_workflow` Kancası (`pre-subagent-guard.sh`):** `hooks.json` içindeki `PreToolUse` eşleştiricisi `invoke_subagent|swarm|run_workflow` desenini izler. `swarm(action="add")` çağrılarında işlemi engellemeden (`non-blocking overwrite`) `brief` başına `[EFFORT_PROFILE: ...]`, `[SWARM_WORKER_CONTRACT ...]` ve `share`/`branch` modlarında `[SWARM_BRANCH_GUARD ...]` başlıklarını ekler; `run_workflow` çağrılarında ise doğrudan `subprocess`/`os.system` atlatmalarını, gizli anahtarları ve geçersiz `model=...` katmanlarını reddeder. Aynı `Role` için paralel dispatch kayıtları `pendingQueues` ve `conversationId` yakınlığıyla çakışmasız tüketilir.
+- **İzole Yazıcı Kopyaları (`workspace: "share"` + alt dal):** Kod yazan veya derleme/test çalıştıran işçiler `workspace: "share"` (veya tam izole klon için `"branch"`) ile başlatılır ve koda dokunmadan önce kendi alt dallarını (`git checkout -b feat/<konu>-<işçi>`) açar. `workspace: "share"` kullanabilmek için çalışma alanının oturum başlamadan önce geçerli bir Git deposu olması gerekir (aksi halde IDE `VCS type Unknown` hatası dönebilir). Salt-okunur inceleme ve keşif işçileri ise `workspace: "inherit"` kullanır.
+- **`invoke_subagent|swarm|run_workflow` Kancası (`pre-subagent-guard.sh`):** `hooks.json` içindeki `PreToolUse` eşleştiricisi `invoke_subagent|swarm|run_workflow` desenini izler. `swarm(action="add")` çağrılarında işlemi engellemeden (`non-blocking overwrite`) `brief` başına `[EFFORT_PROFILE: ...]`, `[SWARM_WORKER_CONTRACT ...]` ve `share`/`branch` modlarında `[SWARM_BRANCH_GUARD ...]` başlıklarını ekler (yerleşik `monitor`/`monitor-N` ve `narrator`/`narrator-N` sistem rolleri muaf tutulur); `run_workflow` çağrılarında ise doğrudan `subprocess`/`os.system` atlatmalarını, gizli anahtarları ve geçersiz `model=...` katmanlarını reddeder. Aynı `Role` için paralel dispatch kayıtları `pendingQueues` ve `conversationId` yakınlığıyla çakışmasız tüketilir. Not: `PreToolUse` araç yürütülmeden önce çalıştığı için başarısız olan bir `swarm(action="add")` çağrısında da ilgili `subagent-dispatch.json` kaydı tükenmiş sayılır; yeniden denemede `stamp-gate.sh dispatch` tekrar çalıştırılmalıdır.
 - **Kararlı `detached-wt-*` Slug'ı:** Linked Git worktree'lerde `detached HEAD` durumunda `common.sh` ve `harness_core.py`, commit hash'ine bağlı değişen `detached-<7sha>` yerine worktree dizin adına sabitlenen `detached-wt-*` (`detached-wt-<ad>`) slug'ını üretir. Böylece işçi yeni commit attığında `.harness/state/detached-wt-<ad>/` altındaki `context7` ve diğer damgalar bozulmaz.
 - **Global Kurulum Önerisi:** Swarm'ın `workspace: "share"` ve `"branch"` modlarında oluşturduğu çalışma kopyalarının kancaları ve arka plan daemon'ını kesintisiz devralması için **Global Kurulum** (`~/.gemini/config/plugins/alps-agy-harness`) önerilir. Proje bazlı `.agents/plugins/` kurulumu kullanılıyorsa `./scripts/harness-doctor.sh` çıktıya `INFO` seviyesinde `swarm_install_advisory` uyarısı ekleyerek global kurulumu veya işçi klonlarında `--recurse-submodules` (`git submodule update --init --recursive`) kullanımını hatırlatır.
 
