@@ -1383,15 +1383,65 @@ EOF
   out_merge_allow=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_merge_allow" ".decision" "allow" "Local merge must allow after tdd-pass.json stamp"
 
-  # 2b. C3: Local merge must deny FAIL or stale tdd-pass.json
+  # 2b. C3 & I2: Local merge must deny FAIL 0/0, PASS with importantGaps=1, and stale tdd-pass.json (each unmasked)
   local tdd_file="$repo/.harness/state/feat-calc/tdd-pass.json"
-  local out_merge_fail out_merge_stale
-  jq -c '.verdict = "FAIL" | .criticalGaps = 1' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
+  local out_merge_fail out_merge_imp out_merge_stale
+  jq -c '.verdict = "FAIL" | .criticalGaps = 0 | .importantGaps = 0' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
   out_merge_fail=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
-  assert_json_field "$out_merge_fail" ".decision" "deny" "Local merge must deny FAIL tdd-pass.json"
-  jq -c '.verdict = "PASS" | .criticalGaps = 0 | .codeTreeSha = "0000000000000000000000000000000000000000"' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
+  assert_json_field "$out_merge_fail" ".decision" "deny" "Local merge must deny FAIL 0/0 tdd-pass.json"
+  jq -c '.verdict = "PASS" | .criticalGaps = 0 | .importantGaps = 1' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
+  out_merge_imp=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_imp" ".decision" "deny" "Local merge must deny importantGaps=1 tdd-pass.json"
+  jq -c '.verdict = "PASS" | .criticalGaps = 0 | .importantGaps = 0 | .codeTreeSha = "0000000000000000000000000000000000000000"' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
   out_merge_stale=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_merge_stale" ".decision" "deny" "Local merge must deny stale tdd-pass.json"
+
+  # 2c. C4: Deletion-only code branch must deny both gh pr create and local git merge without tdd-pass.json
+  mkdir -p "$repo/src"
+  echo "export const legacy = 1;" > "$repo/src/Legacy.ts"
+  git -C "$repo" add src/Legacy.ts
+  git -C "$repo" commit -m "chore: add Legacy.ts on main" --quiet
+  git -C "$repo" checkout -b "feat/del-legacy" --quiet
+  git -C "$repo" rm -f src/Legacy.ts --quiet
+  mkdir -p "$repo/docs/walkthroughs"
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-26-del.md"
+# Deletion Walkthrough
+
+```mermaid
+flowchart LR
+  Legacy --> Removed
+```
+
+```mermaid
+sequenceDiagram
+  Dev->>Git: rm Legacy.ts
+```
+
+## Dosya Bazlı Değişiklik Analizi
+
+### `src/Legacy.ts` — [SİLİNDİ] (`Domain`)
+- **Ne Değişti / Ne Üretildi?:** Eski `src/Legacy.ts` modülü tamamen kaldırıldı.
+- **Neden Değişti / Neden Üretildi?:** Silme-only kod dalında `tdd-pass.json` zorunluluğunu test etmek için silindi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Legacy | Kaldırılan eski modül |
+EOF
+  git -C "$repo" add docs/walkthroughs/2026-11-26-del.md
+  git -C "$repo" commit -m "refactor: remove Legacy.ts" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Legacy.ts"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+  local out_del_pr out_del_merge p_del_merge
+  out_del_pr=$(printf '%s' "$p_pr" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_del_pr" ".decision" "deny" "Deletion-only code branch must deny gh pr create without tdd-pass.json"
+  assert_contains "$(printf '%s' "$out_del_pr" | jq -r '.reason')" "tdd stamp"
+  git -C "$repo" checkout main --quiet
+  p_del_merge=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "git merge feat/del-legacy"}}}')
+  out_del_merge=$(printf '%s' "$p_del_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_del_merge" ".decision" "deny" "Deletion-only code branch must deny local git merge without tdd-pass.json"
+  assert_contains "$(printf '%s' "$out_del_merge" | jq -r '.reason')" "tdd-pass.json"
 
   # 3. Doc-only branch -> gh pr create allows without tdd-pass.json
   git -C "$repo" checkout -b "docs/notes-only" --quiet

@@ -387,7 +387,7 @@ EOF
 
   local new_head
   new_head=$(git -C "$repo" rev-parse HEAD)
-  _wait_for_file_jq "$tree_cache" ".headOid == \"$new_head\" and .canonStampStatus == \"stale\"" 50 || {
+  _wait_for_file_jq "$tree_cache" ".headOid == \"$new_head\" and .canonStampStatus == \"stale\" and .tddStampStatus == \"stale\"" 50 || {
     echo "tree-state.json did not invalidate stale stamps after new commit" >&2
     return 1
   }
@@ -396,6 +396,7 @@ EOF
   start_out=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' | HARNESS_DAEMON_SOCK="$sock_path" "$SESSION_START")
   start_msg=$(printf '%s' "$start_out" | jq -r '.injectSteps[0].systemMessage.systemMessage')
   assert_contains "$start_msg" "[DAEMON STAMP NOTICE]" "SessionStart must warn when stamps are stale"
+  assert_contains "$start_msg" "tdd-pass" "SessionStart stale stamp notice must include tdd-pass"
 
   mkdir -p "$repo/docs/walkthroughs"
   cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-19-stamps.md"
