@@ -3356,12 +3356,12 @@ def _is_trusted_harness_script_path(raw_script: str, seg_cwd: Path, workspace: P
     return False
 
 
-def _extract_stamp_gate_subcmd_and_action(args: list[str]) -> tuple[str, str]:
-    """Return ``(subcommand, first_sub_action)`` skipping ``--workspace`` flags."""
+def _extract_stamp_gate_subcmd_and_actions(args: list[str]) -> tuple[str, list[str]]:
+    """Return ``(subcommand, all_actions)`` skipping known value flags so overrides cannot hide."""
     i = 0
     n = len(args)
     subcmd = ""
-    sub_action = ""
+    actions: list[str] = []
     while i < n:
         tok = args[i]
         if tok == "--workspace":
@@ -3377,31 +3377,43 @@ def _extract_stamp_gate_subcmd_and_action(args: list[str]) -> tuple[str, str]:
             subcmd = tok
             i += 1
             continue
-        if tok == "--action" and i + 1 < n:
-            sub_action = args[i + 1]
-            break
+        if tok == "--action":
+            if i + 1 < n:
+                actions.append(args[i + 1])
+                i += 2
+            else:
+                actions.append("")
+                i += 1
+            continue
         if tok.startswith("--action="):
-            sub_action = tok[len("--action=") :]
-            break
+            actions.append(tok[len("--action=") :])
+            i += 1
+            continue
         if tok.startswith("-"):
             if tok in ("--conversation-id", "--title", "--resume-at", "--wait-seconds", "--buffer-seconds", "--window", "--model", "--reason", "--member", "--role", "--type", "--tier", "--parent-model", "--effort"):
                 i += 2
             else:
                 i += 1
             continue
-        sub_action = tok
-        break
-    return subcmd, sub_action
+        actions.append(tok)
+        i += 1
+    return subcmd, actions
 
 
 def _evaluate_coordinator_stamp_gate(args: list[str], workspace: Path) -> tuple[str, str]:
     """Evaluate ``stamp-gate.sh`` invocation for an active Swarm Coordinator."""
-    subcmd, sub_action = _extract_stamp_gate_subcmd_and_action(args)
+    subcmd, actions = _extract_stamp_gate_subcmd_and_actions(args)
     if subcmd not in COORDINATOR_STAMP_GATE_ALLOWED_SUBCMDS:
         return (
             "deny",
             f"Swarm Coordinator-Only guard: 'stamp-gate.sh {subcmd or '(missing)'}' is restricted to Swarm workers/integrator.",
         )
+    if subcmd in ("swarm-coordinator", "swarm-quota") and len(actions) > 1:
+        return (
+            "deny",
+            "Swarm Coordinator-Only guard: multiple or conflicting --action arguments in stamp-gate.sh are forbidden.",
+        )
+    sub_action = actions[0] if actions else ""
     if subcmd == "swarm-coordinator":
         if sub_action == "off":
             return (
@@ -3649,7 +3661,7 @@ def parse_quota_reset_epoch(
     dur_target = clause_m.group(1) if clause_m else text
     dur_re = re.compile(
         r"(?<![A-Za-z0-9-])(\d+(?:\.\d+)?)\s*"
-        r"(days?|d|hours?|hrs?|h|saat|minutes?|mins?|m|dakika|seconds?|secs?|s|saniye)"
+        r"(days?|d|gün|hours?|hrs?|h|saat|minutes?|mins?|m|dakika|seconds?|secs?|s|saniye)"
         r"(?![A-Za-z0-9-])(?!\s*[-–]?\s*(?:quota|limit|cap|window|kota))",
         re.IGNORECASE,
     )
@@ -3659,7 +3671,7 @@ def parse_quota_reset_epoch(
         val = float(m.group(1))
         unit = m.group(2).lower()
         matched_any = True
-        if unit in ("d", "day", "days"):
+        if unit in ("d", "day", "days", "gün"):
             total_sec += val * 86400.0
         elif unit in ("h", "hr", "hrs", "hour", "hours", "saat"):
             total_sec += val * 3600.0
@@ -3727,8 +3739,6 @@ def record_swarm_quota_pause(
 
     inferred_window = window.strip().lower() if window.strip() else ""
     if inferred_window not in ("5h", "weekly", "unknown"):
-        inferred_window = classify_quota_window(reason, wait_seconds=(target_epoch - now))
-    elif not inferred_window:
         inferred_window = classify_quota_window(reason, wait_seconds=(target_epoch - now))
 
     clean_conv = conversation_id.strip()

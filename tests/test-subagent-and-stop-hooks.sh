@@ -2029,6 +2029,81 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
     toolCall: {name: "swarm", args: {action: "model", name: "implementer-1", model: "gemini-4-hydrogen-high"}}
   }' | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_model_ok" ".decision" "allow" "swarm(model) allowed again after quota resume"
+
+  # 5. First swarm(action="add") auto-registers Coordinator when not previously registered;
+  #    add after explicit off does NOT re-enable; worker-prompt title & linked worktree add do NOT register;
+  #    integrator role variants & empty conversationId Pure-Wait guard also verified.
+  local auto_repo
+  auto_repo=$(make_temp_repo)
+  printf '%s' "$(jq -nc --arg ws "$auto_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-auto",
+    toolCall: {name: "swarm", args: {action: "add", name: "worker-auto", workspace: "share", brief: "Work."}}
+  }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-auto"].active' "true" "First swarm(add) must auto-register caller as Coordinator"
+
+  local out_auto_sub
+  out_auto_sub=$(jq -nc --arg ws "$auto_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-auto",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "research", Role: "R", Prompt: "Scan."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_auto_sub" ".decision" "deny" "Auto-registered coordinator must be denied invoke_subagent"
+
+  "$STAMP_GATE" swarm-coordinator off --workspace "$auto_repo" --conversation-id "conv-auto" >/dev/null
+  printf '%s' "$(jq -nc --arg ws "$auto_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-auto",
+    toolCall: {name: "swarm", args: {action: "add", name: "worker-2", workspace: "share", brief: "Work 2."}}
+  }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-auto"].active' "false" "swarm(add) after off must not re-enable Coordinator guard"
+  assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-auto"].explicitlyDisabled' "true"
+
+  # Worker-prompt swarm(title) must not register Coordinator
+  printf '%s' "$(jq -nc --arg ws "$auto_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-worker-title",
+    lastUserInput: "[SWARM_WORKER_CONTRACT] task",
+    toolCall: {name: "swarm", args: {action: "title", title: "Worker Sub"}}
+  }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-worker-title"] == null' "true"
+
+  # Linked-worktree swarm(add) must not register Coordinator
+  echo "init" > "$auto_repo/README.md"
+  git -C "$auto_repo" add README.md
+  git -C "$auto_repo" commit -m "chore: init" --quiet
+  local auto_wt
+  auto_wt=$(mktemp -d "${TMPDIR:-/tmp}/swarm-wt-auto.XXXXXX")
+  _TEST_TEMP_DIRS+=("$auto_wt")
+  git -C "$auto_repo" worktree add "$auto_wt" -b "feat/wt-helper" --quiet
+  printf '%s' "$(jq -nc --arg ws "$auto_repo" --arg cwd "$auto_wt" '{
+    workspacePaths: [$ws],
+    cwd: $cwd,
+    conversationId: "conv-wt-helper",
+    toolCall: {name: "swarm", args: {action: "add", name: "helper-wt", workspace: "inherit", brief: "Sub."}}
+  }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-wt-helper"] == null' "true" "Linked worktree swarm(add) must not register Coordinator"
+
+  # Integrator role variants receive [SWARM_INTEGRATOR_CONTRACT]
+  local int_role
+  for int_role in "release" "pr-shepherd" "integrator-2"; do
+    local out_ir
+    out_ir=$(jq -nc --arg ws "$repo" --arg r "$int_role" '{
+      workspacePaths: [$ws],
+      conversationId: "conv-coord",
+      toolCall: {name: "swarm", args: {action: "add", name: $r, workspace: "share", brief: "Integrate."}}
+    }' | "$PRE_SUBAGENT_GUARD")
+    assert_contains "$(printf '%s' "$out_ir" | jq -r '.overwrite.brief')" "[SWARM_INTEGRATOR_CONTRACT"
+  done
+
+  # Empty conversationId still triggers force_ask when active quota wait matches workspace
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 300 --buffer-seconds 0 >/dev/null
+  local out_empty_ask
+  out_empty_ask=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "swarm", args: {action: "model", name: "implementer-1", model: "gemini-4-hydrogen-high"}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_empty_ask" ".decision" "force_ask" "swarm(model) with empty conversationId must still trigger force_ask during active wait"
 }
 
 test_stop_gate_detects_coordinator_quota_error_without_looping() {

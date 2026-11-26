@@ -1436,18 +1436,21 @@ EOF
 
   on_ed=$(printf '%s' "$p_ed" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD" | jq -c .)
   off_ed=$(printf '%s' "$p_ed" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD" | jq -c .)
+  assert_json_field "$on_ed" ".decision" "deny"
   assert_eq "$off_ed" "$on_ed" "pre-edit Coordinator-Only parity"
 
   on_cmd=$(printf '%s' "$p_cmd" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD" | jq -c .)
   off_cmd=$(printf '%s' "$p_cmd" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD" | jq -c .)
+  assert_json_field "$on_cmd" ".decision" "deny"
   assert_eq "$off_cmd" "$on_cmd" "pre-command Coordinator-Only parity"
 
   on_sub=$(printf '%s' "$p_sub" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" | jq -c .)
   off_sub=$(printf '%s' "$p_sub" | HARNESS_DISABLE_DAEMON="1" "$PRE_SUBAGENT_GUARD" | jq -c .)
+  assert_json_field "$on_sub" ".decision" "deny"
   assert_eq "$off_sub" "$on_sub" "pre-subagent Coordinator-Only parity"
 
   # 2. stamp-gate.sh swarm-quota pause from relative --workspace . arms daemon automatically,
-  #    in-flight deduplication holds attempt count at 1 behind barrier, TTL eviction is bypassed, and attempt 2 resumes.
+  #    in-flight deduplication holds attempt count at 1 behind barrier past stale threshold, and attempt 2 resumes.
   printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "swarm", args: {action: "add", name: "worker-1", workspace: "share", brief: "Work."}}}')" \
     | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" >/dev/null
 
@@ -1460,11 +1463,12 @@ EOF
   done
   [ -f "$started_flag" ] || { echo "stamp-gate.sh pause --workspace . did not trigger daemon auto-resume" >&2; return 1; }
 
-  # While attempt 1 is blocked behind barrier, verify in-flight dedup (count == 1) & /health quotaWaits == 1
+  # Sleep past HARNESS_SWARM_STALE_RESUMING_SEC (0.3s) across multiple 0.1s watcher cycles while attempt 1 holds barrier
+  sleep 0.45
   local health_json
   health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
   assert_json_field "$health_json" ".quotaWaits" "1"
-  assert_eq "1" "$(cat "$attempt_file")" "In-flight deduplication must keep attempt count at 1 while barrier is held"
+  assert_eq "1" "$(cat "$attempt_file")" "In-flight deduplication must hold attempt count at 1 past stale threshold while barrier is held"
 
   # Release barrier -> attempt 1 fails with 429 -> backoff -> attempt 2 succeeds -> status == resumed
   touch "$release_flag"
@@ -1491,7 +1495,7 @@ EOF
   HARNESS_DAEMON_DATA_DIR="$data_dir" \
   HARNESS_SKIP_SHELL_PATH_SYNC="1" \
   HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
-  HARNESS_DAEMON_WORKSPACE_TTL_SEC="0.5" \
+  HARNESS_DAEMON_WORKSPACE_TTL_SEC="2.0" \
   HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
   HARNESS_SWARM_STALE_RESUMING_SEC="0.3" \
   HARNESS_AGY_BIN="$mock_agy" \
@@ -1538,6 +1542,44 @@ EOF
   assert_json_field "$quota_file" ".source" "stop-error"
   _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
     || { echo "Daemon did not auto-resume Stop(ERROR) quota wait: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
+
+  # 7. I8: Isolated /event/swarm-quota-wait arming on unregistered workspaces under 30s poll interval
+  local long_sock_dir long_data_dir long_sock long_dpid always_ok_agy
+  long_sock_dir=$(mktemp -d "/tmp/hd-swq-ev.XXXXXX")
+  long_data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-swq-evd.XXXXXX")
+  _TD_DIRS+=("$long_sock_dir" "$long_data_dir")
+  long_sock="$long_sock_dir/d.sock"
+  always_ok_agy="$mock_dir/always-ok-agy"
+  cat << 'EOF' > "$always_ok_agy"
+#!/usr/bin/env bash
+echo "Quota restored."
+exit 0
+EOF
+  chmod +x "$always_ok_agy"
+
+  HARNESS_DAEMON_SOCK="$long_sock" \
+  HARNESS_DAEMON_DATA_DIR="$long_data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="30" \
+  HARNESS_AGY_BIN="$always_ok_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  long_dpid=$!
+  _TD_PIDS+=("$long_dpid")
+  _wait_for_socket_health "$long_sock" 50 || { echo "Long-poll daemon failed to start" >&2; return 1; }
+
+  local unreg_a unreg_b ev_raw ev_code ev_body
+  unreg_a=$(make_temp_repo)
+  HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-quota pause --workspace "$unreg_a" --conversation-id "conv-eva" --wait-seconds 600 --buffer-seconds 0 >/dev/null
+  ev_raw=$(jq -nc --arg ws "$unreg_a" '{workspace: $ws}' | curl -s -w '\n%{http_code}' --unix-socket "$long_sock" -H "Content-Type: application/json" -X POST --data-binary @- "http://localhost/event/swarm-quota-wait")
+  ev_code=$(printf '%s\n' "$ev_raw" | tail -n 1)
+  ev_body=$(printf '%s\n' "$ev_raw" | sed '$d')
+  assert_eq "202" "$ev_code" "POST /event/swarm-quota-wait must return 202 for valid active workspace"
+  assert_json_field "$ev_body" ".armed" "true"
+
+  unreg_b=$(make_temp_repo)
+  (cd "$unreg_b" && HARNESS_DAEMON_SOCK="$long_sock" "$STAMP_GATE" swarm-quota pause --workspace "." --conversation-id "conv-evb" --wait-seconds 0 --buffer-seconds 0 >/dev/null)
+  _wait_for_file_jq "$unreg_b/.harness/state/swarm/swarm-quota-wait.json" '.status == "resumed"' 40 \
+    || { echo "stamp-gate pause must immediately wake daemon via /event/swarm-quota-wait even under 30s poll" >&2; return 1; }
 }
 
 run_tests "$@"

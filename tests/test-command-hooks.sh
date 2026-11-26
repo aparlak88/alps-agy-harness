@@ -1521,6 +1521,14 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "./scripts/harness-doctor.sh --json" \
     "gh pr list" \
     "find . -maxdepth 2 -name '*.md'" \
+    "grep '>' README.md" \
+    "env FOO=bar git status" \
+    "./scripts/stamp-gate.sh swarm-coordinator on --workspace \"$repo\" --conversation-id \"conv-coord\"" \
+    "./scripts/stamp-gate.sh swarm-quota pause --workspace \"$repo\" --conversation-id \"conv-coord\" --wait-seconds 60" \
+    "./scripts/stamp-gate.sh dispatch --workspace \"$repo\" --role explorer" \
+    "./scripts/stamp-gate.sh select-model --workspace \"$repo\" --tier pro" \
+    "./scripts/stamp-gate.sh tree-sha --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh verify-pr-stamps --workspace \"$repo\"" \
     "git status >/dev/null 2>&1"
   do
     local out_ok
@@ -1530,7 +1538,17 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     assert_json_field "$out_ok" ".decision" "allow" "Coordinator must allow read-only/coordination command: $allowed_cmd"
   done
 
-  # 2. Denied work, mutation, shell bypass, basename spoof, self-disable, and PR/stamp commands
+  # Clear any active pause written by the allowed swarm-quota pause command before resume tests
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+
+  # 2. Denied work, mutation, shell bypass, basename spoof, self-disable, --action override, and PR/stamp commands
+  local out_env_s
+  out_env_s=$(jq -nc --arg ws "$repo" --arg cmd 'env -S "rm -rf src"' \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_env_s" ".decision" "deny"
+  assert_contains "$(printf '%s' "$out_env_s" | jq -r '.reason')" "env -S"
+
   local denied_cmd
   for denied_cmd in \
     "npm test" \
@@ -1540,23 +1558,33 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git merge feat/worker" \
     "git push origin feat/coord-cmd" \
     "git branch -D old-branch" \
+    "git branch -m old-branch new-branch" \
     "git branch --set-upstream-to=origin/main" \
     "git branch new-branch" \
     "git -c core.fsmonitor=evil status" \
     "GIT_EXTERNAL_DIFF=evil git diff" \
+    "PATH=/tmp/evil git status" \
+    "sudo git status" \
+    "env GIT_EXTERNAL_DIFF=evil git status" \
+    "env FOO=bar npm test" \
     "git diff --output=out.txt" \
     "git remote add origin https://example.com/r.git" \
     "git tag v1.0" \
+    "git tag -d v1.0" \
     "git worktree add /tmp/wt" \
     "gh pr create --fill" \
+    "gh pr merge 1" \
+    "bash -c 'echo hi'" \
     "rm -rf src" \
     "env -S \"rm -rf src\"" \
     "sort -o README.md README.md" \
+    "sort --output=README.md README.md" \
     "uniq README.md out.txt" \
     "rg --pre evil pat" \
     "/tmp/fake/stamp-gate.sh dispatch" \
     "./cat README.md" \
     "echo bad > README.md" \
+    "echo bad >| README.md" \
     "echo bad >> README.md" \
     "echo bad &> out.txt" \
     'echo $(touch /tmp/pwned)' \
@@ -1564,11 +1592,18 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "cat <(id)" \
     "find . -name '*.tmp' -delete" \
     "find . -exec rm {} \\;" \
+    "find . -fprint out.txt" \
     "bash ./scripts/stamp-gate.sh canon --verdict PASS" \
     "./scripts/stamp-gate.sh canon --verdict PASS" \
     "./scripts/stamp-gate.sh security --verdict PASS --critical 0 --important 0" \
     "./scripts/stamp-gate.sh swarm-coordinator off --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-coordinator status --action off --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-coordinator status --action=off --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-quota clear --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota status --action clear --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota status --action=clear --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota status --action resume --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota status --action=resume --workspace \"$repo\"" \
     "python3 -c 'print(1)'"
   do
     local out_bad

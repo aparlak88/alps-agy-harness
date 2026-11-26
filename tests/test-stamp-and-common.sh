@@ -1464,7 +1464,13 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
   assert_json_field "$out_clr" ".cleared" "true"
   [ ! -f "$quota_file" ] || { echo "swarm-quota clear must remove $quota_file" >&2; return 1; }
 
-  # 3. Invalid CLI flags & missing actions fail closed
+  # 3. Invalid CLI flags, conflicting --action, & missing actions fail closed without mutating state
+  "$STAMP_GATE" swarm-coordinator on --workspace "$repo" --conversation-id "conv-inv" --title "Keep Me" >/dev/null
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-inv" --wait-seconds 500 --buffer-seconds 0 --window 5h >/dev/null
+  local coord_snap quota_snap
+  coord_snap=$(cat "$coord_file")
+  quota_snap=$(cat "$quota_file")
+
   local bad_args
   for bad_args in \
     "swarm-quota pause --resume-at not-a-timestamp" \
@@ -1473,8 +1479,12 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
     "swarm-quota pause --buffer-seconds abc" \
     "swarm-quota" \
     "swarm-quota pause --unknown-flag" \
+    "swarm-quota status --action clear" \
+    "swarm-quota status --action=clear" \
     "swarm-coordinator" \
-    "swarm-coordinator bogus"
+    "swarm-coordinator bogus" \
+    "swarm-coordinator status --action off" \
+    "swarm-coordinator status --action=off"
   do
     # shellcheck disable=SC2086
     if "$STAMP_GATE" --workspace "$repo" $bad_args >/dev/null 2>&1; then
@@ -1482,6 +1492,9 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
       return 1
     fi
   done
+  assert_eq "$coord_snap" "$(cat "$coord_file")" "Invalid CLI args must not mutate swarm-coordinator.json"
+  assert_eq "$quota_snap" "$(cat "$quota_file")" "Invalid CLI args must not mutate swarm-quota-wait.json"
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
 
   # 4. swarm-quota attempt-resume failure, security, false-positive, and mid-flight re-pause/clear coverage
   local mock_dir mock_agy env_log
@@ -1590,6 +1603,133 @@ EOF
   out_mid_clr=$(HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
   assert_json_field "$out_mid_clr" ".status" "cleared"
   [ ! -f "$quota_file" ] || { echo "Mid-flight clear must keep swarm-quota-wait.json deleted" >&2; return 1; }
+
+  # (h) C2: Early attempt-resume before nextProbeEpoch does NOT invoke agy and stays waiting
+  local invoked_flag="$mock_dir/agy.invoked"
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+touch "$invoked_flag"
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 600 --buffer-seconds 0 >/dev/null
+  local out_early
+  out_early=$(HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_early" ".status" "waiting"
+  [ ! -f "$invoked_flag" ] || { echo "attempt-resume before nextProbeEpoch must not invoke agy" >&2; return 1; }
+
+  # (i) I5: Re-pausing during active wait preserves conversationId, model, pausedMembers, pausedAt, attemptCount
+  jq '.model = "gemini-4-neon-high" | .pausedMembers = ["worker-a"] | .attemptCount = 2 | .pausedAt = "2026-01-01T00:00:00Z"' \
+    "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  local out_active_repause
+  out_active_repause=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --wait-seconds 300 --buffer-seconds 0 --member "worker-b")
+  assert_json_field "$out_active_repause" ".conversationId" "conv-r" "Active-wait re-pause must keep conversationId"
+  assert_json_field "$out_active_repause" ".model" "gemini-4-neon-high" "Active-wait re-pause must keep model"
+  assert_json_field "$out_active_repause" '.pausedMembers | join(",")' "worker-a,worker-b" "Active-wait re-pause must merge pausedMembers"
+  assert_json_field "$out_active_repause" ".pausedAt" "2026-01-01T00:00:00Z" "Active-wait re-pause must keep pausedAt"
+  assert_json_field "$out_active_repause" ".attemptCount" "2" "Active-wait re-pause must keep attemptCount"
+
+  # (j) I6: Exit 0 with quota error on stdout must fail & stay waiting
+  cat << 'EOF' > "$mock_agy"
+#!/usr/bin/env bash
+echo "Error: 429 RESOURCE_EXHAUSTED quota exceeded"
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_stdout_q
+  out_stdout_q=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="30" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_stdout_q" ".status" "waiting" "Stdout quota error on exit 0 must keep waiting"
+
+  # (k) C3: Explicit reset in stderr & capped exponential backoff computation (clear prior wait first)
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  cat << 'EOF' > "$mock_agy"
+#!/usr/bin/env bash
+echo "429 RESOURCE_EXHAUSTED: resets in 120s" >&2
+exit 1
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local before_ep out_exp_rst next_ep_rst
+  before_ep=$(date +%s)
+  out_exp_rst=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="10" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_exp_rst" ".status" "waiting"
+  assert_json_field "$out_exp_rst" ".attemptCount" "1"
+  next_ep_rst=$(printf '%s' "$out_exp_rst" | jq -r '.nextProbeEpoch | floor')
+  [ "$next_ep_rst" -ge $((before_ep + 100)) ] || { echo "Expected explicit reset nextProbeEpoch >= $((before_ep + 100)), got $next_ep_rst" >&2; return 1; }
+
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  cat << 'EOF' > "$mock_agy"
+#!/usr/bin/env bash
+echo "503 Service overloaded" >&2
+exit 1
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local b1 b2 b3 o1 o2 o3 d1 d2 d3
+  b1=$(date +%s)
+  o1=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="2" HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="5" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  d1=$(printf '%s' "$o1" | jq -r --argjson b "$b1" '(.nextProbeEpoch - $b) | round')
+  [ "$d1" -ge 1 ] && [ "$d1" -le 4 ] || { echo "Backoff attempt 1 expected ~2s, got ${d1}s" >&2; return 1; }
+
+  jq '.nextProbeEpoch = 1' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  b2=$(date +%s)
+  o2=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="2" HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="5" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  d2=$(printf '%s' "$o2" | jq -r --argjson b "$b2" '(.nextProbeEpoch - $b) | round')
+  [ "$d2" -ge 3 ] && [ "$d2" -le 6 ] || { echo "Backoff attempt 2 expected ~4s, got ${d2}s" >&2; return 1; }
+
+  jq '.nextProbeEpoch = 1' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  b3=$(date +%s)
+  o3=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="2" HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="5" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  d3=$(printf '%s' "$o3" | jq -r --argjson b "$b3" '(.nextProbeEpoch - $b) | round')
+  [ "$d3" -ge 4 ] && [ "$d3" -le 7 ] || { echo "Backoff attempt 3 expected capped ~5s (not 8s), got ${d3}s" >&2; return 1; }
+
+  # (l) I7: Direct attempt-resume against fresh 'resuming' state must skip agy & preserve token
+  rm -f "$invoked_flag"
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+touch "$invoked_flag"
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  local now_fresh
+  now_fresh=$(date +%s)
+  jq --argjson n "$now_fresh" '.status = "resuming" | .resumingStartedAtEpoch = $n | .resumingToken = "fresh-tok"' \
+    "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  local out_fresh_res
+  out_fresh_res=$(HARNESS_AGY_BIN="$mock_agy" HARNESS_SWARM_STALE_RESUMING_SEC="60" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_fresh_res" ".status" "resuming"
+  assert_json_field "$out_fresh_res" ".resumingToken" "fresh-tok"
+  [ ! -f "$invoked_flag" ] || { echo "Fresh resuming state must skip duplicate agy invocation" >&2; return 1; }
+
+  # Token mismatch during agy flight must preserve overriding resuming state
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+jq '.resumingToken = "other-worker-tok"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_tok_mis
+  out_tok_mis=$(HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_tok_mis" ".status" "resuming"
+  assert_json_field "$out_tok_mis" ".resumingToken" "other-worker-tok"
+
+  # (m) I9: Duration parsing unit coverage (minutes, seconds, Turkish units, negative lookahead)
+  PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import harness_core
+now = 1700000000.0
+ep, ex = harness_core.parse_quota_reset_epoch("try again in 45m", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 2700.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("retry after 90s", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 90.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("2 saat 30 dakika sonra", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 9000.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("1 gün 30 saniye", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 86430.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("5h quota exceeded", now_epoch=now, buffer_sec=0)
+assert not ex, (ep, ex)
+PYEOF
 }
 
 run_tests "$@"

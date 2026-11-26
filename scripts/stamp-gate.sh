@@ -805,10 +805,12 @@ cmd_swarm_coordinator() {
     case "$1" in
       --action)
         [ $# -ge 2 ] || { echo "Error: --action requires on, off, or status" >&2; exit 1; }
+        [ -z "$action" ] || { echo "Error: duplicate or conflicting --action flag" >&2; exit 1; }
         action="$2"
         shift 2
         ;;
       --action=*)
+        [ -z "$action" ] || { echo "Error: duplicate or conflicting --action flag" >&2; exit 1; }
         action="${1#--action=}"
         shift
         ;;
@@ -873,10 +875,12 @@ cmd_swarm_quota() {
     case "$1" in
       --action)
         [ $# -ge 2 ] || { echo "Error: --action requires pause, resume, status, clear, or attempt-resume" >&2; exit 1; }
+        [ -z "$action" ] || { echo "Error: duplicate or conflicting --action flag" >&2; exit 1; }
         action="$2"
         shift 2
         ;;
       --action=*)
+        [ -z "$action" ] || { echo "Error: duplicate or conflicting --action flag" >&2; exit 1; }
         action="${1#--action=}"
         shift
         ;;
