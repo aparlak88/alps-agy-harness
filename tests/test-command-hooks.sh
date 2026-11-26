@@ -1383,6 +1383,16 @@ EOF
   out_merge_allow=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_merge_allow" ".decision" "allow" "Local merge must allow after tdd-pass.json stamp"
 
+  # 2b. C3: Local merge must deny FAIL or stale tdd-pass.json
+  local tdd_file="$repo/.harness/state/feat-calc/tdd-pass.json"
+  local out_merge_fail out_merge_stale
+  jq -c '.verdict = "FAIL" | .criticalGaps = 1' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
+  out_merge_fail=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_fail" ".decision" "deny" "Local merge must deny FAIL tdd-pass.json"
+  jq -c '.verdict = "PASS" | .criticalGaps = 0 | .codeTreeSha = "0000000000000000000000000000000000000000"' "$tdd_file" > "$tdd_file.tmp" && mv "$tdd_file.tmp" "$tdd_file"
+  out_merge_stale=$(printf '%s' "$p_merge" | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_stale" ".decision" "deny" "Local merge must deny stale tdd-pass.json"
+
   # 3. Doc-only branch -> gh pr create allows without tdd-pass.json
   git -C "$repo" checkout -b "docs/notes-only" --quiet
   mkdir -p "$repo/docs/walkthroughs"

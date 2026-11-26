@@ -376,7 +376,7 @@ EOF
     "http://localhost/event/workspace-touch" >/dev/null
 
   local tree_cache="$repo/.harness/cache/tree-state.json"
-  _wait_for_file_jq "$tree_cache" '.canonStampValid == true and .securityStampValid == true' 40 || {
+  _wait_for_file_jq "$tree_cache" '.canonStampValid == true and .securityStampValid == true and .tddStampValid == true and .tddStampStatus == "fresh"' 40 || {
     echo "tree-state.json should report fresh stamps" >&2
     return 1
   }
@@ -452,6 +452,9 @@ EOF
   "$REPO_ROOT/scripts/stamp-gate.sh" canon --workspace "$repo" --verdict PASS >/dev/null
   "$REPO_ROOT/scripts/stamp-gate.sh" security --workspace "$repo" --verdict PASS --critical 0 --important 0 >/dev/null
   "$REPO_ROOT/scripts/stamp-gate.sh" tdd --workspace "$repo" --verdict PASS --critical-gaps 0 --important-gaps 0 --provider claude-cli --model sonnet --effort high >/dev/null
+
+  _wait_for_file_jq "$repo/.harness/cache/tree-state.json" '.tddStampStatus == "fresh" and .tddStampValid == true' 50 \
+    || { echo "tree-state.json did not record fresh tddStampStatus" >&2; return 1; }
   _wait_for_file_jq "$repo/.harness/cache/doc-validation.json" \
     '.docs["docs/walkthroughs/2026-11-19-stamps.md"].walkthroughValid == true' 50 || {
     echo "doc-validation.json did not cache walkthroughValid == true" >&2

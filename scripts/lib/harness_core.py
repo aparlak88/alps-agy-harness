@@ -1180,6 +1180,7 @@ def verify_pr_stamps(
     workspace: Path,
     diff_files: Optional[list[str]] = None,
     config_dir: Optional[Path] = None,
+    tdd_diff_files: Optional[list[str]] = None,
 ) -> tuple[bool, str]:
     """Verify canon-pass.json, security-pass.json, conditional tdd-pass.json, and conditional ui-pass.json against HEAD codeTreeSha."""
     live_head = get_head_oid(workspace)
@@ -1226,7 +1227,7 @@ def verify_pr_stamps(
             f"Error: verify-pr-stamps failed: security-pass.json codeTreeSha ({sec_sha}) does not match current HEAD codeTreeSha ({current_sha})",
         )
 
-    need_tdd, _ = requires_tdd_stamp(workspace, diff_files=diff_files)
+    need_tdd, _ = requires_tdd_stamp(workspace, diff_files=tdd_diff_files if tdd_diff_files is not None else diff_files)
     if need_tdd and not tdd_file.is_file():
         return (
             False,
@@ -2033,7 +2034,7 @@ def evaluate_pre_command(
                                 "reason": f"Local merge stamps for '{target_branch}' do not match target branch codeTreeSha ({target_tree_sha}) or verdict is not PASS",
                             }
 
-                        need_tdd, _ = requires_tdd_stamp(wt_for_branch or seg_ws, diff_files=diff_files)
+                        need_tdd, _ = requires_tdd_stamp(wt_for_branch or seg_ws, diff_files=all_merge_diff)
                         tdd_path = target_state_dir / "tdd-pass.json"
                         if not tdd_path.is_file() and wt_for_branch is not None:
                             wt_tdd = wt_for_branch / ".harness" / "state" / target_slug / "tdd-pass.json"
@@ -2252,7 +2253,7 @@ def evaluate_pre_command(
                                     "reason": f"PR creation blocked: documentation file '{f}' is missing a valid Technical Glossary / Teknik Terimler Sözlüğü section.",
                                 }
 
-                stamps_ok, verify_err = verify_pr_stamps(seg_ws, diff_files=diff_files)
+                stamps_ok, verify_err = verify_pr_stamps(seg_ws, diff_files=diff_files, tdd_diff_files=all_diff)
                 if not stamps_ok:
                     return {
                         "decision": "deny",
@@ -3498,14 +3499,22 @@ def detect_impeccable(
     }
 
 
-def _collect_branch_diff_files(workspace: Path, target_ref: str = "HEAD") -> list[str]:
-    """Return ACMR changed file paths relative to base branch merge-base."""
+def _collect_branch_diff_files(
+    workspace: Path,
+    target_ref: str = "HEAD",
+    include_deleted: bool = False,
+) -> list[str]:
+    """Return changed file paths relative to base branch merge-base."""
     base = _resolve_base_branch(workspace)
     if not base or get_head_oid(workspace) == "UNBORN":
         return []
     mb_res = _run_git(workspace, ["merge-base", base, target_ref])
     merge_base = mb_res.stdout.strip() if mb_res.returncode == 0 else base
-    diff_res = _run_git(workspace, ["diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}..{target_ref}"])
+    git_args = ["diff", "--name-only"]
+    if not include_deleted:
+        git_args.append("--diff-filter=ACMR")
+    git_args.append(f"{merge_base}..{target_ref}")
+    diff_res = _run_git(workspace, git_args)
     if diff_res.returncode != 0:
         return []
     return [line.strip() for line in diff_res.stdout.splitlines() if line.strip()]
@@ -3679,17 +3688,64 @@ TDD_EXEMPT_PREFIXES = ("docs/", "assets/", "medium-kit/", ".impeccable/", ".supe
 TDD_EXEMPT_FILENAMES = frozenset(
     ("README.md", "PRODUCT.md", "DESIGN.md", "CHANGELOG.md", "LICENSE", ".gitignore", ".harness-ignore")
 )
-TDD_EXEMPT_EXTENSIONS = frozenset((".md", ".txt", ".png", ".jpg", ".jpeg", ".svg", ".webp", ".pdf"))
+TDD_EXEMPT_EXTENSIONS = frozenset((".md", ".png", ".jpg", ".jpeg", ".svg", ".webp", ".pdf"))
 VALID_TDD_PROVIDERS = frozenset(("claude-cli", "agy-cli", "subagent"))
 VERDICT_JSON_RE = re.compile(r"VERDICT_JSON\s*:\s*(\{[^\n]*\})")
+REVIEW_SCRUB_ENV_KEYS = frozenset(
+    (
+        "CLAUDECODE",
+        "TYPESAFE_API_KEY",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "OPENAI_API_KEY",
+        "STRIPE_SECRET_KEY",
+        "STRIPE_API_KEY",
+    )
+)
+SECRET_REDACT_RE = re.compile(
+    r"(?:ts_live_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{12,}|AIza[0-9A-Za-z_-]{16,}|Bearer\s+[A-Za-z0-9._-]{8,})",
+    re.IGNORECASE,
+)
+
+
+def _normalize_rel_path(raw: str) -> str:
+    """Strip leading ``./`` prefixes without corrupting dotfiles or dot-directories."""
+    norm = str(raw or "").strip()
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def _atomic_write_text(target_dir: Path, filename: str, content: str) -> Path:
+    """Atomically write text to ``target_dir/filename`` via temp file + ``os.replace`` without following symlinks."""
+    if target_dir.is_symlink():
+        raise OSError(f"Refusing to write into symlink directory: {target_dir}")
+    target_dir.mkdir(parents=True, exist_ok=True)
+    if not content.endswith("\n"):
+        content += "\n"
+    tmp_path = target_dir / f".{filename}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_path, target_dir / filename)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+    return target_dir / filename
 
 
 def requires_tdd_stamp(workspace: Path, diff_files: Optional[list[str]] = None) -> tuple[bool, list[str]]:
-    """Return ``(required, code_files)`` when branch diff modifies non-documentation code or script files."""
-    files = _collect_branch_diff_files(workspace) if diff_files is None else list(diff_files)
+    """Return ``(required, code_files)`` when branch diff modifies or deletes non-documentation code or script files."""
+    files = _collect_branch_diff_files(workspace, include_deleted=True) if diff_files is None else list(diff_files)
     code_files: list[str] = []
     for raw_f in files:
-        norm = str(raw_f or "").strip().lstrip("./")
+        norm = _normalize_rel_path(raw_f)
         if not norm:
             continue
         if any(norm.startswith(pref) for pref in TDD_EXEMPT_PREFIXES):
@@ -3717,7 +3773,7 @@ def tdd_stamp_register(
     """Validate and atomically write ``tdd-pass.json`` bound to HEAD ``codeTreeSha``."""
     if verdict not in ("PASS", "FAIL"):
         return False, f"Error: tdd --verdict must be PASS or FAIL (got '{verdict}')", 1
-    if critical_gaps < 0 or important_gaps < 0:
+    if type(critical_gaps) is not int or type(important_gaps) is not int or critical_gaps < 0 or important_gaps < 0:
         return False, "Error: tdd --critical-gaps and --important-gaps must be non-negative integers", 1
     if verdict == "PASS" and (critical_gaps != 0 or important_gaps != 0):
         return (
@@ -3728,11 +3784,11 @@ def tdd_stamp_register(
     if provider not in VALID_TDD_PROVIDERS:
         return False, f"Error: tdd --provider must be claude-cli, agy-cli, or subagent (got '{provider}')", 1
     clean_model = (model or "").strip()
-    if not clean_model:
-        return False, "Error: tdd requires non-empty --model", 1
+    if not clean_model or clean_model.startswith("-"):
+        return False, "Error: tdd requires a valid non-empty --model", 1
 
     _, code_files = requires_tdd_stamp(workspace)
-    audited = [str(f).lstrip("./") for f in (explicit_files or code_files) if str(f).strip()]
+    audited = [_normalize_rel_path(f) for f in (explicit_files or code_files) if _normalize_rel_path(f)]
     state_dir = get_state_dir(workspace)
     payload = {
         "verdict": verdict,
@@ -3752,7 +3808,7 @@ def tdd_stamp_register(
 
 def _build_external_review_prompt(workspace: Path, kind: str, targets: Optional[list[str]] = None) -> str:
     """Build a focused, read-only review prompt for ``claude -p`` or ``agy -p``."""
-    clean_targets = [str(t).strip().lstrip("./") for t in (targets or []) if str(t).strip()]
+    clean_targets = [_normalize_rel_path(t) for t in (targets or []) if _normalize_rel_path(t)]
     if kind == "spec-plan":
         target_block = "\n".join(f"- {t}" for t in clean_targets) if clean_targets else "- (Inspect docs/superpowers/specs/ and docs/superpowers/plans/)"
         return (
@@ -3793,25 +3849,40 @@ def _build_external_review_prompt(workspace: Path, kind: str, targets: Optional[
 
 
 def _extract_verdict_json(output_text: str) -> Optional[dict[str, Any]]:
-    """Extract the last ``VERDICT_JSON: {...}`` object from review output if valid."""
+    """Extract only the final ``VERDICT_JSON: {...}`` object; never fall back to earlier quoted lines."""
     matches = VERDICT_JSON_RE.findall(output_text or "")
-    for raw in reversed(matches):
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            continue
-        if isinstance(parsed, dict) and parsed.get("verdict") in ("PASS", "FAIL"):
-            return parsed
+    if not matches:
+        return None
+    raw_last = matches[-1]
+    try:
+        parsed = json.loads(raw_last)
+    except Exception:
+        return None
+    if isinstance(parsed, dict) and parsed.get("verdict") in ("PASS", "FAIL"):
+        return parsed
     return None
 
 
 def _summarize_cli_failure(returncode: int, stderr_text: str, stdout_text: str) -> str:
-    """Produce a concise single-line failure reason from CLI stderr/stdout."""
+    """Produce a concise, secret-redacted single-line failure reason from CLI stderr/stdout."""
     raw = (stderr_text or "").strip() or (stdout_text or "").strip()
     if raw:
-        first_lines = " | ".join(line.strip() for line in raw.splitlines() if line.strip())[:320]
+        redacted = SECRET_REDACT_RE.sub("[REDACTED]", raw)
+        first_lines = " | ".join(line.strip() for line in redacted.splitlines() if line.strip())[:320]
         return f"exit {returncode}: {first_lines}"
     return f"exit {returncode} (empty output)"
+
+
+def _resolve_cli_binary(env_var: str, default_name: str) -> str:
+    """Resolve an executable binary path before changing ``cwd`` into an untrusted workspace."""
+    override = os.environ.get(env_var, "").strip()
+    if override:
+        if os.path.isabs(override):
+            return override
+        if "/" in override:
+            return os.path.abspath(override)
+        return shutil.which(override) or ""
+    return shutil.which(default_name) or ""
 
 
 def run_external_review(
@@ -3835,7 +3906,13 @@ def run_external_review(
         return {"status": "error", "reason": f"Unknown review provider '{provider}' (expected claude|agy)"}, 1
 
     profile = REVIEW_PROFILES[kind]
-    timeout_sec = max(5, int(os.environ.get("HARNESS_REVIEW_TIMEOUT_SEC", str(DEFAULT_REVIEW_TIMEOUT_SEC))))
+    raw_timeout = os.environ.get("HARNESS_REVIEW_TIMEOUT_SEC", str(DEFAULT_REVIEW_TIMEOUT_SEC)).strip()
+    try:
+        timeout_sec = max(1, int(raw_timeout))
+    except ValueError:
+        timeout_sec = DEFAULT_REVIEW_TIMEOUT_SEC
+
+    pre_sha = compute_code_tree_sha(workspace)
     prompt_text = _build_external_review_prompt(workspace, kind, targets=targets)
 
     fallback_choices = {
@@ -3844,13 +3921,14 @@ def run_external_review(
         "timeoutSeconds": 30,
     }
 
-    clean_env = dict(os.environ)
-    clean_env.pop("CLAUDECODE", None)
+    clean_env = {k: v for k, v in os.environ.items() if k not in REVIEW_SCRUB_ENV_KEYS}
 
     if provider == "claude":
         use_model = (model or profile["claudeModel"]).strip()
         use_effort = (effort or profile["claudeEffort"]).strip()
-        claude_bin = os.environ.get("HARNESS_CLAUDE_BIN", "").strip() or (shutil.which("claude") or "")
+        if not use_model or use_model.startswith("-") or not use_effort or use_effort.startswith("-"):
+            return {"status": "error", "reason": "Invalid --model or --effort argument (must not start with '-')"}, 1
+        claude_bin = _resolve_cli_binary("HARNESS_CLAUDE_BIN", "claude")
         if not claude_bin:
             return (
                 {
@@ -3935,7 +4013,9 @@ def run_external_review(
     else:
         use_model = (model or profile["agyDefaultModel"]).strip()
         use_effort = (effort or "").strip()
-        agy_bin = os.environ.get("HARNESS_AGY_BIN", "").strip() or (shutil.which("agy") or "")
+        if not use_model or use_model.startswith("-") or use_effort.startswith("-"):
+            return {"status": "error", "reason": "Invalid --model or --effort argument (must not start with '-')"}, 1
+        agy_bin = _resolve_cli_binary("HARNESS_AGY_BIN", "agy")
         if not agy_bin:
             return (
                 {
@@ -4009,13 +4089,18 @@ def run_external_review(
         report_text = res.stdout.strip()
 
     state_dir = get_state_dir(workspace)
-    report_path = state_dir / profile["reportFile"]
-    report_path.write_text(report_text + "\n", encoding="utf-8")
+    with locked_state_file(state_dir, f"{kind}-review"):
+        report_path = _atomic_write_text(state_dir, profile["reportFile"], report_text)
+
+    post_sha = compute_code_tree_sha(workspace)
+    stale_during_review = pre_sha != post_sha
 
     parsed_verdict = _extract_verdict_json(report_text)
     verdict_val = str(parsed_verdict.get("verdict")) if parsed_verdict else "UNKNOWN"
-    crit_gaps = int(parsed_verdict.get("criticalGaps", 0)) if parsed_verdict and isinstance(parsed_verdict.get("criticalGaps"), int) else -1
-    imp_gaps = int(parsed_verdict.get("importantGaps", 0)) if parsed_verdict and isinstance(parsed_verdict.get("importantGaps"), int) else -1
+    raw_crit = parsed_verdict.get("criticalGaps") if parsed_verdict else None
+    raw_imp = parsed_verdict.get("importantGaps") if parsed_verdict else None
+    crit_gaps = raw_crit if (type(raw_crit) is int and raw_crit >= 0) else -1
+    imp_gaps = raw_imp if (type(raw_imp) is int and raw_imp >= 0) else -1
     summary_val = str(parsed_verdict.get("summary") or "") if parsed_verdict else ""
 
     meta = {
@@ -4024,17 +4109,25 @@ def run_external_review(
         "provider": provider_label,
         "model": use_model,
         "effort": use_effort,
-        "codeTreeSha": compute_code_tree_sha(workspace),
+        "codeTreeSha": pre_sha,
         "verdict": verdict_val,
         "criticalGaps": crit_gaps,
         "importantGaps": imp_gaps,
         "summary": summary_val,
         "reportPath": str(report_path),
         "stamped": False,
+        "staleDuringReview": stale_during_review,
         "timestamp": utc_now_iso(),
     }
 
-    if auto_stamp and kind == "tdd" and verdict_val == "PASS" and crit_gaps == 0 and imp_gaps == 0:
+    if (
+        auto_stamp
+        and kind == "tdd"
+        and not stale_during_review
+        and verdict_val == "PASS"
+        and crit_gaps == 0
+        and imp_gaps == 0
+    ):
         ok_stamp, _, _ = tdd_stamp_register(
             workspace,
             verdict="PASS",
@@ -4047,7 +4140,8 @@ def run_external_review(
         )
         meta["stamped"] = ok_stamp
 
-    atomic_write_json(state_dir, profile["stateFile"], meta)
+    with locked_state_file(state_dir, f"{kind}-review"):
+        atomic_write_json(state_dir, profile["stateFile"], meta)
     return meta, 0
 
 
@@ -5171,6 +5265,8 @@ def build_session_start_payload(
             stale_stamps.append("canon-pass")
         if tree_state.get("securityStampStatus") == "stale":
             stale_stamps.append("security-pass")
+        if tree_state.get("tddStampStatus") == "stale" and requires_tdd_stamp(workspace)[0]:
+            stale_stamps.append("tdd-pass")
         if tree_state.get("uiStampStatus") == "stale" and requires_ui_stamp(workspace)[0]:
             stale_stamps.append("ui-pass")
         if stale_stamps:

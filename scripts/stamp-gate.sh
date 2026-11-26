@@ -585,8 +585,8 @@ cmd_ui() {
 
 cmd_tdd() {
   local verdict=""
-  local critical_gaps="0"
-  local important_gaps="0"
+  local critical_gaps=""
+  local important_gaps=""
   local provider=""
   local model=""
   local effort=""
@@ -681,10 +681,10 @@ cmd_tdd() {
     exit 1
   fi
 
-  local py_args=(tdd-stamp --workspace "$WORKSPACE" --verdict "$verdict" --critical-gaps "$critical_gaps" --important-gaps "$important_gaps" --provider "$provider" --model "$model" --effort "$effort")
+  local py_args=(tdd-stamp --workspace="$WORKSPACE" --verdict="$verdict" --critical-gaps="$critical_gaps" --important-gaps="$important_gaps" --provider="$provider" --model="$model" --effort="$effort")
   local f
   for f in ${files[@]+"${files[@]}"}; do
-    py_args+=(--file "$f")
+    py_args+=(--file="$f")
   done
 
   python3 -B "$(harness_core_python)" "${py_args[@]}"
@@ -765,13 +765,13 @@ cmd_review() {
     exit 1
   fi
 
-  local py_args=(external-review --workspace "$WORKSPACE" --kind "$kind" --provider "$provider" --model "$model" --effort "$effort")
+  local py_args=(external-review --workspace="$WORKSPACE" --kind="$kind" --provider="$provider" --model="$model" --effort="$effort")
   if [ "$auto_stamp" = "true" ]; then
     py_args+=(--auto-stamp)
   fi
   local t
   for t in ${targets[@]+"${targets[@]}"}; do
-    py_args+=(--target "$t")
+    py_args+=(--target="$t")
   done
 
   python3 -B "$(harness_core_python)" "${py_args[@]}"

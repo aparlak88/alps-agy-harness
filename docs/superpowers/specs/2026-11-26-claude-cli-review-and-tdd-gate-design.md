@@ -20,8 +20,8 @@ Bu tasarım, hem **Spec/Plan İncelemesini** hem de **TDD Birim Test Kapsam Dene
 
 ### Hedefler (Goals)
 - **Birincil Sağlayıcı (`claude -p`):**
-  - **Spec / Plan Review:** `claude -p --model opus --effort medium --permission-mode plan --no-session-persistence --tools Read,Grep,Glob --output-format json` (veya yapılandırılmış JSON şema/metin çıktısı).
-  - **TDD Kapsam Denetimi:** `claude -p --model sonnet --effort high --permission-mode plan --no-session-persistence --tools Read,Grep,Glob --output-format json`.
+  - **Spec / Plan Review:** `claude -p --model opus --effort medium --permission-mode plan --no-session-persistence --tools Read,Grep,Glob --output-format text` (son satırda makine-okunur `VERDICT_JSON: {...}`).
+  - **TDD Kapsam Denetimi:** `claude -p --model sonnet --effort high --permission-mode plan --no-session-persistence --tools Read,Grep,Glob --output-format text` (son satırda makine-okunur `VERDICT_JSON: {...}`).
 - **Şeffaf Hata Raporlama ve 30 Saniyelik Antigravity Fallback:**
   - `claude` CLI kurulu değilse veya herhangi bir nedenle başarısız olursa CLI **sessiz fallback yapmaz**; çıkış kodu `42` ve makine-okunur JSON (`status: "claude_unavailable"`, `reason`, `fallbackOptions`) döner.
   - Orkestratör hatanın tam sebebini kullanıcıya açıklar, Antigravity'deki Claude modeli ile Gemini 4 modeli arasında seçim sorar ve aynı turda **`schedule(DurationSeconds=30, TimerCondition="any")`** kurar.

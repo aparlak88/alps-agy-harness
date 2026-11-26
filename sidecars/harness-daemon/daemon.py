@@ -762,6 +762,8 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
             content_len = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             return None, 400
+        if content_len < 0:
+            return None, 400
         if content_len > MAX_REQUEST_BYTES:
             return None, 413
         raw = self.rfile.read(content_len) if content_len > 0 else b"{}"
