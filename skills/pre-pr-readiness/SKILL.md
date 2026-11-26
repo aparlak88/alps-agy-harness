@@ -7,11 +7,11 @@ description: "PR açılışı öncesi son doğrulama orkestratörü: sessiz derl
 
 Bu skill, bir geliştirme dalında tüm görevler tamamlandığında ve PR açılmadan hemen önce (`finishing-a-development-branch` aşamasında) çalıştırılan zorunlu kontrol merkezidir.
 
-`pre-command-guard.sh` içindeki 5 maddelik sert PR açma kapısının (dosya bazlı tam walkthrough kapsama kontrolü dahil) sorunsuz geçilmesini sağlar.
+sert PR açma kapısının (koşullu UI damgası ve dosya bazlı tam walkthrough kapsama kontrolü dahil) sorunsuz geçilmesini sağlar.
 
 ---
 
-## 1. Dört Aşamalı Doğrulama Sırası
+## 1. Doğrulama Sırası
 
 PR açılmadan önce aşağıdaki adımlar sırayla tamamlanmalıdır:
 
@@ -89,6 +89,17 @@ Okuyucunun IDE'yi açmadan tüm işi, mimari kararları ve her bir dosyadaki de�
    ```bash
    ./scripts/stamp-gate.sh security --verdict PASS --critical 0 --important 0
    ```
+
+---
+
+### Adım 5 (Koşullu): UI/Frontend Kalite ve Anti-Pattern Damgası (`stamp-gate.sh ui`)
+Bu adım **yalnızca** dal farkında üretim UI dosyaları (`.html`, `.tsx`, `.css`, `.scss`, `.component.ts`, `.xaml`, SwiftUI `Features`/`Views`, Compose `features`/`ui`) değiştiyse **VE** ortamda `impeccable` kuruluysa zorunludur (saf backend görevlerinde ve `impeccable` kurulu değilken atlanır):
+1. Impeccable `critique` / `audit` bulgularında `P0 = 0` ve `P1 = 0` olduğunu doğrulayın (`PRODUCT.md` / `DESIGN.md` uyumu dahil).
+2. Web UI dosyaları değiştiyse `stamp-gate.sh ui` komutu otomatik olarak `impeccable detect --json` taramasını (`DO_NOT_TRACK=1 IMPECCABLE_LIVE_COPY_AGENT=off`) çalıştırır ve sıfır bulgu (`exit 0`) aldığında `ui-pass.json` damgasını yazar:
+   ```bash
+   ./scripts/stamp-gate.sh ui --verdict PASS --p0 0 --p1 0
+   ```
+   *(Not: `detect` exit kodu `2` dönerse veya `P0`/`P1 > 0` ise `PASS` damgası reddedilir ve `gh pr create` / yerel `merge` kapıları açılmaz.)*
 
 ---
 

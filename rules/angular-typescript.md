@@ -54,6 +54,9 @@ Enforce module/layer boundaries at lint/test time using `@softarc/sheriff` (`she
   1. **Live Console & Network Gate (`@playwright/mcp`):** Inspect accessibility snapshots alongside `browser_console_messages` (`error`/`warning`) and `browser_network_requests` (`4xx`/`5xx`/CORS). Author resilient E2E specs using `getByRole` / `getByLabel` locators rather than brittle CSS paths.
   2. **Deep Diagnostics (`Chrome DevTools`):** When diagnosing failed requests, layout shifts, memory leaks, or slow hydration, inspect request/response payloads, network waterfalls, and performance traces via `Chrome DevTools` (`chrome-devtools-plugin`) and correlate `5xx` responses with backend dev-server logs.
   3. **Zero-Console-Error E2E Shield:** Base `@playwright/test` fixtures must attach `page.on('pageerror')`, unexpected `console.error`, and `response.status() >= 500` listeners that fail the test with an English `REMEDIATION:` message even if the UI renders visually.
+- **Visual Craft & Conditional Slop Gate (`impeccable` vs. Runtime Diagnostics):**
+  - Keep responsibilities separated: use `impeccable` (`shape`, `critique`, `polish`, `detect`) for visual hierarchy, typography, accessibility, and AI-slop elimination; use `@playwright/mcp` + `Chrome DevTools` for zero-console-error, network, and LCP/memory diagnostics.
+  - When `impeccable` is installed and Web UI files (`.html`, `.css`, `.scss`, `.tsx`, `.component.ts`) change, pass `./scripts/stamp-gate.sh ui --verdict PASS --p0 0 --p1 0` before PR/merge (prefix any `impeccable live` run with `DO_NOT_TRACK=1 IMPECCABLE_LIVE_COPY_AGENT=chat`).
 - **Quiet Verification:** Wrap builds, lints, and tests in `./scripts/run-quiet.sh`:
   - `./scripts/run-quiet.sh ng-build -- npx ng build`
   - `./scripts/run-quiet.sh ng-test -- npm test -- --watch=false`

@@ -78,6 +78,7 @@ public sealed class ArchitectureTests
 - **Quiet Build & Test Execution:** Always wrap `dotnet build` and `dotnet test` in `./scripts/run-quiet.sh`:
   - `./scripts/run-quiet.sh dotnet-build -- dotnet build --nologo`
   - `./scripts/run-quiet.sh dotnet-test -- dotnet test --no-build --nologo`
+- **Conditional XAML UI Audit (`impeccable`):** When `impeccable` is installed and `.xaml` views change, verify `P0=0`, `P1=0` UI/accessibility compliance alongside `xaml_validate` and run `./scripts/stamp-gate.sh ui --verdict PASS --p0 0 --p1 0` before PR/merge.
 
 ## 4. Production Code Documentation Contract (English `XMLDoc`)
 

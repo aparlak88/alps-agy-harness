@@ -555,7 +555,7 @@ test_gemini4_and_orchestrator_parent_aware_subagent_routing() {
     }
   }')
   out_orch_sec=$(printf '%s\n' "$p_orch_sec" | "$PRE_SUBAGENT_GUARD")
-  assert_json_field "$out_orch_sec" ".overwrite.Model" "inherit" "Orchestrator security-reviewer must use inherit (-> Carbon)"
+  assert_json_field "$out_orch_sec" ".overwrite.Model" "pro" "Orchestrator security-reviewer must escalate to pro (executor shield)"
 
   # 3. Gemini 4 Hydrogen parent (gemini-4-hydrogen-xhigh):
   #    - bounded_execution with XHIGH -> inherit + XHIGH header (stays on Hydrogen!)
@@ -1547,14 +1547,14 @@ test_neon_gemini4_and_custom_parent_model_routing() {
   }' | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_neon_canon_inh" ".overwrite.Model" "inherit" "Neon multi_module preserves explicit inherit"
 
-  # 2. Neon Low -> argon_low
+  # 2. Neon Low -> frontier_low
   local out_neon_low_sec out_neon_low_self
   out_neon_low_sec=$(jq -nc --arg ws "$repo" '{
     workspacePaths: [$ws],
     modelName: "gemini-4-neon-low",
     toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Neon Low Sec", Prompt: "Audit Neon Low."}}
   }' | "$PRE_SUBAGENT_GUARD")
-  assert_json_field "$out_neon_low_sec" ".overwrite.Model" "pro" "Neon Low (argon_low) escalates security-reviewer to pro"
+  assert_json_field "$out_neon_low_sec" ".overwrite.Model" "pro" "Neon Low (frontier_low) escalates security-reviewer to pro"
 
   "$STAMP_GATE" dispatch --role "Neon Low Worker" --type "self" --tier "bounded_execution" --workspace "$repo"
   out_neon_low_self=$(jq -nc --arg ws "$repo" '{
@@ -1588,6 +1588,200 @@ test_neon_gemini4_and_custom_parent_model_routing() {
     toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Custom Sec", Prompt: "Custom audit."}}
   }' | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_custom_sec" ".overwrite.Model" "inherit" "custom critical_architecture_or_audit keeps inherit"
+}
+
+test_five_layer_gemini4_orchestrator_deprecation_and_run_workflow() {
+  local repo
+  repo=$(make_temp_repo)
+  git -C "$repo" checkout -b "feat/five-layers" --quiet
+
+  # 1. Orchestrator (Neon) shields security-reviewer & pr-auditor with pro (never inheriting Hydrogen executor)
+  local out_orch_neon_sec out_orch_neon_pr
+  out_orch_neon_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Orchestrator (Neon)",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Orch Neon Sec", Prompt: "Audit Neon Orchestrator."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_orch_neon_sec" ".overwrite.Model" "pro" "Orchestrator (Neon) security-reviewer escalates to pro"
+
+  out_orch_neon_pr=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Orchestrator (Carbon)",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "pr-auditor", Role: "Orch Carbon PR", Prompt: "Review PR 7D."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_orch_neon_pr" ".overwrite.Model" "pro" "Orchestrator (Carbon) pr-auditor escalates to pro"
+
+  # 2. Gemini 4 Neon (Extra) escalates pr-auditor effort header to XHIGH while keeping inherit
+  local out_extra_pr
+  out_extra_pr=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Gemini 4 Neon (Extra)",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "pr-auditor", Role: "Extra PR Audit", Prompt: "Audit extra."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_extra_pr" ".overwrite.Model" "inherit" "Neon Extra pr-auditor keeps inherit"
+  assert_contains "$(printf '%s\n' "$out_extra_pr" | jq -r '.overwrite.Prompt')" "[EFFORT_PROFILE: XHIGH" "Neon Extra bumps pr-auditor effort to XHIGH"
+
+  # 3. Claude Opus 5.5 vs Claude Sonnet 5.5 vs Gemini 4 Carbon (Low)
+  "$STAMP_GATE" dispatch --role "Opus Bounded" --type "self" --tier "bounded_execution" --workspace "$repo"
+  "$STAMP_GATE" dispatch --role "Sonnet Bounded" --type "self" --tier "bounded_execution" --workspace "$repo"
+  local out_opus_bounded out_opus_sec out_sonnet_bounded out_sonnet_sec out_carbon_low_sec
+  out_opus_bounded=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Claude Opus 5.5 (Thinking)",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Opus Bounded", Prompt: "Implement helper."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_opus_bounded" ".overwrite.Model" "pro" "Claude Opus 5.5 bounded_execution steps to pro"
+
+  out_opus_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Claude Opus 5.5 (Thinking)",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Opus Sec", Prompt: "Audit."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_opus_sec" ".overwrite.Model" "inherit" "Claude Opus 5.5 critical audit keeps inherit"
+
+  out_sonnet_bounded=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Claude Sonnet 5.5",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Sonnet Bounded", Prompt: "Implement helper."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_sonnet_bounded" ".overwrite.Model" "inherit" "Claude Sonnet 5.5 bounded_execution keeps inherit"
+
+  out_sonnet_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Claude Sonnet 5.5",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Sonnet Sec", Prompt: "Audit."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_sonnet_sec" ".overwrite.Model" "pro" "Claude Sonnet 5.5 security-reviewer escalates to pro"
+
+  out_carbon_low_sec=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    modelName: "Gemini 4 Carbon (Low)",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "security-reviewer", Role: "Carbon Low Sec", Prompt: "Audit."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_carbon_low_sec" ".overwrite.Model" "pro" "Carbon Low (frontier_low) escalates security-reviewer to pro"
+
+  # 4. run_workflow guard: clean inline Script, ScriptPath, and fail-closed denials
+  local out_wf_ok out_wf_subproc out_wf_ossys out_wf_badmodel out_wf_secret out_wf_path_bad out_wf_path_ok
+  out_wf_ok=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "run_workflow",
+      args: {
+        Description: "Clean audit fanout",
+        Script: "parallel(lambda: agent(prompt=\"Check module\", model=\"pro\"))"
+      }
+    }
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_ok" ".decision" "allow" "Clean run_workflow Script allowed"
+
+  out_wf_subproc=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "run_workflow",
+      args: {
+        Description: "Shell bypass",
+        Script: "import subprocess\nsubprocess.run([\"rm\", \"-rf\", \"/tmp/x\"])"
+      }
+    }
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_subproc" ".decision" "deny" "run_workflow subprocess bypass denied"
+
+  out_wf_ossys=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "run_workflow",
+      args: {
+        Description: "os.system bypass",
+        Script: "import os\nos.system(\"echo hi\")"
+      }
+    }
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_ossys" ".decision" "deny" "run_workflow os.system bypass denied"
+
+  out_wf_badmodel=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "run_workflow",
+      args: {
+        Description: "Invalid tier",
+        Script: "agent(prompt=\"Scan\", model=\"gpt4\")"
+      }
+    }
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_badmodel" ".decision" "deny" "run_workflow invalid agent(model=...) tier denied"
+
+  out_wf_secret=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "run_workflow",
+      args: {
+        Description: "Secret embed",
+        Script: "KEY = \"-----BEGIN RSA PRIVATE KEY-----\""
+      }
+    }
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_secret" ".decision" "deny" "run_workflow private key embed denied"
+
+  out_wf_path_bad=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "run_workflow",
+      args: {Description: "Missing file", ScriptPath: "/nonexistent/wf.py"}
+    }
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_path_bad" ".decision" "deny" "run_workflow unreadable ScriptPath denied"
+
+  mkdir -p "$repo/workflows"
+  printf 'parallel(lambda: agent(prompt="Scan", model="flash_lite"))\n' > "$repo/workflows/clean.py"
+  out_wf_path_ok=$(jq -nc --arg ws "$repo" --arg sp "$repo/workflows/clean.py" '{
+    workspacePaths: [$ws],
+    toolCall: {
+      name: "run_workflow",
+      args: {Description: "Valid ScriptPath", ScriptPath: $sp}
+    }
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_path_ok" ".decision" "allow" "Clean run_workflow ScriptPath allowed"
+
+  # 5. AST bypass hardening regressions (pty, import alias, from-import, eval, dynamic/triple-quote model, SyntaxError, external ScriptPath)
+  local bypass_case
+  for bypass_case in \
+    'import pty
+pty.spawn(["git", "push", "origin", "main"])' \
+    'from subprocess import run
+run(["echo", "hi"])' \
+    'import subprocess as sp
+sp.run(["echo", "hi"])' \
+    'from os import system
+system("echo hi")' \
+    'eval("__import__(\"os\").system(\"id\")")' \
+    'import os, builtins
+builtins.getattr(os, "system")("id")' \
+    'from builtins import eval as e
+e("__import__(\"os\").system(\"id\")")' \
+    'agent(prompt="Scan", **{"model": "gpt4"})' \
+    'agent(prompt="Scan", model="""gpt4""")' \
+    'm = "gpt4"
+agent(prompt="Scan", model=m)' \
+    'def broken(:'
+  do
+    local out_byp
+    out_byp=$(jq -nc --arg ws "$repo" --arg sc "$bypass_case" '{
+      workspacePaths: [$ws],
+      toolCall: {name: "run_workflow", args: {Description: "Bypass test", Script: $sc}}
+    }' | "$PRE_SUBAGENT_GUARD")
+    assert_json_field "$out_byp" ".decision" "deny" "AST guard denies bypass payload: ${bypass_case%%$'\n'*}"
+  done
+
+  local ext_dir ext_wf out_wf_ext
+  ext_dir=$(mktemp -d "${TMPDIR:-/tmp}/ext-wf.XXXXXX")
+  echo "$ext_dir" >> "$_HARNESS_TEMP_TRACKER"
+  ext_wf="$ext_dir/wf.py"
+  printf 'agent(prompt="Scan", model="pro")\n' > "$ext_wf"
+  out_wf_ext=$(jq -nc --arg ws "$repo" --arg sp "$ext_wf" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "run_workflow", args: {Description: "External path", ScriptPath: $sp}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_wf_ext" ".decision" "deny" "run_workflow ScriptPath outside workspace denied"
 }
 
 run_tests

@@ -1162,4 +1162,146 @@ EOF
   assert_json_field "$pending_wt" ".conversationId" "conv-cwd"
 }
 
+test_conditional_ui_pr_and_local_merge_gates_and_live_mode_guard() {
+  export HARNESS_DISABLE_DAEMON=1
+  local repo mock_dir mock_cfg mock_bin
+  repo=$(make_temp_repo)
+  mock_dir=$(mktemp -d "${TMPDIR:-/tmp}/harness-ui-gate.XXXXXX")
+  echo "$mock_dir" >> "$_HARNESS_TEMP_TRACKER"
+  mock_cfg="$mock_dir/mock-cfg"
+  mock_bin="$mock_dir/mock-impeccable"
+  mkdir -p "$mock_cfg"
+
+  cat << 'EOF' > "$mock_bin"
+#!/usr/bin/env bash
+echo '[]'
+exit 0
+EOF
+  chmod +x "$mock_bin"
+
+  cat << 'EOF' > "$repo/README.md"
+# UI Gate Demo
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| UI Gate | Koşullu arayüz kalite kapısı |
+EOF
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+
+  git -C "$repo" checkout -b "feat/ui-card" --quiet
+  mkdir -p "$repo/src/ui" "$repo/docs/walkthroughs"
+  echo "export const Card = () => '<div />'; " > "$repo/src/ui/Card.tsx"
+  cat << 'EOF' > "$repo/docs/walkthroughs/2026-11-26-ui-card.md"
+# Pull Request Mühendislik Rehberi: UI Card Bileşeni
+
+## 1. Problem Bağlamı ve Mimari Kararlar
+Kullanıcı arayüzünde kart bileşeni sadeleştirildi ve deterministik UI doğrulama kapısına bağlandı.
+
+## 2. Mimari ve Veri Akışı Diyagramları
+```mermaid
+flowchart LR
+  Card["src/ui/Card.tsx"] --> Detector["impeccable detect"]
+```
+
+```mermaid
+sequenceDiagram
+  Dev->>StampGate: ui --verdict PASS
+  StampGate-->>Dev: ui-pass.json
+```
+
+## 3. Dosya Bazlı Değişiklik Analizi
+
+### `src/ui/Card.tsx` — [ÜRETİLDİ] (`Presentation`)
+- **Ne Değişti / Ne Üretildi?:** `Card` sunum bileşeni ve temel JSX işaretlemesi eklendi.
+- **Neden Değişti / Ne Üretildi?:** Koşullu `ui-pass.json` PR ve yerel merge kapısını gerçek Web UI dosyası üzerinde doğrulamak için üretildi.
+
+## Teknik Terimler Sözlüğü
+
+| Terim | Açıklama |
+| :--- | :--- |
+| Presentation | Arayüz sunum katmanı |
+EOF
+  git -C "$repo" add src/ui/Card.tsx docs/walkthroughs/2026-11-26-ui-card.md
+  git -C "$repo" commit -m "feat: add Card.tsx and walkthrough" --quiet
+
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/ui/Card.tsx"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  local p_pr p_merge out_pr_no_imp out_pr_deny out_merge_deny out_pr_allow out_merge_allow
+  p_pr=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "gh pr create --fill"}}}')
+  p_merge=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "git merge feat/ui-card"}}}')
+
+  # 1. Without Impeccable installed -> gh pr create is allowed even without ui-pass.json
+  out_pr_no_imp=$(printf '%s' "$p_pr" | HARNESS_CONFIG_DIR="$mock_cfg" env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_no_imp" ".decision" "allow" "gh pr create must allow without ui-pass.json when Impeccable is not installed"
+
+  # 2. With Impeccable installed & missing ui-pass.json -> both gh pr create and local git merge are denied
+  out_pr_deny=$(printf '%s' "$p_pr" | HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_deny" ".decision" "deny" "gh pr create must deny without ui-pass.json when Impeccable is installed"
+  assert_contains "$(printf '%s' "$out_pr_deny" | jq -r '.reason')" "ui stamp"
+
+  git -C "$repo" checkout main --quiet
+  out_merge_deny=$(printf '%s' "$p_merge" | HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_deny" ".decision" "deny" "Local merge into main must deny without ui-pass.json when Impeccable is installed"
+  assert_contains "$(printf '%s' "$out_merge_deny" | jq -r '.reason')" "ui-pass.json"
+
+  # 3. Stamp ui-pass.json on feat/ui-card -> both gh pr create and local git merge allow
+  git -C "$repo" checkout feat/ui-card --quiet
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0
+
+  out_pr_allow=$(printf '%s' "$p_pr" | HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_pr_allow" ".decision" "allow" "gh pr create must allow after ui-pass.json stamp"
+
+  git -C "$repo" checkout main --quiet
+  # Incomplete scannedWebFiles must be caught even on main checkout where Card.tsx only exists on target branch
+  local ui_stamp_file ui_stamp_tmp out_merge_incomplete
+  ui_stamp_file="$repo/.harness/state/feat-ui-card/ui-pass.json"
+  ui_stamp_tmp=$(jq -c '.scannedWebFiles = []' "$ui_stamp_file")
+  printf '%s\n' "$ui_stamp_tmp" > "$ui_stamp_file"
+  out_merge_incomplete=$(printf '%s' "$p_merge" | HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_incomplete" ".decision" "deny" "Local merge into main must deny incomplete scannedWebFiles on newly added target-branch UI file"
+  assert_contains "$(printf '%s' "$out_merge_incomplete" | jq -r '.reason')" "scannedWebFiles"
+
+  git -C "$repo" checkout feat/ui-card --quiet
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0
+  git -C "$repo" checkout main --quiet
+  out_merge_allow=$(printf '%s' "$p_merge" | HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_merge_allow" ".decision" "allow" "Local merge into main must allow after ui-pass.json stamp"
+
+  # 4. Gate 5: impeccable live unsandboxed fallback guard
+  local out_live_npx out_live_bin out_live_chat out_live_off
+  out_live_npx=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "npx impeccable live"}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_live_npx" ".decision" "deny" "npx impeccable live without IMPECCABLE_LIVE_COPY_AGENT must be denied"
+  assert_contains "$(printf '%s' "$out_live_npx" | jq -r '.reason')" "IMPECCABLE_LIVE_COPY_AGENT"
+
+  out_live_bin=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: ".agent/skills/impeccable/scripts/impeccable live"}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_live_bin" ".decision" "deny" "Direct impeccable live without IMPECCABLE_LIVE_COPY_AGENT must be denied"
+
+  out_live_chat=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "DO_NOT_TRACK=1 IMPECCABLE_LIVE_COPY_AGENT=chat npx impeccable live"}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_live_chat" ".decision" "allow" "impeccable live with IMPECCABLE_LIVE_COPY_AGENT=chat must be allowed"
+
+  out_live_off=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "export IMPECCABLE_LIVE_COPY_AGENT=off && impeccable live"}}}' | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_live_off" ".decision" "allow" "impeccable live after export IMPECCABLE_LIVE_COPY_AGENT=off must be allowed"
+
+  # 5. Live guard bypass hardening (npx -p, npm exec, pnpm dlx, unset, env -u, env -i)
+  local bypass_cmd
+  for bypass_cmd in \
+    "npx -p impeccable impeccable live" \
+    "npm exec impeccable -- live" \
+    "pnpm dlx impeccable live" \
+    "export IMPECCABLE_LIVE_COPY_AGENT=chat && unset IMPECCABLE_LIVE_COPY_AGENT && impeccable live" \
+    "IMPECCABLE_LIVE_COPY_AGENT=chat env -u IMPECCABLE_LIVE_COPY_AGENT impeccable live" \
+    "IMPECCABLE_LIVE_COPY_AGENT=chat env -i npx impeccable live"
+  do
+    local out_byp_cmd
+    out_byp_cmd=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_cmd" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_byp_cmd" ".decision" "deny" "Live guard must deny bypass: $bypass_cmd"
+  done
+}
+
 run_tests

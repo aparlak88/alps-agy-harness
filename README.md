@@ -14,7 +14,7 @@ Büyük dil modelleri tek başlarına bırakıldığında kapsam kaymasına (*sc
 
 **Engineering Harness**, ajanın etrafına kurulan fiziksel güvenlik ve kalite çemberidir:
 - **Fiziksel Kancalar (`hooks.json`):** `main` dalına doğrudan kod yazılmasını, doğrulanmamış paket kurulmasını ve eksik denetimle PR açılmasını kabuk düzeyinde engeller.
-- **Gemini 4 & `Orchestrator` Duyarlı Model ve Efor Kilidi (`overwrite`):** Ana oturumun modelini (`HOOK_INPUT.modelName`: Carbon, Argon, Hydrogen, `Orchestrator`) algılayarak alt ajan katmanlarını (`inherit`, `pro` [Argon], `flash`, `flash_lite`) ve efor bütçelerini (`LOW`, `MEDIUM`, `HIGH`, `XHIGH`, `MAX`) düşürme kaybı olmadan fiziksel olarak kilitler.
+- **Gemini 4 & İki Fazlı `Orchestrator` Duyarlı Model ve Efor Kilidi (`overwrite`):** Ana oturumun modelini (`HOOK_INPUT.modelName`: Neon, Carbon, Hydrogen, `Orchestrator (Neon|Carbon)`, `Claude Opus/Sonnet 5.5`) algılayarak alt ajan ve `run_workflow` katmanlarını (`inherit`, `pro`, `flash`, `flash_lite`) ve efor bütçelerini (`LOW`, `MEDIUM`, `HIGH`, `XHIGH` [`Extra`], `MAX`) kilitler; `Orchestrator` yürütme turunda denetçileri `pro` katmanına yükselterek `Hydrogen` miras almasını engeller ve `2026-11-30` emeklilik uyarılarını `SessionStart` ile bildirir.
 - **Sessiz Başarı Kalkanı (`run-quiet.sh`):** Binlerce satırlık derleme ve test loglarını süzerek bağlam penceresini korur.
 - **Sıfır-Context Ön-Eleme (`jev`):** Geçmiş dersleri ve PR diff dosyalarını ana modelin context'ini kirletmeden sunucuda değerlendirir.
 - **Sıfır Gecikmeli Arka Plan Daemon'ı (`sidecars/harness-daemon/`, `v1.1.0`):** `graphify` güncellemelerini asenkron single-flight kuyruğuna alır; `harness-doctor`, `codeTreeSha` damgaları, spec paketleri, walkthrough doğrulaması ve iOS `.ips` crash raporlarını `.harness/cache/*.json` altında önceden hazırlar. Hem global hem proje bazlı (`.agents/plugins/`) kurulumlarda `HARNESS_AUTO_START_DAEMON=1` varsayılanıyla soket yokken kancalar daemon'ı arka planda (stdio/pipe ayrık, `daemon.lock` tekilliğiyle) otomatik başlatır; daemon kapalıysa tüm kancalar sessizce yerel fallback'e (`scripts/lib/harness_core.py`) düşer (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir).
@@ -83,6 +83,7 @@ Harness kurulumundan önce geliştirme makinenizde aşağıdaki araçların kuru
    - **Firebase:** `antigravity-plugins-official/plugin/firebase`
    - **Postman:** `antigravity-plugins-partners/plugin/postman`
    - **Android CLI (Önerilen):** `antigravity-plugins-official/plugin/android-cli-plugin`
+   - **Impeccable (Opsiyonel — UI/Frontend Projeleri İçin Önerilen):** `npx impeccable install --scope=global` (kuruluysa ve dalda UI dosyası değişirse `ui-pass.json` sert PR/merge kapısı otomatik devreye girer; saf backend projelerinde tamamen pasiftir).
 
 ---
 
@@ -205,7 +206,7 @@ Antigravity Swarm (`/swarm` veya çoklu ajan iş akışı) kullanılırken harne
 
 - **Tek Entegrasyon Dalı Topolojisi (`feat/*`):** Koordinatör `main` üzerinden tek bir `feat/<konu>` entegrasyon dalına geçer; `jev_classify`, `superpowers:brainstorming`, Spec ve Plan yalnızca burada bir kez yürütülür. Tüm işçi dalları tamamlandığında önce koordinatörün entegrasyon dalında birleştirilir; ardından tek bir bütünleşik `docs/walkthroughs/*.md` rehberi, `canon-auditor`, `security-reviewer`, `gh pr create` ve `pr-auditor` çalıştırılır.
 - **İzole Yazıcı Kopyaları (`workspace: "share"` + alt dal):** Kod yazan veya derleme/test çalıştıran işçiler `workspace: "share"` (veya tam izole klon için `"branch"`) ile başlatılır ve koda dokunmadan önce kendi alt dallarını (`git checkout -b feat/<konu>-<işçi>`) açar. Salt-okunur inceleme ve keşif işçileri ise `workspace: "inherit"` kullanır.
-- **`invoke_subagent|swarm` Kancası (`pre-subagent-guard.sh`):** `hooks.json` içindeki `PreToolUse` eşleştiricisi `invoke_subagent|swarm` desenini izler. `swarm(action="add")` çağrılarında işlemi engellemeden (`non-blocking overwrite`) `brief` başına `[EFFORT_PROFILE: ...]`, `[SWARM_WORKER_CONTRACT ...]` ve `share`/`branch` modlarında `[SWARM_BRANCH_GUARD ...]` başlıklarını ekler; aynı `Role` için paralel dispatch kayıtları `pendingQueues` ve `conversationId` yakınlığıyla çakışmasız tüketilir.
+- **`invoke_subagent|swarm|run_workflow` Kancası (`pre-subagent-guard.sh`):** `hooks.json` içindeki `PreToolUse` eşleştiricisi `invoke_subagent|swarm|run_workflow` desenini izler. `swarm(action="add")` çağrılarında işlemi engellemeden (`non-blocking overwrite`) `brief` başına `[EFFORT_PROFILE: ...]`, `[SWARM_WORKER_CONTRACT ...]` ve `share`/`branch` modlarında `[SWARM_BRANCH_GUARD ...]` başlıklarını ekler; `run_workflow` çağrılarında ise doğrudan `subprocess`/`os.system` atlatmalarını, gizli anahtarları ve geçersiz `model=...` katmanlarını reddeder. Aynı `Role` için paralel dispatch kayıtları `pendingQueues` ve `conversationId` yakınlığıyla çakışmasız tüketilir.
 - **Kararlı `detached-wt-*` Slug'ı:** Linked Git worktree'lerde `detached HEAD` durumunda `common.sh` ve `harness_core.py`, commit hash'ine bağlı değişen `detached-<7sha>` yerine worktree dizin adına sabitlenen `detached-wt-*` (`detached-wt-<ad>`) slug'ını üretir. Böylece işçi yeni commit attığında `.harness/state/detached-wt-<ad>/` altındaki `context7` ve diğer damgalar bozulmaz.
 - **Global Kurulum Önerisi:** Swarm'ın `workspace: "share"` ve `"branch"` modlarında oluşturduğu çalışma kopyalarının kancaları ve arka plan daemon'ını kesintisiz devralması için **Global Kurulum** (`~/.gemini/config/plugins/alps-agy-harness`) önerilir. Proje bazlı `.agents/plugins/` kurulumu kullanılıyorsa `./scripts/harness-doctor.sh` çıktıya `INFO` seviyesinde `swarm_install_advisory` uyarısı ekleyerek global kurulumu veya işçi klonlarında `--recurse-submodules` (`git submodule update --init --recursive`) kullanımını hatırlatır.
 
@@ -218,15 +219,15 @@ Antigravity Swarm (`/swarm` veya çoklu ajan iş akışı) kullanılırken harne
 | **Kancalar (`hooks.json`)** | `session-start.sh` | Oturum başında dal, aktif model ailesi (`modelName`), kanon ve araç durumunu enjekte eder; soket yoksa `harness-daemon`'ı arka planda başlatır. |
 | | `pre-edit-guard.sh` | `main` dalı kod kilidi, kardeş worktree çözümlemesi, doküman sonu sözlük kapısı ve güvenlik süzgeci. |
 | | `pre-command-guard.sh` | `cd`/`git -C` worktree çözümlemesi, paket kurulum doğrulaması, logcat koruması ve `.gitignore` uyumlu sert PR açma kapısı. |
-| | `pre-subagent-guard.sh` | `invoke_subagent\|swarm` eşleştiricisiyle Gemini 4 & `Orchestrator` duyarlı model/efor `overwrite` kilidi, `swarm(action="add")` için non-blocking `brief` zenginleştirme ve `flock`-atomik `pendingQueues` / `conversationId` tüketimi. |
+| | `pre-subagent-guard.sh` | `invoke_subagent\|swarm\|run_workflow` eşleştiricisiyle Gemini 4 & `Orchestrator` duyarlı model/efor `overwrite` kilidi, `swarm(action="add")` `brief` zenginleştirme, `run_workflow` güvenlik kapısı ve `flock`-atomik `pendingQueues` tüketimi. |
 | | `post-command-hooks.sh` | Başarılı PR sonrası etkin worktree + `conversationId` kayıtlı denetim bayrağı ve asenkron `graphify` güncellemesi. |
 | | `stop-gate.sh` | `conversationId` izolasyonuyla yalnızca PR açan oturumda `pr-auditor` çalıştırılmadan çıkışı engeller. |
 | **Arka Plan Sidecar (`sidecars/`)** | `harness-daemon/sidecar.json` & `daemon.py` | Sıfır gecikmeli Unix socket kanca motoru (`HARNESS_AUTO_START_DAEMON=1` otomatik başlatma), tekil kuyruklu asenkron `graphify`, doktor/damga/spec önbelleği ve iOS crash izleyici (`HARNESS_DISABLE_DAEMON=1` ile devre dışı bırakılabilir). |
 | **Ortak Çekirdek (`scripts/lib/`)** | `harness_core.py` | `harness-daemon` ile tüm yerel fallback kanca ve teşhis betikleri arasında paylaşılan tek doğruluk kaynağı. |
 | **Yardımcı Betikler** | `run-quiet.sh` | Derleme/test loglarını sessize alır; tek satır özet ve log kaydı döner. |
 | | `mobile-logs.sh` | iOS Simulator `.ips` crash ve Android Emulator logcat süzgeci. |
-| | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası, `select-model` çözümleyicisi ve subagent dispatch yöneticisi. |
-| | `harness-doctor.sh` | 8 MCP, gizli anahtar ve ortam sağlığı kontrol aracı. |
+| | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası (`canon`, `security`, koşullu `ui-pass.json`), `select-model` çözümleyicisi ve subagent dispatch yöneticisi. |
+| | `harness-doctor.sh` | 8 MCP, gizli anahtar, koşullu `impeccable_ui` ve ortam sağlığı kontrol aracı. |
 | **Alt Ajanlar (`agents/`)** | `canon-auditor.md` | Domain glossary, flows ve Clean Architecture denetçisi (`inherit`/`pro` + `HIGH` taban). |
 | | `security-reviewer.md` | PR diff güvenlik açığı ve secret tarayıcısı (frontier `inherit`/`pro` + `MAX`). |
 | | `pr-auditor.md` | Niyet çapası ve 7 boyutlu derin mimari denetçi (frontier `inherit`/`pro` + `HIGH`/`MAX`). |
@@ -252,10 +253,13 @@ Antigravity Swarm (`/swarm` veya çoklu ajan iş akışı) kullanılırken harne
 | **Engineering Harness** | Yapay zeka ajanlarının hata yapmasını ve kurallardan sapmasını engelleyen kancalar, kurallar ve denetim kapıları çerçevesi. |
 | **Flowchart** | Bileşenler arasındaki katman hiyerarşisini ve bağımlılık yönünü gösteren görsel akış şeması. |
 | **Idempotency** | Aynı komut veya işlemin defalarca çalıştırıldığında sistemde ilk işlem haricinde ek bir yan etki üretmemesi güvencesi. |
+| **Impeccable (Conditional UI Gate)** | UI/Frontend dosyaları değiştiğinde ve Impeccable kurulu olduğunda `stamp-gate.sh ui` (`impeccable detect --json` / `P0=0, P1=0`) ile `ui-pass.json` damgasını zorunlu kılan; `DO_NOT_TRACK=1` ve `IMPECCABLE_LIVE_COPY_AGENT=chat\|off` korumalı opsiyonel modül. |
 | **jev (TypeSafe System One)** | Ajan kararlarını ve kod diff'lerini sunucu tarafında bağlam kirletmeden olasılıksal olarak puanlayan değerlendirme motoru. |
 | **LSP (Language Server Protocol)** | Derleyici düzeyinde tip kontrolü, referans sorgulama ve sembol tanılamalarını ajana sunan standart protokol. |
 | **MCP (Model Context Protocol)** | Yapay zeka ajanlarının harici araçlar, dil sunucuları ve platformlara bağlanmasını sağlayan açık protokol. |
 | **Outbox Pattern** | Veritabanı durum değişikliği ile buna bağlı olay bildirimlerinin aynı işlemde atomik olarak kaydedilip güvenle iletilmesi deseni. |
+| **Orchestrator (Two-Phase Planner/Executor)** | Salt-okunur Planlama (`Neon`/`Carbon`/`Opus 5.5`) ile hızlı Yürütme (`Hydrogen`/`Sonnet 5.5`) fazları arasında el değiştiren Antigravity oturum modu. |
+| **run_workflow** | Python iş akışı betiği üzerinden paralel ve aşamalı ajan orkestrasyonu sağlayan Antigravity aracı. |
 | **PreToolUse & PostToolUse** | Antigravity'de bir aracın çalışmasından hemen önce (Pre) ve tamamlanmasından hemen sonra (Post) tetiklenen kancalar. |
 | **Sequence Diagram** | İstemci ile sunucu arasındaki mesajlaşma ve metot çağrı sırasını adım adım gösteren zaman eksenli UML diyagramı. |
 | **Sidecar (`harness-daemon`)** | Antigravity'nin ana ajandan bağımsız yönettiği, arka plan önbellekleme ve Unix domain socket üzerinden sıcak kanca değerlendirmesi sunan yardımcı süreç. |

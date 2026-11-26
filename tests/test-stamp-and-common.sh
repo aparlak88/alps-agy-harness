@@ -244,47 +244,73 @@ test_gemini4_and_orchestrator_parent_model_classification_and_selector() {
   assert_eq "orchestrator" "$(harness_classify_parent_model "gemini-pro-orchestrator")" "Orchestrator slug -> orchestrator"
   assert_eq "orchestrator" "$(harness_classify_parent_model "Orchestrator")" "Orchestrator display -> orchestrator"
   assert_eq "orchestrator" "$(harness_classify_parent_model "auto")" "auto -> orchestrator"
+  assert_eq "orchestrator_neon" "$(harness_classify_parent_model "gemini-pro-orchestrator-neon")" "Orchestrator Neon slug -> orchestrator_neon"
+  assert_eq "orchestrator_neon" "$(harness_classify_parent_model "Orchestrator (Neon)")" "Orchestrator Neon display -> orchestrator_neon"
+  assert_eq "orchestrator_carbon" "$(harness_classify_parent_model "Orchestrator (Carbon)")" "Orchestrator Carbon display -> orchestrator_carbon"
+  assert_eq "orchestrator_argon" "$(harness_classify_parent_model "Orchestrator (Argon)")" "Orchestrator Argon display -> orchestrator_argon"
   assert_eq "argon" "$(harness_classify_parent_model "gemini-4-argon-high")" "Argon High -> argon"
   assert_eq "argon" "$(harness_classify_parent_model "Gemini 4 Argon (Medium)")" "Argon Medium -> argon"
-  assert_eq "argon_low" "$(harness_classify_parent_model "gemini-4-argon-low")" "Argon Low slug -> argon_low"
-  assert_eq "argon_low" "$(harness_classify_parent_model "Gemini 4 Argon (Low)")" "Argon Low display -> argon_low"
+  assert_eq "frontier_low" "$(harness_classify_parent_model "gemini-4-argon-low")" "Argon Low slug -> frontier_low"
+  assert_eq "frontier_low" "$(harness_classify_parent_model "Gemini 4 Argon (Low)")" "Argon Low display -> frontier_low"
   assert_eq "hydrogen" "$(harness_classify_parent_model "gemini-4-hydrogen-xhigh")" "Hydrogen XHigh -> hydrogen"
-  assert_eq "claude" "$(harness_classify_parent_model "claude-opus-5-5-high")" "Claude Opus -> claude"
+  assert_eq "claude_opus" "$(harness_classify_parent_model "claude-opus-5-5-high")" "Claude Opus -> claude_opus"
+  assert_eq "claude_sonnet" "$(harness_classify_parent_model "Claude Sonnet 5.5")" "Claude Sonnet -> claude_sonnet"
   assert_eq "flash" "$(harness_classify_parent_model "gemini-3.8-flash-low")" "Gemini 3.8 Flash -> flash"
   assert_eq "flash" "$(harness_classify_parent_model "gpt-oss-120b-medium")" "GPT-OSS -> flash"
   assert_eq "custom" "$(harness_classify_parent_model "enterprise-tuned-v1")" "Unknown non-empty -> custom"
+
+  assert_eq "XHIGH" "$(harness_detect_parent_effort_hint "Gemini 4 Neon (Extra)")" "Extra effort label -> XHIGH"
+  assert_eq "XHIGH" "$(harness_detect_parent_effort_hint "gemini-4-hydrogen-xhigh")" "xhigh effort slug -> XHIGH"
+  assert_eq "LOW" "$(harness_detect_parent_effort_hint "Gemini 4 Carbon (Low)")" "Low effort label -> LOW"
+  assert_eq "HIGH" "$(harness_detect_parent_effort_hint "gemini-4-neon-high")" "High effort label -> HIGH"
+  assert_eq "" "$(harness_detect_parent_effort_hint "gemini-4-pro")" "Unmarked model -> empty effort hint"
+
+  harness_is_deprecated_model "gemini-4-argon-high" || { echo "Argon should be deprecated" >&2; return 1; }
+  harness_is_deprecated_model "Orchestrator (Argon)" || { echo "Orchestrator (Argon) should be deprecated" >&2; return 1; }
+  harness_is_deprecated_model "Claude Sonnet 4.6" || { echo "Claude 4.6 should be deprecated" >&2; return 1; }
+  if harness_is_deprecated_model "Gemini 4 Neon (High)"; then echo "Neon should not be deprecated" >&2; return 1; fi
+  if harness_is_deprecated_model "Orchestrator (Neon)"; then echo "Orchestrator (Neon) should not be deprecated" >&2; return 1; fi
 
   local repo state_dir
   repo=$(make_temp_repo)
   state_dir=$(harness_state_dir "$repo")
 
-  # Verify select-model CLI subcommand across Carbon, Orchestrator, Hydrogen, Argon, and Flash
-  local sel_carbon_bounded sel_carbon_crit sel_carbon_multi_default sel_carbon_multi_inherit sel_orch_bounded sel_hyd_bounded sel_hyd_crit sel_flash_multi
+  # Verify select-model CLI subcommand across Carbon, Orchestrator, Hydrogen, Argon, Neon Extra, Claude, and Flash
+  local sel_carbon_bounded sel_carbon_crit sel_carbon_multi_default sel_carbon_multi_inherit sel_orch_bounded sel_orch_crit sel_hyd_bounded sel_hyd_crit sel_flash_multi sel_neon_extra
   sel_carbon_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-carbon-high" --workspace "$repo")
-  assert_json_field "$sel_carbon_bounded" ".model" "pro" "Carbon bounded_execution steps down to pro (Argon)"
+  assert_json_field "$sel_carbon_bounded" ".model" "pro" "Carbon bounded_execution steps down to pro"
   assert_json_field "$sel_carbon_bounded" ".parentFamily" "carbon" "Carbon family reported"
+  assert_json_field "$sel_carbon_bounded" ".deprecated" "false" "Carbon is not deprecated"
 
   sel_carbon_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "gemini-4-carbon-high" --workspace "$repo")
   assert_json_field "$sel_carbon_crit" ".model" "inherit" "Carbon critical audit stays on inherit (Carbon)"
 
   sel_carbon_multi_default=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-4-carbon-medium" --workspace "$repo")
-  assert_json_field "$sel_carbon_multi_default" ".model" "pro" "Carbon multi_module defaults to pro (Argon)"
+  assert_json_field "$sel_carbon_multi_default" ".model" "pro" "Carbon multi_module defaults to pro"
 
   sel_carbon_multi_inherit=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-4-carbon-medium" --caller-model "inherit" --workspace "$repo")
   assert_json_field "$sel_carbon_multi_inherit" ".model" "inherit" "Carbon multi_module preserves explicit inherit"
 
-  sel_orch_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-pro-orchestrator" --workspace "$repo")
+  sel_orch_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-pro-orchestrator-neon" --workspace "$repo")
+  assert_json_field "$sel_orch_bounded" ".parentFamily" "orchestrator_neon" "Orchestrator Neon family reported"
   assert_json_field "$sel_orch_bounded" ".model" "inherit" "Orchestrator bounded_execution uses inherit (-> Hydrogen)"
+
+  sel_orch_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "Orchestrator (Neon)" --workspace "$repo")
+  assert_json_field "$sel_orch_crit" ".model" "pro" "Orchestrator critical audit escalates to pro"
+
+  sel_neon_extra=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "Gemini 4 Neon (Extra)" --workspace "$repo")
+  assert_json_field "$sel_neon_extra" ".parentEffortHint" "XHIGH" "Extra effort label emits XHIGH parentEffortHint"
 
   sel_hyd_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-hydrogen-xhigh" --effort "XHIGH" --workspace "$repo")
   assert_json_field "$sel_hyd_bounded" ".model" "inherit" "Hydrogen bounded_execution keeps inherit (Hydrogen)"
   assert_json_field "$sel_hyd_bounded" ".effortProfile" "XHIGH" "select-model supports explicit XHIGH effort"
 
   sel_hyd_crit=$("$STAMP_GATE" select-model --tier "critical_architecture_or_audit" --parent-model "gemini-4-hydrogen-xhigh" --workspace "$repo")
-  assert_json_field "$sel_hyd_crit" ".model" "pro" "Hydrogen critical audit escalates to pro (Argon)"
+  assert_json_field "$sel_hyd_crit" ".model" "pro" "Hydrogen critical audit escalates to pro"
 
   sel_flash_multi=$("$STAMP_GATE" select-model --tier "multi_module_integration" --parent-model "gemini-3.8-flash-low" --workspace "$repo")
-  assert_json_field "$sel_flash_multi" ".model" "pro" "Flash multi_module escalates to pro (Argon)"
+  assert_json_field "$sel_flash_multi" ".model" "pro" "Flash multi_module escalates to pro"
+  assert_json_field "$sel_flash_multi" ".deprecated" "true" "Gemini 3.8 Flash reports deprecated: true"
 
   # Verify dispatch with --parent-model and --effort XHIGH
   "$STAMP_GATE" dispatch --role "Hydrogen Worker" --type "self" --tier "bounded_execution" --parent-model "gemini-4-hydrogen-xhigh" --effort "XHIGH" --workspace "$repo"
@@ -725,14 +751,20 @@ test_neon_gemini4_and_custom_model_classification_parity() {
   local cases=(
     "gemini-4-neon-high|neon"
     "Gemini 4 Neon (Medium)|neon"
-    "gemini-4-neon-low|argon_low"
-    "Gemini 4 Neon (Low)|argon_low"
-    "gemini-4-neon low|argon_low"
-    "Orchestrator (Neon)|orchestrator"
-    "gemini-4-pro|argon"
-    "Gemini 4 Ultra (High)|argon"
-    "gemini-4-pro-low|argon_low"
-    "Gemini 4 (Low)|argon_low"
+    "Gemini 4 Neon (Extra)|neon"
+    "gemini-4-neon-low|frontier_low"
+    "Gemini 4 Neon (Low)|frontier_low"
+    "gemini-4-neon low|frontier_low"
+    "Gemini 4 Carbon (Low)|frontier_low"
+    "Orchestrator (Neon)|orchestrator_neon"
+    "Orchestrator (Carbon)|orchestrator_carbon"
+    "Orchestrator (Argon)|orchestrator_argon"
+    "gemini-4-pro|neon"
+    "Gemini 4 Ultra (High)|neon"
+    "gemini-4-pro-low|frontier_low"
+    "Gemini 4 (Low)|frontier_low"
+    "Claude Opus 5.5 (Thinking)|claude_opus"
+    "Claude Sonnet 5.5|claude_sonnet"
     "gemini-4-flash|flash"
     "gemini-4-flash-low|flash"
     "enterprise-tuned-v1|custom"
@@ -751,7 +783,7 @@ test_neon_gemini4_and_custom_model_classification_parity() {
   # 2. Bash vs Python resolve_subagent_model parity across all tiers, caller_model, and floor_upgraded
   local py_res='import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.resolve_subagent_model(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "true"))'
   local tier caller floor sh_res py_res_out
-  local m_list=("gemini-4-neon-high" "gemini-4-neon-low" "gemini-4-pro" "gemini-4-flash" "enterprise-tuned-v1" "")
+  local m_list=("gemini-4-neon-high" "gemini-4-neon-low" "Orchestrator (Neon)" "Orchestrator (Carbon)" "Claude Opus 5.5" "Claude Sonnet 5.5" "gemini-4-hydrogen-xhigh" "gemini-4-pro" "gemini-4-flash" "enterprise-tuned-v1" "")
   local t_list=("trivial_lookup" "bounded_execution" "multi_module_integration" "critical_architecture_or_audit")
   for model in "${m_list[@]}"; do
     for tier in "${t_list[@]}"; do
@@ -763,6 +795,20 @@ test_neon_gemini4_and_custom_model_classification_parity() {
         done
       done
     done
+  done
+
+  # 2b. Bash vs Python detect_parent_effort_hint & is_deprecated_parent_model parity
+  local py_eff='import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(harness_core.detect_parent_effort_hint(sys.argv[2]))'
+  local py_dep='import sys; sys.path.insert(0, sys.argv[1]); import harness_core; print("true" if harness_core.is_deprecated_parent_model(sys.argv[2]) else "false")'
+  local meta_models=("Gemini 4 Neon (Extra)" "gemini-4-hydrogen-xhigh" "Gemini 4 Neon (Low)" "gemini-4-argon-high" "Orchestrator (Argon)" "gemini-3.8-flash-low" "gpt-oss-120b-medium" "Claude 4.6 Sonnet" "Orchestrator (Neon)" "Claude Opus 5.5" "")
+  for model in "${meta_models[@]}"; do
+    local sh_eff py_eff_out sh_dep py_dep_out
+    sh_eff=$(harness_detect_parent_effort_hint "$model")
+    py_eff_out=$(python3 -B -c "$py_eff" "$REPO_ROOT/scripts/lib" "$model")
+    assert_eq "$py_eff_out" "$sh_eff" "Effort hint parity failed for '$model'"
+    if harness_is_deprecated_model "$model"; then sh_dep="true"; else sh_dep="false"; fi
+    py_dep_out=$(python3 -B -c "$py_dep" "$REPO_ROOT/scripts/lib" "$model")
+    assert_eq "$py_dep_out" "$sh_dep" "Deprecation parity failed for '$model'"
   done
 
   # 3. Specific routing contracts via stamp-gate.sh select-model
@@ -791,8 +837,193 @@ test_neon_gemini4_and_custom_model_classification_parity() {
   assert_json_field "$sel_flash_bounded" ".model" "flash" "flash bounded_execution remains flash"
 
   sel_g4_pro_bounded=$("$STAMP_GATE" select-model --tier "bounded_execution" --parent-model "gemini-4-pro" --workspace "$repo")
-  assert_json_field "$sel_g4_pro_bounded" ".parentFamily" "argon"
-  assert_json_field "$sel_g4_pro_bounded" ".model" "pro" "unmatched gemini-4-pro classifies as argon and routes bounded_execution -> pro"
+  assert_json_field "$sel_g4_pro_bounded" ".parentFamily" "neon"
+  assert_json_field "$sel_g4_pro_bounded" ".model" "pro" "unmatched gemini-4-pro classifies as neon and routes bounded_execution -> pro"
+}
+
+test_ui_stamp_web_detect_enforcement_and_native_p0_p1_validation() {
+  # shellcheck source=/dev/null
+  source "$COMMON_SH"
+  local repo mock_bin mock_cfg env_log
+  repo=$(make_temp_repo)
+  mock_bin="$repo/.mock-impeccable"
+  mock_cfg="$repo/.mock-cfg"
+  env_log="$repo/.mock-detect-env.log"
+  mkdir -p "$mock_cfg"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/ui-card" --quiet
+
+  # 1. Pure backend change does NOT require ui-pass.json even when Impeccable is installed
+  mkdir -p "$repo/src"
+  echo "export class Order {}" > "$repo/src/Order.cs"
+  git -C "$repo" add src/Order.cs
+  git -C "$repo" commit -m "feat: backend order" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  cat << 'EOF' > "$mock_bin"
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$mock_bin"
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" verify-pr-stamps --workspace "$repo"
+
+  # 2. Add Web UI file -> verify-pr-stamps requires ui-pass.json when Impeccable is present,
+  #    and does NOT require it when Impeccable is absent
+  mkdir -p "$repo/src/app"
+  echo "<section class='hero'><h1>Hello</h1></section>" > "$repo/src/app/Hero.html"
+  git -C "$repo" add src/app/Hero.html
+  git -C "$repo" commit -m "feat: add Hero.html" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs" --allow-file "src/app/Hero.html"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  # Without Impeccable installed -> verify-pr-stamps passes without ui-pass.json
+  HARNESS_CONFIG_DIR="$mock_cfg" env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR \
+    "$STAMP_GATE" verify-pr-stamps --workspace "$repo"
+
+  # With Impeccable installed -> verify-pr-stamps fails until ui-pass.json is stamped
+  local missing_ui_err
+  if missing_ui_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+      "$STAMP_GATE" verify-pr-stamps --workspace "$repo" 2>&1); then
+    echo "verify-pr-stamps must fail when Web UI changed and Impeccable is installed without ui-pass.json" >&2
+    return 1
+  fi
+  assert_contains "$missing_ui_err" "ui stamp"
+
+  # 3. Mock detector returning exit 2 (slop findings) blocks PASS stamp
+  cat << 'EOF' > "$mock_bin"
+#!/usr/bin/env bash
+echo '[{"rule":"overused-font","file":"src/app/Hero.html"}]'
+exit 2
+EOF
+  chmod +x "$mock_bin"
+
+  set +e
+  local detect_fail_err rc_detect=0
+  detect_fail_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0 2>&1)
+  rc_detect=$?
+  set -e
+  assert_eq "2" "$rc_detect" "Detector findings (exit 2) must reject ui PASS stamp with exit 2"
+  assert_contains "$detect_fail_err" "overused-font"
+
+  local state_dir
+  state_dir="$(harness_state_dir "$repo")"
+  [ ! -f "$state_dir/ui-pass.json" ] || { echo "ui-pass.json must not be written when detector exits 2" >&2; return 1; }
+
+  # 4. Non-zero p0 or p1 rejects PASS stamp (exit 1)
+  if HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+      "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 1 --p1 0 >/dev/null 2>&1; then
+    echo "ui PASS with p0=1 must be rejected" >&2
+    return 1
+  fi
+  if HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+      "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 2 >/dev/null 2>&1; then
+    echo "ui PASS with p1=2 must be rejected" >&2
+    return 1
+  fi
+
+  # 5. Clean detector (exit 0) verifies safe env and writes valid ui-pass.json
+  cat << EOF > "$mock_bin"
+#!/usr/bin/env bash
+printf 'DO_NOT_TRACK=%s\nIMPECCABLE_LIVE_COPY_AGENT=%s\nARGS=%s\n' \
+  "\${DO_NOT_TRACK:-}" "\${IMPECCABLE_LIVE_COPY_AGENT:-}" "\$*" > "$env_log"
+echo '[]'
+exit 0
+EOF
+  chmod +x "$mock_bin"
+
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0
+  [ -f "$state_dir/ui-pass.json" ] || { echo "ui-pass.json must be created on clean detector pass" >&2; return 1; }
+  assert_json_field "$state_dir/ui-pass.json" ".verdict" "PASS"
+  assert_json_field "$state_dir/ui-pass.json" ".p0Count" "0"
+  assert_json_field "$state_dir/ui-pass.json" ".p1Count" "0"
+  assert_json_field "$state_dir/ui-pass.json" ".scannedWebFiles[0]" "src/app/Hero.html"
+
+  local env_dump
+  env_dump=$(cat "$env_log")
+  assert_contains "$env_dump" "DO_NOT_TRACK=1"
+  assert_contains "$env_dump" "IMPECCABLE_LIVE_COPY_AGENT=off"
+  assert_contains "$env_dump" "detect --json src/app/Hero.html"
+
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" verify-pr-stamps --workspace "$repo"
+
+  # 6. Modifying Hero.html after stamping invalidates ui-pass.json (stale codeTreeSha)
+  echo "<section class='hero'><h1>Updated</h1></section>" > "$repo/src/app/Hero.html"
+  git -C "$repo" add src/app/Hero.html
+  git -C "$repo" commit -m "feat: update Hero.html" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs" --allow-file "src/app/Hero.html"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  local stale_err
+  if stale_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+      "$STAMP_GATE" verify-pr-stamps --workspace "$repo" 2>&1); then
+    echo "verify-pr-stamps must reject stale ui-pass.json after UI commit" >&2
+    return 1
+  fi
+  assert_contains "$stale_err" "ui-pass.json codeTreeSha"
+
+  # 7. Native SwiftUI change with SKILL.md only (no web files) requires ui-pass.json and passes without binary detector
+  local native_repo native_skill_dir
+  native_repo=$(make_temp_repo)
+  native_skill_dir="$native_repo/.mock-skill"
+  mkdir -p "$native_skill_dir" "$native_repo/Sources/Features"
+  echo "# Impeccable" > "$native_skill_dir/SKILL.md"
+  echo "init" > "$native_repo/README.md"
+  git -C "$native_repo" add README.md
+  git -C "$native_repo" commit -m "chore: init" --quiet
+  git -C "$native_repo" checkout -b "feat/paywall-view" --quiet
+  echo "struct PaywallView {}" > "$native_repo/Sources/Features/PaywallView.swift"
+  git -C "$native_repo" add Sources/Features/PaywallView.swift
+  git -C "$native_repo" commit -m "feat: add PaywallView" --quiet
+  "$STAMP_GATE" canon --workspace "$native_repo" --verdict PASS --allow-file "Sources/Features/PaywallView.swift"
+  "$STAMP_GATE" security --workspace "$native_repo" --verdict PASS --critical 0 --important 0
+
+  if HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$native_skill_dir" \
+      "$STAMP_GATE" verify-pr-stamps --workspace "$native_repo" >/dev/null 2>&1; then
+    echo "Native SwiftUI UI change with Impeccable skill must require ui-pass.json" >&2
+    return 1
+  fi
+
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$native_skill_dir" \
+    "$STAMP_GATE" ui --workspace "$native_repo" --verdict PASS --p0 0 --p1 0
+  local native_state_dir
+  native_state_dir="$(harness_state_dir "$native_repo")"
+  assert_json_field "$native_state_dir/ui-pass.json" ".auditedNativeFiles[0]" "Sources/Features/PaywallView.swift"
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$native_skill_dir" \
+    "$STAMP_GATE" verify-pr-stamps --workspace "$native_repo"
+
+  # 8. --target cannot bypass changed Web UI files when --verdict PASS, and non-executable repo scripts are not executed via /bin/sh
+  local partial_err
+  if partial_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$repo/.missing-bin" "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0 --target README.md 2>&1); then
+    echo "stamp-gate ui --verdict PASS --target README.md must still scan changed Hero.html and require valid detector" >&2
+    return 1
+  fi
+  mkdir -p "$repo/.agent/skills/impeccable/scripts"
+  cat << 'EOF' > "$repo/.agent/skills/impeccable/scripts/impeccable"
+#!/usr/bin/env bash
+echo '[]'
+exit 0
+EOF
+  # Deliberately NOT chmod +x: must NOT run via /bin/sh fallback
+  echo "# Skill" > "$repo/.agent/skills/impeccable/SKILL.md"
+  if HARNESS_CONFIG_DIR="$mock_cfg" env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR \
+      "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0 --target README.md >/dev/null 2>&1; then
+    echo "Non-executable .agent/skills/impeccable/scripts/impeccable must not be executed via /bin/sh" >&2
+    return 1
+  fi
+
+  # 9. Angular .component.ts files classify as webFiles (not nativeFiles)
+  local comp_cls
+  comp_cls=$(python3 -B -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import harness_core; print(json.dumps(harness_core.classify_ui_files(["src/app/hero.component.ts"])))' "$REPO_ROOT/scripts/lib")
+  assert_json_field "$comp_cls" ".webFiles[0]" "src/app/hero.component.ts" ".component.ts classifies into webFiles"
+  assert_eq "0" "$(printf '%s\n' "$comp_cls" | jq '.nativeFiles | length')" ".component.ts must not fall into nativeFiles"
 }
 
 run_tests "$@"

@@ -14,6 +14,7 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import ast
 import contextlib
 import fcntl
 import glob
@@ -56,6 +57,62 @@ DOTNET_VAL_FLAGS = frozenset(
 )
 AUDITOR_BASENAMES = frozenset(("canon-auditor.md", "security-reviewer.md", "pr-auditor.md"))
 PBXPROJ_BUNDLE_RE = re.compile(r"PRODUCT_BUNDLE_IDENTIFIER\s*=\s*\"?([^;\n\"]+)\"?\s*;")
+
+WEB_UI_EXTENSIONS = frozenset(
+    (".html", ".htm", ".tsx", ".jsx", ".vue", ".svelte", ".astro", ".css", ".scss", ".sass", ".less", ".component.ts")
+)
+WEB_CONFIG_FILENAMES = frozenset(
+    (
+        "angular.json",
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.ts",
+        "vite.config.js",
+        "vite.config.mjs",
+        "vite.config.ts",
+        "svelte.config.js",
+        "astro.config.mjs",
+        "nuxt.config.ts",
+    )
+)
+WEB_PACKAGE_DEPS = frozenset(
+    ("@angular/core", "react", "react-dom", "vue", "svelte", "next", "nuxt", "astro", "tailwindcss", "solid-js")
+)
+IMPECCABLE_SAFE_ENV = {
+    "DO_NOT_TRACK": "1",
+    "IMPECCABLE_LIVE_COPY_AGENT": "off",
+    "IMPECCABLE_TELEMETRY_CHANNEL": "disabled",
+}
+UI_TEST_FILE_RE = re.compile(
+    r"(?:\.(?:spec|test)\.(?:[jt]sx?|mjs|cjs)|(?:Tests?|Specs?)\.(?:swift|kt|cs))$",
+    re.IGNORECASE,
+)
+ANDROID_RES_LAYOUT_RE = re.compile(r"(?:^|/)res/layout/[^/]+\.xml$")
+UI_SKIP_WALK_DIRS = frozenset(
+    (
+        ".git",
+        ".harness",
+        ".impeccable",
+        ".superpowers",
+        "node_modules",
+        ".worktrees",
+        "Pods",
+        "DerivedData",
+        "__pycache__",
+        "dist",
+        "build",
+        "target",
+        "bin",
+        "obj",
+        "medium-kit",
+        "tests",
+        "test",
+        "docs",
+        "assets",
+        ".agents",
+        ".agent",
+    )
+)
 
 
 def utc_now_iso() -> str:
@@ -1029,6 +1086,25 @@ def _evaluate_stamp_status(stamp_data: Optional[dict[str, Any]], current_sha: st
     return "fresh", stamp_sha
 
 
+def _evaluate_ui_stamp_status(stamp_data: Optional[dict[str, Any]], current_sha: str) -> tuple[str, str]:
+    """Return ``(status, stamp_sha)`` for ``ui-pass.json`` (``fresh|stale|fail|missing``)."""
+    if not isinstance(stamp_data, dict):
+        return "missing", ""
+    verdict = str(stamp_data.get("verdict", ""))
+    stamp_sha = str(stamp_data.get("codeTreeSha", ""))
+    if verdict != "PASS":
+        return "fail", stamp_sha
+    if (
+        not _is_zero_int(stamp_data.get("p0Count"))
+        or not _is_zero_int(stamp_data.get("p1Count"))
+        or not _is_zero_int(stamp_data.get("detectorFindings", 0))
+    ):
+        return "fail", stamp_sha
+    if current_sha == "UNBORN" or stamp_sha != current_sha:
+        return "stale", stamp_sha
+    return "fresh", stamp_sha
+
+
 def compute_tree_and_stamp_state(workspace: Path, existing_cache: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Compute branch, HEAD OID, codeTreeSha, and PR stamp freshness.
 
@@ -1052,10 +1128,12 @@ def compute_tree_and_stamp_state(workspace: Path, existing_cache: Optional[dict[
     state_dir = workspace / ".harness" / "state" / slug
     canon_data = read_json_file(state_dir / "canon-pass.json")
     sec_data = read_json_file(state_dir / "security-pass.json")
+    ui_data = read_json_file(state_dir / "ui-pass.json")
     pending_data = read_json_file(state_dir / "pr-audit-pending.json")
 
     canon_status, canon_sha = _evaluate_stamp_status(canon_data, code_sha, require_zero_findings=False)
     sec_status, sec_sha = _evaluate_stamp_status(sec_data, code_sha, require_zero_findings=True)
+    ui_status, ui_sha = _evaluate_ui_stamp_status(ui_data, code_sha)
 
     return {
         "schemaVersion": CACHE_SCHEMA_VERSION,
@@ -1070,13 +1148,20 @@ def compute_tree_and_stamp_state(workspace: Path, existing_cache: Optional[dict[
         "securityStampStatus": sec_status,
         "securityStampValid": sec_status == "fresh",
         "securityStampSha": sec_sha,
+        "uiStampStatus": ui_status,
+        "uiStampValid": ui_status == "fresh",
+        "uiStampSha": ui_sha,
         "prAuditPending": isinstance(pending_data, dict),
         "prAuditConversationId": str(pending_data.get("conversationId") or "") if isinstance(pending_data, dict) else "",
     }
 
 
-def verify_pr_stamps(workspace: Path) -> tuple[bool, str]:
-    """Verify canon-pass.json and security-pass.json against live HEAD codeTreeSha."""
+def verify_pr_stamps(
+    workspace: Path,
+    diff_files: Optional[list[str]] = None,
+    config_dir: Optional[Path] = None,
+) -> tuple[bool, str]:
+    """Verify canon-pass.json, security-pass.json, and conditional ui-pass.json against HEAD codeTreeSha."""
     live_head = get_head_oid(workspace)
     if live_head == "UNBORN":
         return False, "Error: verify-pr-stamps failed: repository HEAD is UNBORN (no commits found)"
@@ -1089,6 +1174,7 @@ def verify_pr_stamps(workspace: Path) -> tuple[bool, str]:
     state_dir = get_state_dir(workspace)
     canon_file = state_dir / "canon-pass.json"
     security_file = state_dir / "security-pass.json"
+    ui_file = state_dir / "ui-pass.json"
 
     if not canon_file.is_file():
         return False, f"Error: verify-pr-stamps failed: missing canon stamp ({canon_file})"
@@ -1119,6 +1205,42 @@ def verify_pr_stamps(workspace: Path) -> tuple[bool, str]:
             f"Error: verify-pr-stamps failed: security-pass.json codeTreeSha ({sec_sha}) does not match current HEAD codeTreeSha ({current_sha})",
         )
 
+    need_ui, ui_info_chk, _ = requires_ui_stamp(workspace, diff_files=diff_files, config_dir=config_dir)
+    if need_ui and not ui_file.is_file():
+        return (
+            False,
+            f"Error: verify-pr-stamps failed: missing ui stamp ({ui_file}) required because UI/Frontend files changed and Impeccable is installed",
+        )
+    if need_ui or ui_file.is_file():
+        ui_data = read_json_file(ui_file) or {}
+        ui_verdict = str(ui_data.get("verdict", ""))
+        ui_sha = str(ui_data.get("codeTreeSha", ""))
+        if ui_verdict != "PASS":
+            return False, f"Error: verify-pr-stamps failed: ui-pass.json verdict is '{ui_verdict}' (expected PASS)"
+        if (
+            not _is_zero_int(ui_data.get("p0Count"))
+            or not _is_zero_int(ui_data.get("p1Count"))
+            or not _is_zero_int(ui_data.get("detectorFindings", 0))
+        ):
+            return (
+                False,
+                "Error: verify-pr-stamps failed: ui-pass.json has non-zero p0Count, p1Count, or detectorFindings",
+            )
+        if ui_sha != current_sha:
+            return (
+                False,
+                f"Error: verify-pr-stamps failed: ui-pass.json codeTreeSha ({ui_sha}) does not match current HEAD codeTreeSha ({current_sha})",
+            )
+        req_web = [f for f in ui_info_chk["webFiles"] if (workspace / f).is_file()]
+        raw_scanned = ui_data.get("scannedWebFiles")
+        scanned_web = {str(p) for p in raw_scanned if isinstance(p, str)} if isinstance(raw_scanned, list) else set()
+        missing_web = [f for f in req_web if f not in scanned_web]
+        if missing_web:
+            return (
+                False,
+                f"Error: verify-pr-stamps failed: ui-pass.json scannedWebFiles omits changed Web UI file(s): {', '.join(missing_web)}",
+            )
+
     return True, ""
 
 
@@ -1127,28 +1249,76 @@ def _is_low_model_variant(norm: str) -> bool:
     return norm.endswith("-low") or "(low)" in norm or " low" in norm
 
 
+def is_extra_effort_model(norm: str) -> bool:
+    """Return True when normalized model name indicates an Extra / XHigh reasoning tier."""
+    return (
+        norm.endswith("-xhigh")
+        or norm.endswith("-extra")
+        or "(xhigh)" in norm
+        or " xhigh" in norm
+        or "(extra)" in norm
+        or " extra" in norm
+    )
+
+
+def detect_parent_effort_hint(raw: str) -> str:
+    """Extract parent reasoning effort hint (LOW|MEDIUM|HIGH|XHIGH|'') from ``modelName``."""
+    norm = (raw or "").strip().lower()
+    if not norm:
+        return ""
+    if is_extra_effort_model(norm):
+        return "XHIGH"
+    if norm.endswith("-high") or "(high)" in norm or " high" in norm:
+        return "HIGH"
+    if norm.endswith("-medium") or "(medium)" in norm or " medium" in norm:
+        return "MEDIUM"
+    if _is_low_model_variant(norm):
+        return "LOW"
+    return ""
+
+
+def is_deprecated_parent_model(raw: str) -> bool:
+    """Return True when ``raw`` identifies a model retiring on 2026-11-30."""
+    norm = (raw or "").strip().lower()
+    if not norm:
+        return False
+    if "argon" in norm or "3.8-flash" in norm or "3.8 flash" in norm or "gpt-oss" in norm:
+        return True
+    if ("claude" in norm or "sonnet" in norm or "opus" in norm) and ("4-6" in norm or "4.6" in norm):
+        return True
+    return False
+
+
 def classify_parent_model(raw: str) -> str:
     """Classify parent modelName into canonical routing family."""
     trimmed = re.sub(r"\s+", "", raw or "")
     if not trimmed:
         return "unset"
     norm = (raw or "").lower()
-    if "orchestrator" in norm or norm == "auto":
+    if "orchestrator" in norm or norm.strip() == "auto":
+        if "neon" in norm:
+            return "orchestrator_neon"
+        if "argon" in norm:
+            return "orchestrator_argon"
+        if "carbon" in norm:
+            return "orchestrator_carbon"
         return "orchestrator"
-    if "carbon" in norm:
-        return "carbon"
     if "neon" in norm:
-        return "argon_low" if _is_low_model_variant(norm) else "neon"
+        return "frontier_low" if _is_low_model_variant(norm) else "neon"
+    if "carbon" in norm:
+        return "frontier_low" if _is_low_model_variant(norm) else "carbon"
     if "argon" in norm:
-        return "argon_low" if _is_low_model_variant(norm) else "argon"
+        return "frontier_low" if _is_low_model_variant(norm) else "argon"
     if "hydrogen" in norm:
         return "hydrogen"
-    if any(tok in norm for tok in ("claude", "opus", "sonnet")):
-        return "claude"
+    if "sonnet" in norm:
+        return "claude_sonnet"
+    if "opus" in norm or "claude" in norm:
+        return "frontier_low" if _is_low_model_variant(norm) else "claude_opus"
     if "flash" in norm or "gpt-oss" in norm:
         return "flash"
     if "gemini-4" in norm or "gemini 4" in norm:
-        return "argon_low" if _is_low_model_variant(norm) else "argon"
+        return "frontier_low" if _is_low_model_variant(norm) else "neon"
     return "custom"
 
 
@@ -1288,23 +1458,33 @@ def evaluate_pre_edit(
     if rel_path == ".superpowers" or rel_path.startswith(".superpowers/") or rel_path == ".harness" or rel_path.startswith(".harness/"):
         return {"decision": "allow"}
 
+    append_val = args.get("Append", False)
+    is_append = str(append_val).lower() == "true" if not isinstance(append_val, bool) else append_val
+    content = str(args.get("Content") or "")
+    replacement = str(args.get("Replacement") or "")
+    text_to_check = content if tool_name == "write_file" else replacement
+
+    if rel_path == ".impeccable" or rel_path.startswith(".impeccable/"):
+        if PRIVATE_KEY_RE.search(text_to_check):
+            return {"decision": "deny", "reason": "Plain private key detected in code; secrets must never be committed."}
+        return {"decision": "allow"}
+
     # Rule 1: main/master lock when HEAD exists
     branch = get_branch_name(effective_ws)
     if branch in ("main", "master") and get_head_oid(effective_ws) != "UNBORN":
-        if not (rel_path.startswith("docs/superpowers/specs/") or rel_path.startswith("docs/canon/")):
+        if not (
+            rel_path.startswith("docs/superpowers/specs/")
+            or rel_path.startswith("docs/canon/")
+            or rel_path in ("PRODUCT.md", "DESIGN.md")
+        ):
             return {
                 "decision": "deny",
                 "reason": (
                     f"Direct writes to workspace file '{rel_path}' are locked on branch '{branch}'. "
                     "Feature development must occur in a feature branch or worktree "
-                    "(only docs/superpowers/specs/* and docs/canon/* may be drafted on main/master)."
+                    "(only docs/superpowers/specs/*, docs/canon/*, PRODUCT.md, and DESIGN.md may be drafted on main/master)."
                 ),
             }
-
-    append_val = args.get("Append", False)
-    is_append = str(append_val).lower() == "true" if not isinstance(append_val, bool) else append_val
-    content = str(args.get("Content") or "")
-    replacement = str(args.get("Replacement") or "")
 
     # Rule 2: Technical Glossary gate on documentation creation
     if tool_name == "write_file" and not is_append:
@@ -1318,10 +1498,10 @@ def evaluate_pre_edit(
             }
 
     # Rule 3: Dangerous patterns in production code
-    if rel_path.startswith("docs/") or rel_path.startswith("tests/") or rel_path == "README.md":
+    if rel_path.startswith("docs/") or rel_path.startswith("tests/") or rel_path in ("README.md", "PRODUCT.md", "DESIGN.md"):
+        if rel_path in ("PRODUCT.md", "DESIGN.md") and PRIVATE_KEY_RE.search(text_to_check):
+            return {"decision": "deny", "reason": "Plain private key detected in code; secrets must never be committed."}
         return {"decision": "allow"}
-
-    text_to_check = content if tool_name == "write_file" else replacement
 
     if PRIVATE_KEY_RE.search(text_to_check):
         return {"decision": "deny", "reason": "Plain private key detected in code; secrets must never be committed."}
@@ -1568,7 +1748,7 @@ def evaluate_pre_command(
     doc_cache: Optional[dict[str, Any]] = None,
     worktree_cache_getter: Optional[Callable[[Path], dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    """Evaluate all 4 PreToolUse command gates deterministically across worktree contexts."""
+    """Evaluate all 5 PreToolUse command gates deterministically across worktree contexts."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
 
@@ -1812,6 +1992,47 @@ def evaluate_pre_command(
                                 "reason": f"Local merge stamps for '{target_branch}' do not match target branch codeTreeSha ({target_tree_sha}) or verdict is not PASS",
                             }
 
+                        need_ui, seg_ui_info, _ = requires_ui_stamp(wt_for_branch or seg_ws, diff_files=diff_files)
+                        ui_path = target_state_dir / "ui-pass.json"
+                        if not ui_path.is_file() and wt_for_branch is not None:
+                            wt_ui = wt_for_branch / ".harness" / "state" / target_slug / "ui-pass.json"
+                            if wt_ui.is_file():
+                                ui_path = wt_ui
+                        if need_ui or ui_path.is_file():
+                            if not ui_path.is_file():
+                                return {
+                                    "decision": "deny",
+                                    "reason": f"Local merge requires valid ui-pass.json under .harness/state/{target_slug} (UI/Frontend files changed and Impeccable is installed)",
+                                }
+                            ui_data = read_json_file(ui_path) or {}
+                            if (
+                                ui_data.get("verdict") != "PASS"
+                                or not _is_zero_int(ui_data.get("p0Count"))
+                                or not _is_zero_int(ui_data.get("p1Count"))
+                                or not _is_zero_int(ui_data.get("detectorFindings", 0))
+                                or ui_data.get("codeTreeSha") != target_tree_sha
+                            ):
+                                return {
+                                    "decision": "deny",
+                                    "reason": f"Local merge ui-pass.json for '{target_branch}' does not match target branch codeTreeSha ({target_tree_sha}) or has non-PASS/non-zero findings",
+                                }
+                            if wt_for_branch is not None:
+                                req_web = [f for f in seg_ui_info["webFiles"] if (wt_for_branch / f).is_file()]
+                            else:
+                                req_web = [
+                                    f
+                                    for f in seg_ui_info["webFiles"]
+                                    if _run_git(seg_ws, ["cat-file", "-e", f"{target_branch}:{f}"]).returncode == 0
+                                ]
+                            raw_scanned = ui_data.get("scannedWebFiles")
+                            scanned_web = {str(p) for p in raw_scanned if isinstance(p, str)} if isinstance(raw_scanned, list) else set()
+                            missing_web = [f for f in req_web if f not in scanned_web]
+                            if missing_web:
+                                return {
+                                    "decision": "deny",
+                                    "reason": f"Local merge ui-pass.json scannedWebFiles omits changed Web UI file(s): {', '.join(missing_web)}",
+                                }
+
         # Gate 3: Package install verification
         pkgs = extract_install_packages(seg)
         if pkgs:
@@ -1966,7 +2187,7 @@ def evaluate_pre_command(
                                     "reason": f"PR creation blocked: documentation file '{f}' is missing a valid Technical Glossary / Teknik Terimler Sözlüğü section.",
                                 }
 
-                stamps_ok, verify_err = verify_pr_stamps(seg_ws)
+                stamps_ok, verify_err = verify_pr_stamps(seg_ws, diff_files=diff_files)
                 if not stamps_ok:
                     return {
                         "decision": "deny",
@@ -1989,6 +2210,8 @@ def evaluate_pre_command(
                             or f.startswith("docs/canon/")
                             or f.startswith("docs/walkthroughs/")
                             or f == "docs/parking-lot.md"
+                            or f in ("PRODUCT.md", "DESIGN.md")
+                            or f.startswith(".impeccable/")
                         ):
                             continue
                         if f not in allowed_set:
@@ -1996,6 +2219,10 @@ def evaluate_pre_command(
                                 "decision": "deny",
                                 "reason": f"PR creation blocked: file '{f}' is not in allowedFiles list in canon-pass.json and not an allowed documentation path.",
                             }
+
+    live_block = _check_impeccable_live_guard(cmd_line)
+    if live_block is not None:
+        return live_block
 
     return {"decision": "allow"}
 
@@ -2158,6 +2385,19 @@ def default_effort_for_tier(tier: str) -> Optional[str]:
     return TIER_DEFAULT_EFFORT.get(tier)
 
 
+ORCHESTRATOR_FAMILIES = frozenset(
+    ("orchestrator", "orchestrator_neon", "orchestrator_carbon", "orchestrator_argon")
+)
+VALID_SUBAGENT_MODEL_TIERS = frozenset(("inherit", "flash_lite", "flash", "pro"))
+FORBIDDEN_WORKFLOW_MODULES = frozenset(
+    ("subprocess", "pty", "shutil", "commands", "ctypes", "importlib", "popen2", "builtins", "posix", "nt", "_posixsubprocess")
+)
+FORBIDDEN_WORKFLOW_OS_ATTRS = frozenset(("system", "popen", "fork", "forkpty"))
+FORBIDDEN_WORKFLOW_OS_PREFIXES = ("exec", "spawn", "posix_spawn")
+FORBIDDEN_WORKFLOW_BUILTINS = frozenset(("eval", "exec", "compile", "__import__", "getattr"))
+MAX_WORKFLOW_SCRIPT_BYTES = 1_048_576
+
+
 def resolve_subagent_model(
     parent_model: str,
     tier: str,
@@ -2169,21 +2409,23 @@ def resolve_subagent_model(
     if tier == "trivial_lookup":
         return "flash_lite"
     if tier == "bounded_execution":
-        if family in ("orchestrator", "hydrogen", "argon_low"):
+        if family in (*ORCHESTRATOR_FAMILIES, "hydrogen", "frontier_low", "claude_sonnet"):
             return "inherit"
-        if family in ("carbon", "neon", "argon", "claude", "custom"):
+        if family in ("neon", "carbon", "argon", "claude_opus", "custom"):
             return "pro"
         return "flash"
     if tier == "multi_module_integration":
-        if family in ("orchestrator", "argon", "claude", "custom"):
-            return "inherit"
-        if family in ("carbon", "neon"):
+        if family in ORCHESTRATOR_FAMILIES:
+            return "pro"
+        if family in ("neon", "carbon"):
             return "inherit" if caller_model == "inherit" else "pro"
-        if family in ("argon_low", "hydrogen", "flash"):
+        if family in ("claude_opus", "argon", "custom"):
+            return "inherit"
+        if family in ("frontier_low", "hydrogen", "claude_sonnet", "flash"):
             return "pro"
         return "pro" if floor_upgraded else "inherit"
     if tier == "critical_architecture_or_audit":
-        if family in ("orchestrator", "carbon", "neon", "argon", "claude", "custom"):
+        if family in ("neon", "carbon", "claude_opus", "argon", "custom"):
             return "inherit"
         return "pro"
     raise ValueError(f"Unknown subagent dispatch tier: {tier}")
@@ -2562,8 +2804,199 @@ def _build_subagent_overwrite(model: str, effort: str, orig_prompt: str) -> dict
     return {"decision": "allow", "overwrite": {"Model": model, "Prompt": new_prompt}}
 
 
+def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate ``run_workflow`` PreToolUse guard for secrets, shell bypasses, and invalid model tiers."""
+    if is_harness_ignored(workspace):
+        return {"decision": "allow"}
+    if not isinstance(hook_input, dict):
+        return {"decision": "allow"}
+    tool_call = hook_input.get("toolCall")
+    if not isinstance(tool_call, dict):
+        return {"decision": "allow"}
+    if str(tool_call.get("name") or "") != "run_workflow":
+        return {"decision": "allow"}
+    args = tool_call.get("args")
+    if not isinstance(args, dict):
+        return {"decision": "allow"}
+
+    initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+    raw_cwd = args.get("Cwd")
+    wf_cwd = _resolve_dir_arg(initial_cwd, raw_cwd.strip()) if isinstance(raw_cwd, str) and raw_cwd.strip() else initial_cwd
+    linked_wt = resolve_linked_worktree(workspace, wf_cwd)
+    if linked_wt is not None and is_harness_ignored(linked_wt):
+        return {"decision": "allow"}
+
+    script_parts: list[str] = []
+    inline_script = args.get("Script")
+    if isinstance(inline_script, str) and inline_script:
+        script_parts.append(inline_script)
+
+    script_path_raw = str(args.get("ScriptPath") or "").strip()
+    if script_path_raw:
+        sp = _resolve_dir_arg(wf_cwd, script_path_raw)
+        _, is_ext = _resolve_rel_path(workspace, str(sp))
+        if is_ext:
+            wt_root = resolve_linked_worktree(workspace, sp)
+            if wt_root is None or _resolve_rel_path(wt_root, str(sp))[1]:
+                return {
+                    "decision": "deny",
+                    "reason": f"Workflow ScriptPath '{script_path_raw}' must reside inside the active workspace or linked worktree.",
+                }
+        if not sp.is_file():
+            return {
+                "decision": "deny",
+                "reason": f"Workflow ScriptPath '{script_path_raw}' does not exist or is not a file.",
+            }
+        try:
+            if sp.stat().st_size > MAX_WORKFLOW_SCRIPT_BYTES:
+                return {
+                    "decision": "deny",
+                    "reason": f"Workflow ScriptPath '{script_path_raw}' exceeds {MAX_WORKFLOW_SCRIPT_BYTES} bytes limit.",
+                }
+            script_parts.append(sp.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            return {
+                "decision": "deny",
+                "reason": f"Unable to read workflow ScriptPath '{script_path_raw}': {exc}",
+            }
+
+    full_script = "\n".join(script_parts)
+    if PRIVATE_KEY_RE.search(full_script):
+        return {
+            "decision": "deny",
+            "reason": "Plain private key detected in workflow script; secrets must never be embedded.",
+        }
+
+    try:
+        tree = ast.parse(full_script)
+    except SyntaxError as exc:
+        return {
+            "decision": "deny",
+            "reason": f"Invalid Python syntax in workflow script (fail-closed): {exc.msg}.",
+        }
+
+    os_aliases: set[str] = {"os"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".", 1)[0]
+                if root in FORBIDDEN_WORKFLOW_MODULES:
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            f"Importing forbidden module '{alias.name}' inside run_workflow scripts is blocked "
+                            "because direct shell/process execution bypasses pre-command-guard.sh."
+                        ),
+                    }
+                if root == "os":
+                    os_aliases.add(alias.asname or root)
+        elif isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            root = mod.split(".", 1)[0]
+            if root in FORBIDDEN_WORKFLOW_MODULES:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Importing from forbidden module '{mod}' inside run_workflow scripts is blocked "
+                        "because direct shell/process execution bypasses pre-command-guard.sh."
+                    ),
+                }
+            if root == "os":
+                for alias in node.names:
+                    nm = alias.name
+                    if nm == "*" or nm in FORBIDDEN_WORKFLOW_OS_ATTRS or nm.startswith(FORBIDDEN_WORKFLOW_OS_PREFIXES):
+                        return {
+                            "decision": "deny",
+                            "reason": (
+                                f"Direct os process execution ('from {mod} import {nm}') inside run_workflow "
+                                "bypasses pre-command-guard.sh and is denied."
+                            ),
+                        }
+            elif root == "asyncio":
+                for alias in node.names:
+                    nm = alias.name
+                    if nm == "*" or nm.startswith("create_subprocess"):
+                        return {
+                            "decision": "deny",
+                            "reason": (
+                                f"Direct asyncio subprocess execution ('from {mod} import {nm}') inside run_workflow "
+                                "bypasses pre-command-guard.sh and is denied."
+                            ),
+                        }
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            if node.id in FORBIDDEN_WORKFLOW_BUILTINS:
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Dynamic execution primitive '{node.id}' is blocked inside run_workflow scripts "
+                        "to prevent pre-command-guard.sh evasion."
+                    ),
+                }
+        elif isinstance(node, ast.Attribute):
+            attr = node.attr
+            if attr in FORBIDDEN_WORKFLOW_BUILTINS or attr == "__dict__" or (attr == "modules" and isinstance(node.value, ast.Name) and node.value.id == "sys"):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        f"Dynamic lookup/execution attribute '.{attr}' is blocked inside run_workflow scripts "
+                        "to prevent pre-command-guard.sh evasion."
+                    ),
+                }
+            if attr.startswith("create_subprocess"):
+                return {
+                    "decision": "deny",
+                    "reason": "Direct asyncio.create_subprocess_* calls inside run_workflow scripts are blocked.",
+                }
+            if isinstance(node.value, ast.Name) and node.value.id in os_aliases:
+                if attr in FORBIDDEN_WORKFLOW_OS_ATTRS or attr.startswith(FORBIDDEN_WORKFLOW_OS_PREFIXES):
+                    return {
+                        "decision": "deny",
+                        "reason": (
+                            f"Direct process execution ('{node.value.id}.{attr}') inside run_workflow scripts "
+                            "is blocked because it bypasses pre-command-guard.sh."
+                        ),
+                    }
+        elif isinstance(node, ast.Call):
+            is_agent_call = (
+                (isinstance(node.func, ast.Name) and node.func.id == "agent")
+                or (isinstance(node.func, ast.Attribute) and node.func.attr == "agent")
+            )
+            if is_agent_call:
+                for kw in node.keywords:
+                    if kw.arg is None:
+                        return {
+                            "decision": "deny",
+                            "reason": (
+                                "run_workflow agent(**kwargs) unpacking is blocked; "
+                                "pass explicit static string literals for agent(model=...)."
+                            ),
+                        }
+                    if kw.arg == "model":
+                        if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, str):
+                            return {
+                                "decision": "deny",
+                                "reason": (
+                                    "run_workflow agent(model=...) must be a static string literal in "
+                                    "{'inherit', 'flash_lite', 'flash', 'pro'}."
+                                ),
+                            }
+                        m_val = kw.value.value.strip()
+                        if not m_val or m_val not in VALID_SUBAGENT_MODEL_TIERS:
+                            return {
+                                "decision": "deny",
+                                "reason": (
+                                    f"Invalid workflow agent model tier '{m_val}'. "
+                                    "run_workflow agent(model=...) only accepts 'inherit', 'flash_lite', 'flash', or 'pro'."
+                                ),
+                            }
+
+    return {"decision": "allow"}
+
+
 def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate ``invoke_subagent`` and ``swarm`` PreToolUse guards with atomic locking and worktree discovery."""
+    """Evaluate ``invoke_subagent``, ``swarm``, and ``run_workflow`` PreToolUse guards."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
     if not isinstance(hook_input, dict):
@@ -2575,6 +3008,8 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     tool_name = str(tool_call.get("name") or "")
     if tool_name == "swarm":
         return evaluate_pre_swarm(workspace, hook_input)
+    if tool_name == "run_workflow":
+        return evaluate_pre_workflow(workspace, hook_input)
     if tool_name and tool_name != "invoke_subagent":
         return {"decision": "allow"}
     args = tool_call.get("args")
@@ -2603,7 +3038,7 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
         return _build_subagent_overwrite(sec_model, "MAX", orig_prompt)
 
     if type_name == "pr-auditor":
-        pr_effort = "HIGH"
+        pr_effort = "XHIGH" if detect_parent_effort_hint(parent_model) == "XHIGH" else "HIGH"
         matched_ws: Optional[Path] = None
         if role:
             candidates = _ordered_candidate_worktrees(workspace, orig_prompt)
@@ -2793,6 +3228,540 @@ def detect_mobile_workspace(workspace: Path) -> tuple[bool, bool]:
         if has_ios and has_android:
             break
     return has_ios, has_android
+
+
+def detect_ui_workspace(workspace: Path) -> dict[str, bool]:
+    """Detect whether ``workspace`` contains Web or Native UI/Frontend surfaces."""
+    has_web = False
+    has_xaml = False
+    has_ios, has_android = detect_mobile_workspace(workspace)
+    impeccable_marker = (workspace / ".impeccable").is_dir() or (workspace / "DESIGN.md").is_file()
+
+    for root, dirs, files in os.walk(workspace):
+        dirs[:] = [d for d in dirs if d not in UI_SKIP_WALK_DIRS]
+        for fname in files:
+            lower = fname.lower()
+            if fname in WEB_CONFIG_FILENAMES or any(lower.endswith(ext) for ext in WEB_UI_EXTENSIONS):
+                has_web = True
+            elif fname == "package.json":
+                pkg_data = read_json_file(Path(root) / fname)
+                if isinstance(pkg_data, dict):
+                    for dep_key in ("dependencies", "devDependencies"):
+                        deps = pkg_data.get(dep_key)
+                        if isinstance(deps, dict) and any(k in WEB_PACKAGE_DEPS for k in deps):
+                            has_web = True
+                            break
+            elif lower.endswith(".xaml"):
+                has_xaml = True
+        if has_web and (has_ios or has_android or has_xaml):
+            break
+
+    has_native = bool(has_ios or has_android or has_xaml)
+    return {
+        "hasWebUi": has_web,
+        "hasNativeUi": has_native,
+        "hasAnyUi": bool(has_web or has_native or impeccable_marker),
+    }
+
+
+def classify_ui_files(file_paths: list[str]) -> dict[str, Any]:
+    """Classify changed repository paths into Web UI, Native UI, or non-UI files."""
+    web_files: set[str] = set()
+    native_files: set[str] = set()
+    ignored_prefixes = (
+        "docs/",
+        "tests/",
+        "test/",
+        ".harness/",
+        ".impeccable/",
+        ".superpowers/",
+        "medium-kit/",
+        ".github/",
+        ".agent/",
+        ".agents/",
+    )
+
+    for raw in file_paths:
+        norm = raw.strip().replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        if not norm or norm.startswith(ignored_prefixes):
+            continue
+        base = os.path.basename(norm)
+        if UI_TEST_FILE_RE.search(base):
+            continue
+
+        lower = norm.lower()
+        base_lower = base.lower()
+        parts = [p for p in norm.split("/") if p]
+        lower_parts = {p.lower() for p in parts[:-1]}
+
+        if any(lower.endswith(ext) for ext in WEB_UI_EXTENSIONS):
+            web_files.add(norm)
+        elif (
+            lower.endswith(".xaml")
+            or (
+                lower.endswith(".swift")
+                and (
+                    bool(lower_parts & {"features", "presentation", "views", "ui", "screens"})
+                    or base_lower.endswith("view.swift")
+                    or base_lower.endswith("screen.swift")
+                )
+            )
+            or (
+                lower.endswith(".kt")
+                and (
+                    bool(lower_parts & {"features", "presentation", "ui", "compose", "screens"})
+                    or base_lower.endswith("screen.kt")
+                    or base_lower.endswith("view.kt")
+                )
+            )
+            or bool(ANDROID_RES_LAYOUT_RE.search(norm))
+        ):
+            native_files.add(norm)
+
+    sorted_web = sorted(web_files)
+    sorted_native = sorted(native_files)
+    sorted_all = sorted(web_files | native_files)
+    return {
+        "webFiles": sorted_web,
+        "nativeFiles": sorted_native,
+        "allUiFiles": sorted_all,
+        "hasUiChanges": bool(sorted_web or sorted_native),
+    }
+
+
+def _resolve_executable_detect_cmd(candidate_raw: str) -> list[str]:
+    """Build a command prefix ending in ``detect`` for an executable binary or launcher path."""
+    if not candidate_raw:
+        return []
+    expanded = os.path.expanduser(candidate_raw)
+    if os.path.sep in expanded or (os.altsep and os.altsep in expanded) or expanded.startswith("."):
+        p = Path(expanded)
+        if p.is_file() and os.access(p, os.X_OK):
+            return [str(p), "detect"]
+        return []
+    which = shutil.which(expanded)
+    return [which, "detect"] if which else []
+
+
+def detect_impeccable(
+    workspace: Path,
+    config_dir: Optional[Path] = None,
+    home_dir: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Detect Impeccable skill and CLI detector availability with strict test isolation."""
+    if os.environ.get("HARNESS_DISABLE_IMPECCABLE") == "1":
+        return {"installed": False, "projectConfigured": False, "skillPath": "", "detectorCmd": []}
+
+    project_configured = (
+        (workspace / ".impeccable").is_dir()
+        or (workspace / "DESIGN.md").is_file()
+        or (workspace / "PRODUCT.md").is_file()
+    )
+
+    explicit_cfg = (config_dir is not None) or bool(os.environ.get("HARNESS_CONFIG_DIR", "").strip())
+    cfg_dir = config_dir or Path(os.environ.get("HARNESS_CONFIG_DIR") or (Path.home() / ".gemini" / "config"))
+    raw_home_env = os.environ.get("HARNESS_HOME_DIR", "").strip()
+    if raw_home_env:
+        eff_home: Optional[Path] = Path(os.path.expanduser(raw_home_env))
+    elif home_dir is not None:
+        eff_home = home_dir
+    elif explicit_cfg:
+        eff_home = None
+    else:
+        eff_home = Path.home()
+
+    skill_candidates: list[Path] = []
+    explicit_skill = os.environ.get("HARNESS_IMPECCABLE_SKILL_DIR", "").strip()
+    if explicit_skill:
+        skill_candidates.append(Path(os.path.expanduser(explicit_skill)))
+    skill_candidates.extend(
+        [
+            workspace / ".agent" / "skills" / "impeccable",
+            workspace / ".agents" / "skills" / "impeccable",
+            cfg_dir / "skills" / "impeccable",
+        ]
+    )
+    if eff_home is not None:
+        skill_candidates.append(eff_home / ".agents" / "skills" / "impeccable")
+
+    skill_path = ""
+    matched_skill_dir: Optional[Path] = None
+    for sdir in skill_candidates:
+        if (sdir / "SKILL.md").is_file():
+            skill_path = str(sdir)
+            matched_skill_dir = sdir
+            break
+
+    detector_cmd: list[str] = []
+    explicit_bin = os.environ.get("HARNESS_IMPECCABLE_BIN", "").strip()
+    if not explicit_bin and not explicit_cfg:
+        explicit_bin = os.environ.get("IMPECCABLE_BIN", "").strip()
+
+    if explicit_bin:
+        detector_cmd = _resolve_executable_detect_cmd(explicit_bin)
+
+    # Prefer trusted global/user launchers before workspace-local .agent/.agents scripts so a PR
+    # branch cannot shadow the machine's Impeccable detector with an in-repo stub.
+    trusted_launchers: list[Path] = [cfg_dir / "skills" / "impeccable" / "scripts" / "impeccable"]
+    if eff_home is not None:
+        trusted_launchers.append(eff_home / ".agents" / "skills" / "impeccable" / "scripts" / "impeccable")
+        trusted_launchers.append(eff_home / ".impeccable" / "bin" / "impeccable")
+    if not detector_cmd:
+        for tlauncher in trusted_launchers:
+            if tlauncher.is_file() and os.access(tlauncher, os.X_OK):
+                detector_cmd = [str(tlauncher), "detect"]
+                break
+
+    if not detector_cmd and not explicit_cfg:
+        which_imp = shutil.which("impeccable")
+        if which_imp:
+            detector_cmd = [which_imp, "detect"]
+
+    if not detector_cmd and matched_skill_dir is not None:
+        launcher = matched_skill_dir / "scripts" / "impeccable"
+        if launcher.is_file() and os.access(launcher, os.X_OK):
+            detector_cmd = [str(launcher), "detect"]
+
+    installed = bool(skill_path or detector_cmd)
+    return {
+        "installed": installed,
+        "projectConfigured": project_configured,
+        "skillPath": skill_path,
+        "detectorCmd": detector_cmd,
+    }
+
+
+def _collect_branch_diff_files(workspace: Path, target_ref: str = "HEAD") -> list[str]:
+    """Return ACMR changed file paths relative to base branch merge-base."""
+    base = _resolve_base_branch(workspace)
+    if not base or get_head_oid(workspace) == "UNBORN":
+        return []
+    mb_res = _run_git(workspace, ["merge-base", base, target_ref])
+    merge_base = mb_res.stdout.strip() if mb_res.returncode == 0 else base
+    diff_res = _run_git(workspace, ["diff", "--name-only", "--diff-filter=ACMR", f"{merge_base}..{target_ref}"])
+    if diff_res.returncode != 0:
+        return []
+    return [line.strip() for line in diff_res.stdout.splitlines() if line.strip()]
+
+
+def requires_ui_stamp(
+    workspace: Path,
+    diff_files: Optional[list[str]] = None,
+    config_dir: Optional[Path] = None,
+) -> tuple[bool, dict[str, Any], dict[str, Any]]:
+    """Return ``(required, ui_info, impeccable_info)`` under dual-condition UI gate activation."""
+    files = diff_files if diff_files is not None else _collect_branch_diff_files(workspace, "HEAD")
+    ui_info = classify_ui_files(files)
+    imp = detect_impeccable(workspace, config_dir=config_dir)
+    return bool(ui_info["hasUiChanges"] and imp["installed"]), ui_info, imp
+
+
+def run_impeccable_detect(
+    workspace: Path,
+    web_rel_paths: list[str],
+    detector_cmd: list[str],
+) -> tuple[int, str, int]:
+    """Execute deterministic Impeccable CLI detector on existing Web UI files with safe env."""
+    existing = [p for p in web_rel_paths if (workspace / p).is_file()]
+    if not existing:
+        return 0, "[]", 0
+
+    safe_args = [f"./{p}" if p.startswith("-") else p for p in existing]
+    cmd = [*detector_cmd, "--json", *safe_args]
+    env = dict(os.environ)
+    env.update(IMPECCABLE_SAFE_ENV)
+    timeout_sec = max(5, int(os.environ.get("HARNESS_IMPECCABLE_TIMEOUT_SEC", "30")))
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(workspace),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+    except subprocess.TimeoutExpired:
+        return 1, f"detector timed out after {timeout_sec}s", 0
+    except OSError as exc:
+        return 1, str(exc), 0
+
+    if proc.returncode == 0:
+        return 0, proc.stdout.strip(), 0
+
+    if proc.returncode == 2:
+        items: list[Any] = []
+        raw_out = (proc.stdout or "").strip()
+        if raw_out:
+            try:
+                parsed = json.loads(raw_out)
+                if isinstance(parsed, list):
+                    items = parsed
+                elif isinstance(parsed, dict):
+                    cand = parsed.get("findings") if isinstance(parsed.get("findings"), list) else parsed.get("results")
+                    if isinstance(cand, list):
+                        items = cand
+            except Exception:
+                pass
+        count = max(1, len(items))
+        summaries: list[str] = []
+        for item in items[:3]:
+            if isinstance(item, dict):
+                rule = str(item.get("rule") or item.get("id") or item.get("ruleId") or "finding")
+                fpath = str(item.get("file") or item.get("path") or "")
+                summaries.append(f"{rule}@{fpath}" if fpath else rule)
+            else:
+                summaries.append(str(item)[:80])
+        summary_text = "; ".join(summaries) if summaries else (raw_out[:240] or "anti-pattern findings reported")
+        return 2, summary_text, count
+
+    err_msg = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()[:400]
+    return 1, err_msg, 0
+
+
+def ui_stamp_register(
+    workspace: Path,
+    verdict: str,
+    p0: int,
+    p1: int,
+    explicit_targets: Optional[list[str]] = None,
+    config_dir: Optional[Path] = None,
+) -> tuple[bool, str, int]:
+    """Validate Web/Native UI gates and write ``ui-pass.json`` bound to current ``codeTreeSha``."""
+    if verdict not in ("PASS", "FAIL"):
+        return False, f"Error: ui --verdict must be PASS or FAIL (got '{verdict}')", 1
+    if p0 < 0 or p1 < 0:
+        return False, "Error: ui --p0 and --p1 must be non-negative integers", 1
+    if verdict == "PASS" and (p0 != 0 or p1 != 0):
+        return False, f"Error: ui stamp cannot record PASS when p0Count ({p0}) or p1Count ({p1}) is non-zero", 1
+
+    branch_files = _collect_branch_diff_files(workspace, "HEAD")
+    if explicit_targets:
+        norm_targets: list[str] = []
+        for raw_t in explicit_targets:
+            nt = raw_t.strip()
+            while nt.startswith("./"):
+                nt = nt[2:]
+            if nt:
+                norm_targets.append(nt)
+        candidates = list(dict.fromkeys([*branch_files, *norm_targets])) if verdict == "PASS" else norm_targets
+    else:
+        candidates = branch_files
+
+    ui_info = classify_ui_files(candidates)
+    scanned_web: list[str] = []
+
+    if verdict == "PASS":
+        existing_web = [f for f in ui_info["webFiles"] if (workspace / f).is_file()]
+        if existing_web:
+            imp = detect_impeccable(workspace, config_dir=config_dir)
+            if not imp["detectorCmd"]:
+                return (
+                    False,
+                    "Error: ui stamp requires an executable Impeccable detector to scan Web UI files, but none was found. Install Impeccable ('npx impeccable install --scope=global') or set HARNESS_IMPECCABLE_BIN.",
+                    1,
+                )
+            rc, summary, count = run_impeccable_detect(workspace, existing_web, imp["detectorCmd"])
+            if rc == 2:
+                return (
+                    False,
+                    f"Error: ui stamp rejected by deterministic Impeccable detector ({count} finding(s)): {summary}",
+                    2,
+                )
+            if rc != 0:
+                return False, f"Error: ui stamp failed due to Impeccable detector error: {summary}", 1
+            scanned_web = existing_web
+
+    state_dir = get_state_dir(workspace)
+    payload = {
+        "verdict": verdict,
+        "codeTreeSha": compute_code_tree_sha(workspace),
+        "p0Count": p0,
+        "p1Count": p1,
+        # PASS rejects rc == 2 above; FAIL records pre-scan status as 0 findings.
+        "detectorFindings": 0,
+        "scannedWebFiles": scanned_web,
+        "auditedNativeFiles": ui_info["nativeFiles"],
+        "timestamp": utc_now_iso(),
+    }
+    atomic_write_json(state_dir, "ui-pass.json", payload)
+    return True, "", 0
+
+
+def _extract_segment_env_controls(raw_seg: str) -> tuple[dict[str, str], bool, set[str]]:
+    """Extract per-segment KEY=VALUE assignments, ``env -i`` reset state, and ``env -u`` removals."""
+    try:
+        tokens = shlex.split(raw_seg)
+    except Exception:
+        tokens = raw_seg.split()
+    env_vars: dict[str, str] = {}
+    cleared_env = False
+    unset_vars: set[str] = set()
+    if not tokens:
+        return env_vars, cleared_env, unset_vars
+    idx = 0
+    if tokens[0] == "export":
+        idx = 1
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if "=" in tok:
+                k, v = tok.split("=", 1)
+                if k.isidentifier():
+                    env_vars[k] = v
+                    unset_vars.discard(k)
+            idx += 1
+        return env_vars, cleared_env, unset_vars
+
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if "=" in tok and tok.split("=", 1)[0].isidentifier():
+            k, v = tok.split("=", 1)
+            env_vars[k] = v
+            unset_vars.discard(k)
+            idx += 1
+            continue
+        if tok == "env":
+            idx += 1
+            while idx < len(tokens):
+                etok = tokens[idx]
+                if etok in ("-i", "--ignore-environment"):
+                    cleared_env = True
+                    env_vars.clear()
+                    idx += 1
+                elif etok in ("-u", "--unset") and idx + 1 < len(tokens):
+                    ukey = tokens[idx + 1]
+                    env_vars.pop(ukey, None)
+                    unset_vars.add(ukey)
+                    idx += 2
+                elif etok.startswith("--unset="):
+                    ukey = etok.split("=", 1)[1]
+                    env_vars.pop(ukey, None)
+                    unset_vars.add(ukey)
+                    idx += 1
+                elif etok.startswith("-"):
+                    idx += 2 if etok in ("-C", "-S") else 1
+                elif "=" in etok and etok.split("=", 1)[0].isidentifier():
+                    k, v = etok.split("=", 1)
+                    env_vars[k] = v
+                    unset_vars.discard(k)
+                    idx += 1
+                else:
+                    break
+            continue
+        if tok in ("sudo", "nohup", "time", "builtin", "command"):
+            idx += 1
+            if tok == "sudo":
+                while idx < len(tokens) and tokens[idx].startswith("-"):
+                    idx += 2 if tokens[idx] in ("-u", "-g", "-h", "-p", "-U") else 1
+            continue
+        break
+    return env_vars, cleared_env, unset_vars
+
+
+def _is_impeccable_pkg_and_live(tokens: list[str], start_idx: int, val_flags: frozenset[str]) -> bool:
+    """Return True when runner args starting at ``start_idx`` resolve package ``impeccable`` with ``live``."""
+    idx = start_idx
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--":
+            idx += 1
+            break
+        if tok in val_flags:
+            idx += 2
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        break
+    if idx >= len(tokens):
+        return False
+    pkg = tokens[idx]
+    pkg_base = pkg.split("@", 1)[0] if not pkg.startswith("@") else pkg
+    if pkg_base != "impeccable" and not pkg.replace("\\", "/").endswith("/impeccable"):
+        return False
+    idx += 1
+    while idx < len(tokens) and tokens[idx] == "--":
+        idx += 1
+    return idx < len(tokens) and tokens[idx] == "live"
+
+
+def _is_impeccable_live_tokens(tokens: list[str]) -> bool:
+    """Return True if argv tokens invoke ``impeccable live`` directly or via package/node runners."""
+    if not tokens:
+        return False
+    exe_base = os.path.basename(tokens[0])
+    norm_exe = tokens[0].replace("\\", "/")
+    if (exe_base == "impeccable" or norm_exe.endswith("/scripts/impeccable")) and len(tokens) >= 2 and tokens[1] == "live":
+        return True
+    if exe_base in ("npx", "bunx", "pnpx"):
+        if _is_impeccable_pkg_and_live(tokens, 1, frozenset(("-p", "--package", "-c", "--call", "--userconfig"))):
+            return True
+        # Fallback for `-p impeccable` followed by command `impeccable live`
+        for j in range(1, len(tokens) - 1):
+            if tokens[j] in ("-p", "--package") and tokens[j + 1].split("@", 1)[0] == "impeccable":
+                rest = tokens[j + 2 :]
+                for k, rt in enumerate(rest):
+                    if rt == "live" or (rt == "impeccable" and k + 1 < len(rest) and rest[k + 1] == "live"):
+                        return True
+        return False
+    if exe_base == "npm" and len(tokens) >= 3 and tokens[1] == "exec":
+        return _is_impeccable_pkg_and_live(tokens, 2, frozenset(("-p", "--package", "-w", "--workspace", "--userconfig")))
+    if exe_base in ("pnpm", "yarn") and len(tokens) >= 3 and tokens[1] == "dlx":
+        return _is_impeccable_pkg_and_live(tokens, 2, frozenset(("--package", "-p")))
+    if exe_base in ("node", "nodejs", "bun") and len(tokens) >= 3:
+        for idx in range(1, len(tokens)):
+            t = tokens[idx]
+            if t.startswith("-"):
+                continue
+            tb = os.path.basename(t)
+            if tb in ("impeccable", "impeccable.js", "impeccable.mjs", "impeccable.cjs") or t.replace("\\", "/").endswith("/scripts/impeccable"):
+                nxt = idx + 1
+                while nxt < len(tokens) and tokens[nxt] == "--":
+                    nxt += 1
+                return nxt < len(tokens) and tokens[nxt] == "live"
+            break
+    return False
+
+
+def _check_impeccable_live_guard(cmd_line: str) -> Optional[dict[str, Any]]:
+    """Deny ``impeccable live`` unless ``IMPECCABLE_LIVE_COPY_AGENT`` is pinned to ``chat`` or ``off``."""
+    session_env: dict[str, str] = {}
+    session_unset: set[str] = set()
+    for raw_seg, _ in _tokenize_raw_segments(cmd_line):
+        seg_env, cleared_env, seg_unset = _extract_segment_env_controls(raw_seg)
+        cleaned = _strip_segment_wrappers(raw_seg)
+        if not cleaned:
+            continue
+        if cleaned[0] == "export":
+            for k, v in seg_env.items():
+                session_env[k] = v
+                session_unset.discard(k)
+            continue
+        if cleaned[0] == "unset":
+            for ukey in cleaned[1:]:
+                if ukey.isidentifier():
+                    session_env.pop(ukey, None)
+                    session_unset.add(ukey)
+            continue
+        if _is_impeccable_live_tokens(cleaned):
+            if "IMPECCABLE_LIVE_COPY_AGENT" in seg_env:
+                effective = seg_env["IMPECCABLE_LIVE_COPY_AGENT"]
+            elif cleared_env or "IMPECCABLE_LIVE_COPY_AGENT" in seg_unset or "IMPECCABLE_LIVE_COPY_AGENT" in session_unset:
+                effective = ""
+            else:
+                effective = session_env.get("IMPECCABLE_LIVE_COPY_AGENT", os.environ.get("IMPECCABLE_LIVE_COPY_AGENT", ""))
+            if effective.strip().lower() not in ("chat", "off"):
+                return {
+                    "decision": "deny",
+                    "reason": (
+                        "Impeccable live mode blocked: 'impeccable live' without IMPECCABLE_LIVE_COPY_AGENT=chat "
+                        "or IMPECCABLE_LIVE_COPY_AGENT=off can spawn unsandboxed fallback agents "
+                        "(--dangerously-bypass-approvals-and-sandbox). Prefix with: DO_NOT_TRACK=1 IMPECCABLE_LIVE_COPY_AGENT=chat"
+                    ),
+                }
+    return None
 
 
 def extract_ios_bundle_identifiers(workspace: Path) -> list[str]:
@@ -3444,6 +4413,45 @@ def run_doctor_checks(
     else:
         add_check("graphify_graph", "workspace", "WARN", "graphify-out/graph.json uninitialized", "Fix: run graphify on project root")
 
+    if not is_harness_ignored(workspace):
+        ui_ws = detect_ui_workspace(workspace)
+        imp = detect_impeccable(workspace, config_dir=cfg_dir)
+        surface_parts: list[str] = []
+        if ui_ws["hasWebUi"]:
+            surface_parts.append("Web")
+        if ui_ws["hasNativeUi"]:
+            surface_parts.append("Native")
+        surface_label = "+".join(surface_parts) or "UI"
+        if ui_ws["hasAnyUi"] and imp["installed"]:
+            add_check(
+                "impeccable_ui",
+                "workspace",
+                "OK",
+                f"Impeccable UI gate active for {surface_label} surface",
+            )
+        elif ui_ws["hasAnyUi"] and not imp["installed"]:
+            add_check(
+                "impeccable_ui",
+                "workspace",
+                "WARN",
+                "UI/Frontend surface detected without Impeccable installed (hard UI gate inactive until installed)",
+                "Fix: npx impeccable install --scope=global",
+            )
+        elif imp["installed"]:
+            add_check(
+                "impeccable_ui",
+                "workspace",
+                "INFO",
+                "Impeccable installed (dormant: no UI/Frontend surface detected in workspace)",
+            )
+        else:
+            add_check(
+                "impeccable_ui",
+                "workspace",
+                "INFO",
+                "No UI/Frontend surface detected (Impeccable optional module dormant)",
+            )
+
     # Sidecar daemon manifest & live socket check
     sidecar_dir = h_root / "sidecars" / "harness-daemon"
     sidecar_manifest = sidecar_dir / "sidecar.json"
@@ -3615,6 +4623,14 @@ def build_session_start_payload(
     canon_flows = "present" if (workspace / "docs" / "canon" / "flows.md").is_file() else "missing"
     canon_lessons = "present" if (workspace / "docs" / "canon" / "lessons.md").is_file() else "missing"
     graphify_present = "present" if (workspace / "graphify-out" / "graph.json").is_file() else "missing"
+    ui_ws = detect_ui_workspace(workspace)
+    imp = detect_impeccable(workspace)
+    if ui_ws["hasAnyUi"] and imp["installed"]:
+        ui_gate_line = "- Impeccable UI Gate: active (ui-pass.json hard gate enforced when UI files change; run with DO_NOT_TRACK=1 IMPECCABLE_LIVE_COPY_AGENT=chat)"
+    elif ui_ws["hasAnyUi"]:
+        ui_gate_line = "- Impeccable UI Gate: advisory (UI/Frontend surface detected without Impeccable installed)"
+    else:
+        ui_gate_line = "- Impeccable UI Gate: dormant (no UI/Frontend surface detected)"
 
     if missing_bins is None:
         raw_bins = os.environ.get("HARNESS_CHECK_BINS", "gh jq")
@@ -3629,13 +4645,20 @@ def build_session_start_payload(
         f"  - flows.md: {canon_flows}",
         f"  - lessons.md: {canon_lessons}",
         f"- Graphify Status: {graphify_present} (graphify-out/graph.json)",
+        ui_gate_line,
         "- Protocols:",
         "  - Use jev_classify, jev_check, and jev_ask for intent, architecture trade-offs, and verification.",
-        "  - Parent-aware Gemini 4 / Orchestrator subagent routing is enforced by pre-subagent-guard.sh (never downgrades Carbon/Orchestrator/Argon-High audits; escalates Hydrogen/Flash audits to Argon via pro).",
+        "  - Parent-aware Gemini 4 / Orchestrator subagent & workflow routing is enforced by pre-subagent-guard.sh (keeps Neon/Carbon/Opus audits on inherit; escalates Orchestrator/Hydrogen/Sonnet/frontier_low audits to frontier pro).",
         "  - Wrap high-output shell commands with scripts/run-quiet.sh.",
         "  - All documentation must conclude with a ## Teknik Terimler Sözlüğü or ## Technical Glossary section.",
         "  - Swarm Worker Mode: When dispatched as a Swarm worker, stay strictly within your coordinator brief and branch (skip re-running jev_classify, Spec, Walkthrough, or gh pr create; report docs/parking-lot.md or docs/canon/* suggestions to @coordinator).",
     ]
+
+    if is_deprecated_parent_model(parent_model):
+        lines.append(
+            f"[MODEL DEPRECATION WARNING] Active model '{parent_model_display}' retires on 2026-11-30. "
+            "Migrate to Gemini 4 Neon, Gemini 4 Carbon, Gemini 4 Hydrogen, Claude 5.5, or Orchestrator (Neon/Carbon)."
+        )
 
     live_head = get_head_oid(workspace)
     if branch in ("main", "master") and live_head != "UNBORN":
@@ -3675,12 +4698,20 @@ def build_session_start_payload(
                     f"[DAEMON HEALTH WARNING] Cached harness-doctor failures detected ({names}). Run scripts/harness-doctor.sh for exact Fix commands."
                 )
 
+    if ui_ws["hasAnyUi"] and not imp["installed"]:
+        lines.append(
+            "[UI ADVISORY] UI/Frontend surface detected without Impeccable installed. "
+            "Run 'npx impeccable install --scope=global' to enable deterministic UI anti-pattern/slop gating."
+        )
+
     if isinstance(tree_state, dict) and tree_state.get("headOid") == live_head:
         stale_stamps: list[str] = []
         if tree_state.get("canonStampStatus") == "stale":
             stale_stamps.append("canon-pass")
         if tree_state.get("securityStampStatus") == "stale":
             stale_stamps.append("security-pass")
+        if tree_state.get("uiStampStatus") == "stale" and requires_ui_stamp(workspace)[0]:
+            stale_stamps.append("ui-pass")
         if stale_stamps:
             lines.append(
                 f"[DAEMON STAMP NOTICE] Stale PR stamp(s) for current HEAD ({', '.join(stale_stamps)}). Re-run pre-pr-readiness audits before gh pr create."
@@ -3782,6 +4813,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_c7.add_argument("--version", required=True)
     p_c7.add_argument("--source", required=True)
 
+    p_ui = sub.add_parser("ui-stamp")
+    p_ui.add_argument("--workspace", default=".")
+    p_ui.add_argument("--verdict", required=True)
+    p_ui.add_argument("--p0", type=int, default=0)
+    p_ui.add_argument("--p1", type=int, default=0)
+    p_ui.add_argument("--target", action="append", default=[])
+
+    p_vpr = sub.add_parser("verify-pr-stamps")
+    p_vpr.add_argument("--workspace", default=".")
+
     p_clear_pr = sub.add_parser("clear-pr-audit")
     p_clear_pr.add_argument("--workspace", default=".")
 
@@ -3864,6 +4905,26 @@ def main(argv: Optional[list[str]] = None) -> int:
             ver=args.version,
             src=args.source,
         )
+        return 0
+
+    if args.subcommand == "ui-stamp":
+        ok, err, rc = ui_stamp_register(
+            Path(args.workspace),
+            verdict=args.verdict,
+            p0=args.p0,
+            p1=args.p1,
+            explicit_targets=args.target or None,
+        )
+        if not ok:
+            print(err, file=sys.stderr)
+            return rc
+        return 0
+
+    if args.subcommand == "verify-pr-stamps":
+        ok, err = verify_pr_stamps(Path(args.workspace))
+        if not ok:
+            print(err, file=sys.stderr)
+            return 1
         return 0
 
     if args.subcommand == "clear-pr-audit":

@@ -412,7 +412,7 @@ class HarnessDaemonState:
         slug = harness_core.get_branch_slug(ws_path)
         state_mtimes: dict[str, int] = {}
         state_dir = ws_path / ".harness" / "state" / slug
-        for fn in ("canon-pass.json", "security-pass.json", "pr-audit-pending.json"):
+        for fn in ("canon-pass.json", "security-pass.json", "ui-pass.json", "pr-audit-pending.json"):
             p = state_dir / fn
             if p.is_file():
                 try:
@@ -450,7 +450,15 @@ class HarnessDaemonState:
         cfg_dir = Path(os.environ.get("HARNESS_CONFIG_DIR") or (Path.home() / ".gemini" / "config"))
         key_file = Path(os.environ.get("HARNESS_TYPESAFE_KEY_FILE") or (Path.home() / ".config" / "typesafe" / "key"))
         cfg_mtimes: dict[str, int] = {}
-        for cp in (cfg_dir / "mcp_config.json", cfg_dir / "config.json", cfg_dir / "plugins.json", key_file):
+        for cp in (
+            cfg_dir / "mcp_config.json",
+            cfg_dir / "config.json",
+            cfg_dir / "plugins.json",
+            cfg_dir / "skills" / "impeccable" / "SKILL.md",
+            ws_path / ".agent" / "skills" / "impeccable" / "SKILL.md",
+            ws_path / ".agents" / "skills" / "impeccable" / "SKILL.md",
+            key_file,
+        ):
             if cp.is_file():
                 try:
                     cfg_mtimes[str(cp)] = cp.stat().st_mtime_ns

@@ -696,4 +696,66 @@ EOF
   assert_eq "" "$ignored_advisory" ".harness-ignore must suppress swarm_install_advisory"
 }
 
+test_harness_doctor_impeccable_ui_states() {
+  local tmp_repo mock_cfg mock_bin_dir
+  tmp_repo="$(make_temp_repo)"
+  mock_cfg="$tmp_repo/gemini-config"
+  mock_bin_dir="$tmp_repo/doctor-bin"
+  mkdir -p "$mock_cfg/plugins/superpowers" "$mock_bin_dir"
+  cat <<'EOF' > "$mock_cfg/plugins.json"
+{
+  "plugins": [{"name": "superpowers"}, {"name": "firebase"}, {"name": "postman"}, {"name": "chrome-devtools-plugin"}]
+}
+EOF
+  cat <<'EOF' > "$mock_cfg/mcp_config.json"
+{
+  "mcpServers": {
+    "jev": {}, "context7": {}, "csharp-lsp": {}, "typescript-lsp": {},
+    "playwright": {}, "graphify": {}, "revenuecat": {}, "filesystem": {}
+  }
+}
+EOF
+  cat <<'EOF' > "$mock_bin_dir/gh"
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$mock_bin_dir/gh"
+
+  # 1. Backend workspace without Impeccable -> impeccable_ui = INFO, healthy = true
+  local backend_json
+  backend_json=$(TYPESAFE_API_KEY="test_key" \
+                 HARNESS_CONFIG_DIR="$mock_cfg" \
+                 HARNESS_GH_BIN="$mock_bin_dir/gh" \
+                 env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR \
+                 "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$tmp_repo" --json)
+  assert_json_field "$backend_json" ".healthy" "true"
+  assert_json_field "$backend_json" '.checks[] | select(.name=="impeccable_ui") | .status' "INFO"
+
+  # 2. UI workspace (src/App.tsx) without Impeccable -> impeccable_ui = WARN with Fix, healthy = true
+  mkdir -p "$tmp_repo/src"
+  echo "export const App = () => <main />;" > "$tmp_repo/src/App.tsx"
+  local warn_json rc_warn=0
+  warn_json=$(TYPESAFE_API_KEY="test_key" \
+              HARNESS_CONFIG_DIR="$mock_cfg" \
+              HARNESS_GH_BIN="$mock_bin_dir/gh" \
+              env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR \
+              "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$tmp_repo" --json) || rc_warn=$?
+  assert_eq "0" "$rc_warn" "Missing Impeccable on UI workspace must warn without failing doctor"
+  assert_json_field "$warn_json" ".healthy" "true"
+  assert_json_field "$warn_json" '.checks[] | select(.name=="impeccable_ui") | .status' "WARN"
+  assert_contains "$(printf '%s\n' "$warn_json" | jq -r '.checks[] | select(.name=="impeccable_ui") | .fix')" "npx impeccable install --scope=global"
+
+  # 3. UI workspace with global skill installed -> impeccable_ui = OK, healthy = true
+  mkdir -p "$mock_cfg/skills/impeccable"
+  echo "# Impeccable" > "$mock_cfg/skills/impeccable/SKILL.md"
+  local ok_json
+  ok_json=$(TYPESAFE_API_KEY="test_key" \
+            HARNESS_CONFIG_DIR="$mock_cfg" \
+            HARNESS_GH_BIN="$mock_bin_dir/gh" \
+            env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR \
+            "$REPO_ROOT/scripts/harness-doctor.sh" --workspace "$tmp_repo" --json)
+  assert_json_field "$ok_json" ".healthy" "true"
+  assert_json_field "$ok_json" '.checks[] | select(.name=="impeccable_ui") | .status' "OK"
+}
+
 run_tests "test_"

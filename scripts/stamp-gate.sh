@@ -29,6 +29,7 @@ Usage:
   stamp-gate.sh tree-sha [--workspace <dir>]
   stamp-gate.sh canon --verdict PASS|FAIL [--plan <path>] [--allow-file <relpath> ...] [--workspace <dir>]
   stamp-gate.sh security --verdict PASS|FAIL --critical <n> --important <n> [--workspace <dir>]
+  stamp-gate.sh ui --verdict PASS|FAIL --p0 <n> --p1 <n> [--target <relpath> ...] [--workspace <dir>]
   stamp-gate.sh context7 --package <name> --version <ver> --source locked|greenfield-latest [--workspace <dir>]
   stamp-gate.sh dispatch --role <role> --type <typeName> --tier <tier> [--parent-model <modelName>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--conversation-id <id>] [--workspace <dir>]
   stamp-gate.sh select-model --tier <tier> [--parent-model <modelName>] [--caller-model <tier>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--workspace <dir>]
@@ -475,17 +476,23 @@ cmd_select_model() {
     effort="$explicit_effort"
   fi
 
-  local family model
+  local family model effort_hint deprecated_flag="false"
   family="$(harness_classify_parent_model "$parent_model")"
   model="$(harness_resolve_subagent_model "$parent_model" "$tier" "$caller_model" "false")"
+  effort_hint="$(harness_detect_parent_effort_hint "$parent_model")"
+  if harness_is_deprecated_model "$parent_model"; then
+    deprecated_flag="true"
+  fi
 
   jq -nc \
     --arg tier "$tier" \
     --arg parentModel "$parent_model" \
     --arg parentFamily "$family" \
+    --arg parentEffortHint "$effort_hint" \
+    --argjson deprecated "$deprecated_flag" \
     --arg model "$model" \
     --arg effort "$effort" \
-    '{tier: $tier, parentModel: $parentModel, parentFamily: $parentFamily, model: $model, effortProfile: $effort}'
+    '{tier: $tier, parentModel: $parentModel, parentFamily: $parentFamily, parentEffortHint: $parentEffortHint, deprecated: $deprecated, model: $model, effortProfile: $effort}'
 }
 
 cmd_verify_pr_stamps() {
@@ -494,62 +501,84 @@ cmd_verify_pr_stamps() {
     exit 1
   fi
 
-  local current_sha
-  current_sha="$(harness_code_tree_sha "$WORKSPACE")"
-  if [ "$current_sha" = "UNBORN" ]; then
-    echo "Error: verify-pr-stamps failed: repository HEAD is UNBORN (no commits found)" >&2
+  python3 -B "$(harness_core_python)" verify-pr-stamps --workspace "$WORKSPACE"
+}
+
+cmd_ui() {
+  local verdict=""
+  local p0="0"
+  local p1="0"
+  local targets=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --verdict)
+        [ $# -ge 2 ] || { echo "Error: --verdict requires PASS or FAIL" >&2; exit 1; }
+        verdict="$2"
+        shift 2
+        ;;
+      --verdict=*)
+        verdict="${1#--verdict=}"
+        shift
+        ;;
+      --p0)
+        [ $# -ge 2 ] || { echo "Error: --p0 requires a non-negative integer" >&2; exit 1; }
+        p0="$2"
+        shift 2
+        ;;
+      --p0=*)
+        p0="${1#--p0=}"
+        shift
+        ;;
+      --p1)
+        [ $# -ge 2 ] || { echo "Error: --p1 requires a non-negative integer" >&2; exit 1; }
+        p1="$2"
+        shift 2
+        ;;
+      --p1=*)
+        p1="${1#--p1=}"
+        shift
+        ;;
+      --target)
+        [ $# -ge 2 ] || { echo "Error: --target requires a relative file path" >&2; exit 1; }
+        local norm_t="$2"
+        while [[ "$norm_t" == ./* ]]; do norm_t="${norm_t#./}"; done
+        targets+=("$norm_t")
+        shift 2
+        ;;
+      --target=*)
+        local norm_t="${1#--target=}"
+        while [[ "$norm_t" == ./* ]]; do norm_t="${norm_t#./}"; done
+        targets+=("$norm_t")
+        shift
+        ;;
+      *)
+        echo "Error: unknown argument for ui: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ "$verdict" != "PASS" ] && [ "$verdict" != "FAIL" ]; then
+    echo "Error: ui --verdict must be PASS or FAIL (got '$verdict')" >&2
+    exit 1
+  fi
+  if [[ ! "$p0" =~ ^[0-9]+$ ]]; then
+    echo "Error: ui --p0 must be a non-negative integer (got '$p0')" >&2
+    exit 1
+  fi
+  if [[ ! "$p1" =~ ^[0-9]+$ ]]; then
+    echo "Error: ui --p1 must be a non-negative integer (got '$p1')" >&2
     exit 1
   fi
 
-  local state_dir canon_file security_file
-  state_dir="$(harness_state_dir "$WORKSPACE")"
-  canon_file="$state_dir/canon-pass.json"
-  security_file="$state_dir/security-pass.json"
+  local py_args=(ui-stamp --workspace "$WORKSPACE" --verdict "$verdict" --p0 "$p0" --p1 "$p1")
+  local t
+  for t in ${targets[@]+"${targets[@]}"}; do
+    py_args+=(--target "$t")
+  done
 
-  if [ ! -f "$canon_file" ]; then
-    echo "Error: verify-pr-stamps failed: missing canon stamp ($canon_file)" >&2
-    exit 1
-  fi
-
-  if [ ! -f "$security_file" ]; then
-    echo "Error: verify-pr-stamps failed: missing security stamp ($security_file)" >&2
-    exit 1
-  fi
-
-  local canon_verdict canon_sha
-  canon_verdict="$(jq -r '.verdict // empty' "$canon_file" 2>/dev/null || true)"
-  canon_sha="$(jq -r '.codeTreeSha // empty' "$canon_file" 2>/dev/null || true)"
-
-  if [ "$canon_verdict" != "PASS" ]; then
-    echo "Error: verify-pr-stamps failed: canon-pass.json verdict is '$canon_verdict' (expected PASS)" >&2
-    exit 1
-  fi
-
-  if [ "$canon_sha" != "$current_sha" ]; then
-    echo "Error: verify-pr-stamps failed: canon-pass.json codeTreeSha ($canon_sha) does not match current HEAD codeTreeSha ($current_sha)" >&2
-    exit 1
-  fi
-
-  local sec_verdict sec_sha
-  sec_verdict="$(jq -r '.verdict // empty' "$security_file" 2>/dev/null || true)"
-  sec_sha="$(jq -r '.codeTreeSha // empty' "$security_file" 2>/dev/null || true)"
-
-  if [ "$sec_verdict" != "PASS" ]; then
-    echo "Error: verify-pr-stamps failed: security-pass.json verdict is '$sec_verdict' (expected PASS)" >&2
-    exit 1
-  fi
-
-  if ! jq -e '(.criticalCount == 0) and (.importantCount == 0)' "$security_file" >/dev/null 2>&1; then
-    echo "Error: verify-pr-stamps failed: security-pass.json has non-zero criticalCount or importantCount" >&2
-    exit 1
-  fi
-
-  if [ "$sec_sha" != "$current_sha" ]; then
-    echo "Error: verify-pr-stamps failed: security-pass.json codeTreeSha ($sec_sha) does not match current HEAD codeTreeSha ($current_sha)" >&2
-    exit 1
-  fi
-
-  return 0
+  python3 -B "$(harness_core_python)" "${py_args[@]}"
 }
 
 cmd_clear_pr_audit() {
@@ -569,6 +598,9 @@ case "$SUBCMD" in
     ;;
   security)
     cmd_security ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
+    ;;
+  ui)
+    cmd_ui ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
     ;;
   context7)
     cmd_context7 ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
