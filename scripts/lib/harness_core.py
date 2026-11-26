@@ -498,7 +498,7 @@ def compute_code_tree_sha(workspace: Path, ref: str = "HEAD") -> str:
 
 
 def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
-    """Split a shell command into ``(segment_text, delimiter)`` pairs respecting quotes."""
+    """Split a shell command into ``(segment_text, delimiter)`` pairs respecting quotes and comments."""
     if not cmd_line:
         return []
 
@@ -506,6 +506,7 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
     current: list[str] = []
     in_single = False
     in_double = False
+    in_ansi_c = False
     escape = False
     i = 0
     n = len(cmd_line)
@@ -522,18 +523,30 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
             current.append(c)
             i += 1
             continue
+        if not in_single and not in_double and not in_ansi_c and c == "$" and i + 1 < n and cmd_line[i + 1] == "'":
+            in_ansi_c = True
+            current.append("$'")
+            i += 2
+            continue
         if c == "'" and not in_double:
-            in_single = not in_single
+            if in_ansi_c:
+                in_ansi_c = False
+            else:
+                in_single = not in_single
             current.append(c)
             i += 1
             continue
-        if c == '"' and not in_single:
+        if c == '"' and not in_single and not in_ansi_c:
             in_double = not in_double
             current.append(c)
             i += 1
             continue
 
-        if not in_single and not in_double:
+        if not in_single and not in_double and not in_ansi_c:
+            if c == "#" and (i == 0 or cmd_line[i - 1] in (" ", "\t", "\n", ";", "&", "|", "(", ")")):
+                while i < n and cmd_line[i] != "\n":
+                    i += 1
+                continue
             if c in ("&", "|") and i + 1 < n and cmd_line[i + 1] == c:
                 seg = "".join(current).strip()
                 segments.append((seg, c + c))
@@ -541,6 +554,10 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
                 i += 2
                 continue
             if c == "&" and ((i > 0 and cmd_line[i - 1] in (">", "<")) or (i + 1 < n and cmd_line[i + 1] == ">")):
+                current.append(c)
+                i += 1
+                continue
+            if c == "|" and i > 0 and cmd_line[i - 1] == ">":
                 current.append(c)
                 i += 1
                 continue
@@ -2600,6 +2617,11 @@ COORDINATOR_DANGEROUS_ENV_VARS = frozenset(
         "VISUAL",
         "PATH",
         "PYTHONPATH",
+        "RIPGREP_CONFIG_PATH",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
     )
 )
 COORDINATOR_READ_ONLY_BINS = frozenset(
@@ -3240,6 +3262,14 @@ def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
                 return "$(...) command substitution"
 
         if not in_single and not in_double:
+            if c == "#" and (i == 0 or cmd_line[i - 1] in (" ", "\t", "\n", ";", "&", "|", "(", ")")):
+                while i < n and cmd_line[i] != "\n":
+                    i += 1
+                continue
+            if c == "$" and i + 1 < n and cmd_line[i + 1] == "'":
+                return "ANSI-C $'...' quoting"
+            if c == "$" and i + 1 < n and cmd_line[i + 1] == '"':
+                return 'locale $"..." quoting'
             if c in ("<", ">") and i + 1 < n and cmd_line[i + 1] == "(":
                 return "process substitution"
             if c == ">" or (c == "&" and i + 1 < n and cmd_line[i + 1] == ">"):
@@ -3547,7 +3577,7 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
                 return _deny_seg()
         elif exe == "rg":
             for tok in seg[1:]:
-                if tok in ("--pre", "--pre-glob") or tok.startswith(("--pre=", "--pre-glob=")):
+                if tok in ("--pre", "--pre-glob", "--hostname-bin") or tok.startswith(("--pre=", "--pre-glob=", "--hostname-bin=")):
                     return _deny_seg()
         return "allow", ""
 
@@ -3568,8 +3598,6 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
                 gtok in COORDINATOR_GIT_FORBIDDEN_GLOBAL_FLAGS
                 or gtok.startswith(("-c", "--config-env=", "--exec-path=", "--upload-pack=", "--receive-pack="))
             ):
-                if gtok == "-C" or gtok.startswith("-C"):
-                    continue
                 return _deny_seg()
 
         if git_subcmd in COORDINATOR_READ_ONLY_GIT_SUBCMDS:
@@ -3685,7 +3713,7 @@ def parse_quota_reset_epoch(
     buf = max(0, int(buffer_sec))
     probe = _default_quota_probe_seconds() if default_probe_sec is None else max(0.1, float(default_probe_sec))
 
-    text = error_text or ""
+    text = re.sub(r"\btimed\s+out\s+after\s+\d+(?:\.\d+)?\s*[a-z]+", "", error_text or "", flags=re.IGNORECASE)
     iso_m = re.search(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)", text)
     if iso_m:
         parsed_ep = _parse_iso_timestamp_epoch(iso_m.group(1))
@@ -3699,26 +3727,28 @@ def parse_quota_reset_epoch(
         re.IGNORECASE,
     )
     dur_target = clause_m.group(1) if clause_m else text
-    dur_re = re.compile(
-        r"(?<![A-Za-z0-9-])(\d+(?:\.\d+)?)\s*"
-        r"(days?|d|gün|hours?|hrs?|h|saat|minutes?|mins?|m|dakika|seconds?|secs?|s|saniye)"
+    unit_pat = r"(?:days?|gün|hours?|hrs?|saat|minutes?|mins?|dakika|seconds?|secs?|saniye|d|h|m|s)"
+    dur_seq_re = re.compile(
+        rf"(?<![A-Za-z0-9-])((?:\d+(?:\.\d+)?\s*{unit_pat}(?:\s*,?\s*|\s+and\s+|\s+ve\s+)?)+)"
         r"(?![A-Za-z0-9-])(?!\s*[-–]?\s*(?:quota|limit|cap|window|kota))",
         re.IGNORECASE,
     )
+    dur_part_re = re.compile(rf"(\d+(?:\.\d+)?)\s*({unit_pat})(?![A-Za-z])", re.IGNORECASE)
     total_sec = 0.0
     matched_any = False
-    for m in dur_re.finditer(dur_target):
-        val = float(m.group(1))
-        unit = m.group(2).lower()
-        matched_any = True
-        if unit in ("d", "day", "days", "gün"):
-            total_sec += val * 86400.0
-        elif unit in ("h", "hr", "hrs", "hour", "hours", "saat"):
-            total_sec += val * 3600.0
-        elif unit in ("m", "min", "mins", "minute", "minutes", "dakika"):
-            total_sec += val * 60.0
-        else:
-            total_sec += val
+    for seq_m in dur_seq_re.finditer(dur_target):
+        for m in dur_part_re.finditer(seq_m.group(1)):
+            val = float(m.group(1))
+            unit = m.group(2).lower()
+            matched_any = True
+            if unit in ("d", "day", "days", "gün"):
+                total_sec += val * 86400.0
+            elif unit in ("h", "hr", "hrs", "hour", "hours", "saat"):
+                total_sec += val * 3600.0
+            elif unit in ("m", "min", "mins", "minute", "minutes", "dakika"):
+                total_sec += val * 60.0
+            else:
+                total_sec += val
 
     if matched_any and total_sec > 0:
         return now + total_sec + buf, True

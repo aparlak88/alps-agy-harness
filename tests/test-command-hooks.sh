@@ -1530,6 +1530,10 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "env FOO=bar git status" \
     "/usr/bin/cat README.md" \
     "./scripts/stamp-gate.sh swarm-coordinator on --workspace \"$repo\" --conversation-id \"conv-coord\"" \
+    "bash ./scripts/stamp-gate.sh tree-sha --workspace \"$repo\"" \
+    "git status >>/dev/null" \
+    "git status >|/dev/null" \
+    "git status &>/dev/null" \
     "./scripts/stamp-gate.sh swarm-quota pause --workspace \"$repo\" --conversation-id \"conv-coord\" --wait-seconds 60" \
     "./scripts/stamp-gate.sh dispatch --workspace \"$repo\" --role explorer" \
     "./scripts/stamp-gate.sh select-model --workspace \"$repo\" --tier pro" \
@@ -1574,6 +1578,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "GIT_CONFIG_PARAMETERS=evil git status" \
     "GIT_EXEC_PATH=/tmp/x git status" \
     "IFS=: git status" \
+    "RIPGREP_CONFIG_PATH=/tmp/rc rg pat" \
+    "HOME=/tmp/evil git status" \
+    "XDG_CONFIG_HOME=/tmp/evil git status" \
+    "GIT_DIR=/tmp/evil git status" \
+    "GIT_WORK_TREE=/tmp/evil git status" \
     "FOO=bar && git status" \
     "PATH=/tmp/evil git status" \
     "DYLD_INSERT_LIBRARIES=/tmp/x.dylib git status" \
@@ -1595,6 +1604,8 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "env GIT_EXTERNAL_DIFF=evil git status" \
     "env FOO=bar npm test" \
     "git diff --output=out.txt" \
+    "git --upload-pack=evil status" \
+    "git --receive-pack=evil status" \
     "git remote add origin https://example.com/r.git" \
     "git tag v1.0" \
     "git tag -d v1.0" \
@@ -1617,6 +1628,8 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "rg --pre evil pat" \
     "rg --pre=evil pat" \
     "rg --pre-glob='*.md' pat" \
+    "rg --hostname-bin=evil pat" \
+    "rg --hostname-bin evil pat" \
     "/tmp/fake/stamp-gate.sh dispatch" \
     "/usr/bin/../../tmp/x/cat README.md" \
     "./cat README.md" \
@@ -1649,6 +1662,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "bash ./scripts/stamp-gate.sh canon --verdict PASS" \
     "./scripts/stamp-gate.sh canon --verdict PASS" \
     "./scripts/stamp-gate.sh security --verdict PASS --critical 0 --important 0" \
+    "./scripts/stamp-gate.sh tdd --verdict PASS" \
+    "./scripts/stamp-gate.sh review --kind tdd" \
+    "./scripts/stamp-gate.sh ui --verdict PASS" \
+    "./scripts/stamp-gate.sh context7 --lib react" \
+    "./scripts/stamp-gate.sh clear-pr-audit" \
     "./scripts/stamp-gate.sh swarm-coordinator off --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-coordinator status --action off --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-coordinator status --action=off --workspace \"$repo\"" \
@@ -1675,6 +1693,19 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_nl" ".decision" "deny" "Coordinator guard must deny forbidden command after newline"
+
+  local cmt_cmd out_cmt ansic_cmd out_ansic
+  cmt_cmd=$(printf "ls # '\nrm -rf src\n# '")
+  out_cmt=$(jq -nc --arg ws "$repo" --arg cmd "$cmt_cmd" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_cmt" ".decision" "deny" "C1: Shell # comment containing unmatched quote must not hide rm -rf"
+
+  ansic_cmd="echo \$'\'' ; rm -rf src #'"
+  out_ansic=$(jq -nc --arg ws "$repo" --arg cmd "$ansic_cmd" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_ansic" ".decision" "deny" "C2: ANSI-C quoting \$'...' must fail closed"
 
   spoof_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-spoof.XXXXXX")
   echo "$spoof_dir" >> "$_HARNESS_TEMP_TRACKER"

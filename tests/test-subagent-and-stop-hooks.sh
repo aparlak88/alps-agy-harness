@@ -2059,6 +2059,15 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
   assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-auto"].active' "false" "swarm(add) after off must not re-enable Coordinator guard"
   assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-auto"].explicitlyDisabled' "true"
 
+  # Minor: swarm(action="title") after explicit off re-enables Coordinator guard
+  printf '%s' "$(jq -nc --arg ws "$auto_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-auto",
+    toolCall: {name: "swarm", args: {action: "title", title: "Re-Enabled"}}
+  }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-auto"].active' "true" "swarm(title) after off must re-enable Coordinator guard"
+  assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-auto"].explicitlyDisabled' "false"
+
   # Worker-prompt swarm(title) must not register Coordinator
   printf '%s' "$(jq -nc --arg ws "$auto_repo" '{
     workspacePaths: [$ws],

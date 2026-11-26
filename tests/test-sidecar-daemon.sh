@@ -1623,6 +1623,7 @@ EOF
   HARNESS_DAEMON_DATA_DIR="$long_data_dir" \
   HARNESS_SKIP_SHELL_PATH_SYNC="1" \
   HARNESS_DAEMON_POLL_INTERVAL_SEC="30" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
   HARNESS_AGY_BIN="$always_ok_agy" \
   python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
   long_dpid=$!
@@ -1643,8 +1644,8 @@ EOF
   _wait_for_file_jq "$unreg_b/.harness/state/swarm/swarm-quota-wait.json" '.status == "resumed"' 40 \
     || { echo "stamp-gate pause must immediately wake daemon via /event/swarm-quota-wait even under 30s poll" >&2; return 1; }
 
-  # Minor: /hook/stop-gate on_swarm_quota_wait immediately registers & increases quotaWaits under 30s poll
-  local unreg_c stop_c_out long_health
+  # I3: /hook/stop-gate on_swarm_quota_wait immediately wakes 30s-poll daemon and auto-resumes within 4s
+  local unreg_c stop_c_out
   unreg_c=$(make_temp_repo)
   HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-coordinator on --workspace "$unreg_c" --conversation-id "conv-evc" --title "Stop Callback" >/dev/null
   stop_c_out=$(jq -nc --arg ws "$unreg_c" '{
@@ -1654,8 +1655,8 @@ EOF
     error: "RESOURCE_EXHAUSTED: 5-hour quota exceeded"
   }' | HARNESS_DAEMON_SOCK="$long_sock" "$STOP_GATE" | jq -c .)
   assert_eq "{}" "$stop_c_out"
-  long_health=$(curl -fsS --unix-socket "$long_sock" "http://localhost/health")
-  assert_json_field "$long_health" ".quotaWaits" "2" "/hook/stop-gate callback must immediately arm quotaWaits under 30s poll"
+  _wait_for_file_jq "$unreg_c/.harness/state/swarm/swarm-quota-wait.json" '.status == "resumed"' 40 \
+    || { echo "/hook/stop-gate callback did not wake 30s-poll daemon to auto-resume within 4s: $(cat "$unreg_c/.harness/state/swarm/swarm-quota-wait.json" 2>/dev/null || true)" >&2; return 1; }
 }
 
 run_tests "$@"

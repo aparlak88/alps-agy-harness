@@ -726,6 +726,7 @@ class HarnessDaemonState:
                         due_graphify.append((ws_key, str(job.get("reason", "queued"))))
 
                 due_quota_resumes: list[str] = []
+                soonest_probe_delta: Optional[float] = None
                 stale_threshold = harness_core._stale_resuming_threshold_sec()
                 for ws_key in to_refresh:
                     if ws_key in self._quota_resume_inflight:
@@ -734,9 +735,14 @@ class HarnessDaemonState:
                         q_state = harness_core.get_swarm_quota_state(Path(ws_key))
                         q_status = str(q_state.get("status") or "")
                         if q_status == "waiting":
-                            if harness_core._safe_float(q_state.get("nextProbeEpoch"), 0.0) <= now:
+                            next_probe = harness_core._safe_float(q_state.get("nextProbeEpoch"), 0.0)
+                            if next_probe <= now:
                                 self._quota_resume_inflight.add(ws_key)
                                 due_quota_resumes.append(ws_key)
+                            else:
+                                delta = next_probe - now
+                                if soonest_probe_delta is None or delta < soonest_probe_delta:
+                                    soonest_probe_delta = delta
                         elif q_status == "resuming":
                             started_ep = harness_core._safe_float(q_state.get("resumingStartedAtEpoch"), 0.0)
                             if started_ep <= 0 or (now - started_ep) >= stale_threshold:
@@ -777,7 +783,12 @@ class HarnessDaemonState:
 
             with self._lock:
                 self._watcher_cycles += 1
-            self.wake_event.wait(timeout=self.poll_interval_sec)
+            wait_timeout = (
+                self.poll_interval_sec
+                if soonest_probe_delta is None
+                else min(self.poll_interval_sec, max(0.05, soonest_probe_delta))
+            )
+            self.wake_event.wait(timeout=wait_timeout)
             self.wake_event.clear()
 
 

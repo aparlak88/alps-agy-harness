@@ -1050,6 +1050,15 @@ test_swarm_coordinator_only_pre_edit_and_session_start() {
   out_prose=$(printf '%s' "$p_prose" | "$PRE_EDIT_GUARD")
   assert_json_field "$out_prose" ".decision" "allow" "Prose mentioning swarm without /swarm must NOT trigger Coordinator-Only"
 
+  local out_swarming
+  out_swarming=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-swarming",
+    lastUserInput: "/swarming should never trigger coordinator mode",
+    toolCall: {name: "write_file", args: {Path: "src/Swarming.ts", Content: "export const ok = 1;"}}
+  }' | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_swarming" ".decision" "allow" "/swarming substring must NOT trigger Coordinator-Only"
+
   # 2. Turn-1 explicit /swarm slash command triggers Coordinator-Only guard immediately
   local p_slash out_slash
   p_slash=$(jq -nc --arg ws "$repo" '{
