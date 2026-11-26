@@ -1119,6 +1119,13 @@ test_swarm_coordinator_only_pre_edit_and_session_start() {
   wt_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-wt-edit.XXXXXX")
   echo "$wt_dir" >> "$_HARNESS_TEMP_TRACKER"
   git -C "$repo" worktree add "$wt_dir" -b "feat/wt-worker" --quiet
+  local out_sib_coord
+  out_sib_coord=$(jq -nc --arg ws "$repo" --arg path "$wt_dir/src/SibCoord.ts" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "write_file", args: {Path: $path, Content: "export const sc = 1;"}}
+  }' | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_sib_coord" ".decision" "deny" "Active Coordinator editing sibling worktree file must be denied"
   local out_wt_slash
   out_wt_slash=$(jq -nc --arg ws "$repo" --arg cwd "$wt_dir" '{
     workspacePaths: [$ws],

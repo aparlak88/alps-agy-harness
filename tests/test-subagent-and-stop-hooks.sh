@@ -2074,7 +2074,7 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
   git -C "$auto_repo" commit -m "chore: init" --quiet
   local auto_wt
   auto_wt=$(mktemp -d "${TMPDIR:-/tmp}/swarm-wt-auto.XXXXXX")
-  _TEST_TEMP_DIRS+=("$auto_wt")
+  echo "$auto_wt" >> "$_HARNESS_TEMP_TRACKER"
   git -C "$auto_repo" worktree add "$auto_wt" -b "feat/wt-helper" --quiet
   printf '%s' "$(jq -nc --arg ws "$auto_repo" --arg cwd "$auto_wt" '{
     workspacePaths: [$ws],
@@ -2096,14 +2096,23 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
     assert_contains "$(printf '%s' "$out_ir" | jq -r '.overwrite.brief')" "[SWARM_INTEGRATOR_CONTRACT"
   done
 
-  # Empty conversationId still triggers force_ask when active quota wait matches workspace
+  # Empty conversationId still triggers force_ask when active quota wait matches workspace or has empty stored conversationId
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 300 --buffer-seconds 0 >/dev/null
-  local out_empty_ask
+  local out_empty_ask out_empty_stored_ask
   out_empty_ask=$(jq -nc --arg ws "$repo" '{
     workspacePaths: [$ws],
     toolCall: {name: "swarm", args: {action: "model", name: "implementer-1", model: "gemini-4-hydrogen-high"}}
   }' | "$PRE_SUBAGENT_GUARD")
   assert_json_field "$out_empty_ask" ".decision" "force_ask" "swarm(model) with empty conversationId must still trigger force_ask during active wait"
+
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --wait-seconds 300 --buffer-seconds 0 >/dev/null
+  out_empty_stored_ask=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "swarm", args: {action: "model", name: "implementer-1", model: "gemini-4-hydrogen-high"}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_empty_stored_ask" ".decision" "force_ask" "swarm(model) must trigger force_ask when stored quota wait has empty conversationId"
 }
 
 test_stop_gate_detects_coordinator_quota_error_without_looping() {

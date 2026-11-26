@@ -1500,7 +1500,7 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
   # 4. swarm-quota attempt-resume failure, security, false-positive, and mid-flight re-pause/clear coverage
   local mock_dir mock_agy env_log
   mock_dir=$(mktemp -d)
-  _TEST_TEMP_DIRS+=("$mock_dir")
+  echo "$mock_dir" >> "$_HARNESS_TEMP_TRACKER"
   mock_agy="$mock_dir/mock-agy"
   env_log="$mock_dir/agy-env.log"
 
@@ -1565,17 +1565,17 @@ EOF
   # (e) Explicit reset in error + exponential backoff + env scrubbing + prose non-false-positive
   cat << EOF > "$mock_agy"
 #!/usr/bin/env bash
-printf 'TYPESAFE=%s GITHUB=%s OPENAI=%s\n' "\${TYPESAFE_API_KEY:-}" "\${GITHUB_TOKEN:-}" "\${OPENAI_API_KEY:-}" > "$env_log"
+printf 'TYPESAFE=%s GITHUB=%s OPENAI=%s GH=%s CLAUDECODE=%s\n' "\${TYPESAFE_API_KEY:-}" "\${GITHUB_TOKEN:-}" "\${OPENAI_API_KEY:-}" "\${GH_TOKEN:-}" "\${CLAUDECODE:-}" > "$env_log"
 echo "The 5-hour usage limit has reset; all workers resumed."
 exit 0
 EOF
   chmod +x "$mock_agy"
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
   local out_prose
-  out_prose=$(TYPESAFE_API_KEY="ts_live_12345678" GITHUB_TOKEN="ghp_1234567890abcdef" OPENAI_API_KEY="sk-openai123456" \
+  out_prose=$(TYPESAFE_API_KEY="ts_live_12345678" GITHUB_TOKEN="ghp_1234567890abcdef" OPENAI_API_KEY="sk-openai123456" GH_TOKEN="ghp_testscrub12345" CLAUDECODE="1" \
     HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
   assert_json_field "$out_prose" ".status" "resumed" "Prose mentioning usage limit without error prefix must succeed"
-  assert_eq "TYPESAFE= GITHUB= OPENAI=" "$(cat "$env_log")" "All sensitive env vars must be scrubbed before invoking agy"
+  assert_eq "TYPESAFE= GITHUB= OPENAI= GH= CLAUDECODE=" "$(cat "$env_log")" "All sensitive env vars must be scrubbed before invoking agy"
 
   # (f) CRITICAL: Mid-flight re-pause by coordinator inside agy must NOT be overwritten to resumed on exit 0
   cat << EOF > "$mock_agy"
@@ -1703,6 +1703,13 @@ EOF
   assert_json_field "$out_fresh_res" ".resumingToken" "fresh-tok"
   [ ! -f "$invoked_flag" ] || { echo "Fresh resuming state must skip duplicate agy invocation" >&2; return 1; }
 
+  # Zero resumingStartedAtEpoch is treated as stale and recovers cleanly
+  jq '.status = "resuming" | .resumingStartedAtEpoch = 0 | .resumingToken = "zero-tok"' \
+    "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  local out_zero_rec
+  out_zero_rec=$(HARNESS_AGY_BIN="$mock_agy" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_zero_rec" ".status" "resumed" "Zero resumingStartedAtEpoch must be recovered as stale"
+
   # Token mismatch during agy flight must preserve overriding resuming state
   cat << EOF > "$mock_agy"
 #!/usr/bin/env bash
@@ -1807,14 +1814,15 @@ ws = Path(os.environ["CONC_REPO"])
 barrier = threading.Barrier(4)
 results = []
 def worker_resume():
-    barrier.wait()
+    barrier.wait(timeout=5)
     results.append(harness_core.attempt_swarm_quota_resume(ws))
 
 threads = [threading.Thread(target=worker_resume) for _ in range(4)]
 for t in threads:
     t.start()
 for t in threads:
-    t.join()
+    t.join(timeout=5)
+    assert not t.is_alive(), "Concurrent resume thread timed out"
 
 final_state = harness_core.get_swarm_quota_state(ws)
 assert final_state.get("status") == "resumed", final_state
@@ -1826,14 +1834,15 @@ assert str(ws.resolve()) in cwd_line and "gemini-4-neon-high" in cwd_line, cwd_l
 
 w_barrier = threading.Barrier(6)
 def worker_reg(idx: int):
-    w_barrier.wait()
+    w_barrier.wait(timeout=5)
     harness_core.register_swarm_coordinator(ws, conversation_id="conv-conc-w", active=True, worker_name=f"w-{idx}")
 
 w_threads = [threading.Thread(target=worker_reg, args=(i,)) for i in range(6)]
 for t in w_threads:
     t.start()
 for t in w_threads:
-    t.join()
+    t.join(timeout=5)
+    assert not t.is_alive(), "Concurrent coordinator registration thread timed out"
 
 coord_status = harness_core.get_swarm_coordinator_status(ws, conversation_id="conv-conc-w")
 assert sorted(coord_status.get("workers", [])) == [f"w-{i}" for i in range(6)], coord_status

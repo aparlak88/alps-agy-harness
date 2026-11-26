@@ -273,13 +273,36 @@ test_async_graphify_queue_and_coalescing() {
   git -C "$repo" commit -m "chore: init" --quiet
   mkdir -p "$repo/graphify-out"
 
-  local call_log="$repo/.mock-graphify-calls.log"
-  local mock_graphify="$repo/mock-graphify.sh"
+  local call_log started1 release1 active_flag count_file mock_graphify
+  call_log="$repo/.mock-graphify-calls.log"
+  started1="$repo/.mock-graphify.started1"
+  release1="$repo/.mock-graphify.release1"
+  active_flag="$repo/.mock-graphify.active"
+  count_file="$repo/.mock-graphify.count"
+  mock_graphify="$repo/mock-graphify.sh"
   cat << EOF > "$mock_graphify"
 #!/usr/bin/env bash
-echo "START:\$(date +%s)" >> "$call_log"
-sleep 0.6
-echo "END:\$*" >> "$call_log"
+if [ -f "$active_flag" ]; then
+  echo "OVERLAP" >> "$call_log"
+fi
+touch "$active_flag"
+n=0
+if [ -f "$count_file" ]; then
+  n=\$(cat "$count_file")
+fi
+n=\$((n + 1))
+echo "\$n" > "$count_file"
+echo "START:\$n" >> "$call_log"
+if [ "\$n" -eq 1 ]; then
+  touch "$started1"
+  tries=0
+  while [ ! -f "$release1" ] && [ "\$tries" -lt 80 ]; do
+    sleep 0.05
+    tries=\$((tries + 1))
+  done
+fi
+rm -f "$active_flag"
+echo "END:\$n" >> "$call_log"
 EOF
   chmod +x "$mock_graphify"
 
@@ -312,6 +335,15 @@ print(dt)
     return 1
   fi
 
+  # Wait until run 1 is actively running behind release1
+  local tries_s=0
+  while [ ! -f "$started1" ] && [ "$tries_s" -lt 50 ]; do
+    sleep 0.05
+    tries_s=$((tries_s + 1))
+  done
+  [ -f "$started1" ] || { echo "Graphify run 1 did not start behind barrier" >&2; return 1; }
+
+  # Send two bursts while run 1 is still executing
   curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST \
     --data-binary "$(jq -nc --arg ws "$repo" '{workspace: $ws, reason: "burst1"}')" \
     "http://localhost/event/graphify" >/dev/null
@@ -319,17 +351,33 @@ print(dt)
     --data-binary "$(jq -nc --arg ws "$repo" '{workspace: $ws, reason: "burst2"}')" \
     "http://localhost/event/graphify" >/dev/null
 
+  # Wait for >= 3 watcherCycles while run 1 holds release1 -> single-flight must keep START == 1
+  local c0 cur_cyc w_steps=0
+  c0=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.watcherCycles // 0')
+  while [ "$w_steps" -lt 40 ]; do
+    sleep 0.1
+    w_steps=$((w_steps + 1))
+    cur_cyc=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.watcherCycles // 0')
+    [ "$cur_cyc" -ge $((c0 + 3)) ] && break
+  done
+  [ "$cur_cyc" -ge $((c0 + 3)) ] || { echo "Expected >= 3 watcherCycles during graphify barrier" >&2; return 1; }
+  assert_eq "1" "$(grep -c '^START:' "$call_log" || true)" "Single-flight must not start a concurrent graphify run while run 1 is active"
+
+  # Release run 1 -> bursts must coalesce into exactly 1 rerun (total START == 2, END == 2, OVERLAP == 0)
+  touch "$release1"
   _wait_for_file_jq "$repo/.harness/cache/graphify-status.json" '.state == "succeeded"' 60 || {
     echo "graphify-status.json did not reach succeeded" >&2
     return 1
   }
+  local e_tries=0
+  while [ "$(grep -c '^END:' "$call_log" || true)" -lt 2 ] && [ "$e_tries" -lt 40 ]; do
+    sleep 0.05
+    e_tries=$((e_tries + 1))
+  done
 
-  local start_count
-  start_count=$(grep -c '^START:' "$call_log" || true)
-  if [ "$start_count" -lt 1 ] || [ "$start_count" -gt 2 ]; then
-    echo "Expected 1 or 2 coalesced graphify runs, got $start_count" >&2
-    return 1
-  fi
+  assert_eq "2" "$(grep -c '^START:' "$call_log" || true)" "Expected 1 initial run + 1 coalesced rerun"
+  assert_eq "2" "$(grep -c '^END:' "$call_log" || true)" "Expected 2 completed runs"
+  assert_eq "0" "$(grep -c '^OVERLAP' "$call_log" || true)" "Single-flight runs must never overlap"
 }
 
 test_tree_state_and_stale_stamp_safety() {

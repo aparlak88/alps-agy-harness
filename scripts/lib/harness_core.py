@@ -1903,12 +1903,17 @@ def evaluate_pre_command(
                     "and is blocked for the active Swarm Coordinator."
                 ),
             }
+        pending_ask_reason = ""
         for seg, seg_cwd in segments_with_cwd:
             if not seg:
                 continue
             seg_decision, seg_reason = _evaluate_coordinator_command_segment(seg, seg_cwd, workspace)
-            if seg_decision != "allow":
-                return {"decision": seg_decision, "reason": seg_reason}
+            if seg_decision == "deny":
+                return {"decision": "deny", "reason": seg_reason}
+            if seg_decision == "force_ask" and not pending_ask_reason:
+                pending_ask_reason = seg_reason
+        if pending_ask_reason:
+            return {"decision": "force_ask", "reason": pending_ask_reason}
 
     if not segments_with_cwd:
         return {"decision": "allow"}

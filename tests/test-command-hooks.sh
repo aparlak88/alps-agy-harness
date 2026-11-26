@@ -1522,6 +1522,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "gh pr list" \
     "find . -maxdepth 2 -name '*.md'" \
     "grep '>' README.md" \
+    'echo '\''$(id)'\''' \
+    'echo '\''`id`'\''' \
+    "git -C \"$repo\" status" \
+    "git branch --contains HEAD" \
+    "git remote show" \
     "env FOO=bar git status" \
     "/usr/bin/cat README.md" \
     "./scripts/stamp-gate.sh swarm-coordinator on --workspace \"$repo\" --conversation-id \"conv-coord\"" \
@@ -1566,6 +1571,10 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git --config-env=core.fsmonitor=X status" \
     "git --exec-path=/tmp/evil status" \
     "GIT_EXTERNAL_DIFF=evil git diff" \
+    "GIT_CONFIG_PARAMETERS=evil git status" \
+    "GIT_EXEC_PATH=/tmp/x git status" \
+    "IFS=: git status" \
+    "FOO=bar && git status" \
     "PATH=/tmp/evil git status" \
     "DYLD_INSERT_LIBRARIES=/tmp/x.dylib git status" \
     "BASH_ENV=/tmp/x git status" \
@@ -1619,6 +1628,13 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "echo bad >> README.md" \
     "echo bad &> out.txt" \
     'echo $(touch /tmp/pwned)' \
+    'echo "$(rm -rf src)"' \
+    'echo "`id`"' \
+    "git status && rm -rf src" \
+    "git status || rm -rf src" \
+    "git status ; rm -rf src" \
+    "git status | rm -rf src" \
+    "git status & rm -rf src" \
     "echo \`id\`" \
     "cat <(id)" \
     "find . -name '*.tmp' -delete" \
@@ -1652,13 +1668,51 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     assert_contains "$(printf '%s' "$out_bad" | jq -r '.reason')" "Coordinator-Only"
   done
 
-  # 2b. Premature stamp-gate.sh swarm-quota resume returns force_ask before reset, allow after reset
+  # Newline delimiter (C2) and real spoofed harness scripts + symlink (I1) must be denied
+  local nl_cmd out_nl spoof_dir
+  nl_cmd=$(printf 'git status\nrm -rf src')
+  out_nl=$(jq -nc --arg ws "$repo" --arg cmd "$nl_cmd" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_nl" ".decision" "deny" "Coordinator guard must deny forbidden command after newline"
+
+  spoof_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-spoof.XXXXXX")
+  echo "$spoof_dir" >> "$_HARNESS_TEMP_TRACKER"
+  mkdir -p "$spoof_dir/sym"
+  printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/stamp-gate.sh"
+  printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/harness-doctor.sh"
+  chmod +x "$spoof_dir/stamp-gate.sh" "$spoof_dir/harness-doctor.sh"
+  ln -s "$spoof_dir/stamp-gate.sh" "$spoof_dir/sym/stamp-gate.sh"
+  local spoof_cmd
+  for spoof_cmd in \
+    "$spoof_dir/stamp-gate.sh dispatch" \
+    "$spoof_dir/harness-doctor.sh --json" \
+    "$spoof_dir/sym/stamp-gate.sh dispatch" \
+    "bash \"$spoof_dir/stamp-gate.sh\" dispatch" \
+    "bash \"$spoof_dir/harness-doctor.sh\" --json" \
+    "cd \"$spoof_dir\" && ./stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\" && ./harness-doctor.sh --json"
+  do
+    local out_sp
+    out_sp=$(jq -nc --arg ws "$repo" --arg cmd "$spoof_cmd" \
+      '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_sp" ".decision" "deny" "Real spoofed/symlink script must be denied: $spoof_cmd"
+  done
+
+  # 2b. Premature stamp-gate.sh swarm-quota resume returns force_ask before reset, allow after reset;
+  #     C1: chained deny MUST override force_ask (never let force_ask hide rm -rf).
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 600 --buffer-seconds 0 --window 5h >/dev/null
-  local out_res_ask out_res_ok
+  local out_res_ask out_res_chained out_res_ok
   out_res_ask=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\"" \
     '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_res_ask" ".decision" "force_ask" "Premature swarm-quota resume must trigger force_ask"
+
+  out_res_chained=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\" && rm -rf src" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_res_chained" ".decision" "deny" "Chained deny after premature resume must override force_ask"
 
   jq '.status = "resuming"' "$repo/.harness/state/swarm/swarm-quota-wait.json" > "$repo/.harness/state/swarm/swarm-quota-wait.json.tmp" \
     && mv "$repo/.harness/state/swarm/swarm-quota-wait.json.tmp" "$repo/.harness/state/swarm/swarm-quota-wait.json"
