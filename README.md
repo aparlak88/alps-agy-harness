@@ -83,6 +83,7 @@ Harness kurulumundan önce geliştirme makinenizde aşağıdaki araçların kuru
    - **Firebase:** `antigravity-plugins-official/plugin/firebase`
    - **Postman:** `antigravity-plugins-partners/plugin/postman`
    - **Android CLI (Önerilen):** `antigravity-plugins-official/plugin/android-cli-plugin`
+   - **Impeccable (Opsiyonel — UI/Frontend Projeleri İçin Önerilen):** `npx impeccable install --scope=global` (kuruluysa ve dalda UI dosyası değişirse `ui-pass.json` sert PR/merge kapısı otomatik devreye girer; saf backend projelerinde tamamen pasiftir).
 
 ---
 
@@ -225,8 +226,8 @@ Antigravity Swarm (`/swarm` veya çoklu ajan iş akışı) kullanılırken harne
 | **Ortak Çekirdek (`scripts/lib/`)** | `harness_core.py` | `harness-daemon` ile tüm yerel fallback kanca ve teşhis betikleri arasında paylaşılan tek doğruluk kaynağı. |
 | **Yardımcı Betikler** | `run-quiet.sh` | Derleme/test loglarını sessize alır; tek satır özet ve log kaydı döner. |
 | | `mobile-logs.sh` | iOS Simulator `.ips` crash ve Android Emulator logcat süzgeci. |
-| | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası, `select-model` çözümleyicisi ve subagent dispatch yöneticisi. |
-| | `harness-doctor.sh` | 8 MCP, gizli anahtar ve ortam sağlığı kontrol aracı. |
+| | `stamp-gate.sh` | Kriptografik `codeTreeSha` damgası (`canon`, `security`, koşullu `ui-pass.json`), `select-model` çözümleyicisi ve subagent dispatch yöneticisi. |
+| | `harness-doctor.sh` | 8 MCP, gizli anahtar, koşullu `impeccable_ui` ve ortam sağlığı kontrol aracı. |
 | **Alt Ajanlar (`agents/`)** | `canon-auditor.md` | Domain glossary, flows ve Clean Architecture denetçisi (`inherit`/`pro` + `HIGH` taban). |
 | | `security-reviewer.md` | PR diff güvenlik açığı ve secret tarayıcısı (frontier `inherit`/`pro` + `MAX`). |
 | | `pr-auditor.md` | Niyet çapası ve 7 boyutlu derin mimari denetçi (frontier `inherit`/`pro` + `HIGH`/`MAX`). |
@@ -252,6 +253,7 @@ Antigravity Swarm (`/swarm` veya çoklu ajan iş akışı) kullanılırken harne
 | **Engineering Harness** | Yapay zeka ajanlarının hata yapmasını ve kurallardan sapmasını engelleyen kancalar, kurallar ve denetim kapıları çerçevesi. |
 | **Flowchart** | Bileşenler arasındaki katman hiyerarşisini ve bağımlılık yönünü gösteren görsel akış şeması. |
 | **Idempotency** | Aynı komut veya işlemin defalarca çalıştırıldığında sistemde ilk işlem haricinde ek bir yan etki üretmemesi güvencesi. |
+| **Impeccable (Conditional UI Gate)** | UI/Frontend dosyaları değiştiğinde ve Impeccable kurulu olduğunda `stamp-gate.sh ui` (`impeccable detect --json` / `P0=0, P1=0`) ile `ui-pass.json` damgasını zorunlu kılan; `DO_NOT_TRACK=1` ve `IMPECCABLE_LIVE_COPY_AGENT=chat\|off` korumalı opsiyonel modül. |
 | **jev (TypeSafe System One)** | Ajan kararlarını ve kod diff'lerini sunucu tarafında bağlam kirletmeden olasılıksal olarak puanlayan değerlendirme motoru. |
 | **LSP (Language Server Protocol)** | Derleyici düzeyinde tip kontrolü, referans sorgulama ve sembol tanılamalarını ajana sunan standart protokol. |
 | **MCP (Model Context Protocol)** | Yapay zeka ajanlarının harici araçlar, dil sunucuları ve platformlara bağlanmasını sağlayan açık protokol. |

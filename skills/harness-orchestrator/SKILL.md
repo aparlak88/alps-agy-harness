@@ -95,10 +95,15 @@ Görev yürütülürken plan dışı dosyalarda düzenleme (*drive-by refactorin
 
 ---
 
-## 7. Yaşam Döngüsü Tamamlama
+## 7. Yaşam Döngüsü Tamamlama ve Koşullu UI Tasarım Kapısı (`impeccable`)
+
+UI/Frontend içeren `small_change` veya `full_project` görevlerinde `impeccable` kurulu ise:
+- **Araç Görev Ayrımı:** Görsel tasarım yönlendirme (`shape`, `bolder`, `polish`), UX eleştirisi (`critique`) ve statik AI-slop tespiti (`detect`) için `impeccable` kullanın; sıfır-konsol/5xx hatası, fonksiyonel E2E ve LCP/ağ incelemeleri için `playwright-e2e` ve `chrome-devtools-plugin` kullanın.
+- **Güvenli Ortam:** `impeccable` komutlarını ve `/impeccable live` oturumlarını her zaman `DO_NOT_TRACK=1 IMPECCABLE_LIVE_COPY_AGENT=chat` (veya `off`) ile çalıştırın; `.impeccable/` dizini ve kök `PRODUCT.md`/`DESIGN.md` dosyaları `main` kilidine takılmadan taslaklanabilir.
+- **Saf Backend İzolasyonu:** Backend/CLI görevlerinde `impeccable` tamamen pasiftir ve `ui-pass.json` üretilmez.
 
 Uygulama tamamlandığında:
-1. `pre-pr-readiness` skill'ini çağırın (`canon-auditor`, `security-reviewer`, Walkthrough).
+1. `pre-pr-readiness` skill'ini çağırın (`canon-auditor`, `security-reviewer`, UI değiştiyse + `impeccable` kuruluysa `stamp-gate.sh ui`, Walkthrough).
 2. `gh pr create` komutunu çalıştırın.
 3. `stop-gate.sh` devreye girdiğinde `review-pr` skill'i ile `pr-auditor` denetimini gerçekleştirin.
 

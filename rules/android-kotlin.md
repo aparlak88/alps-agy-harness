@@ -72,6 +72,7 @@ class ArchitectureFitnessTest {
   - Use the `Android CLI` plugin when installed for SDK/AVD tooling guidance, and wrap all Gradle verification tasks in `./scripts/run-quiet.sh`:
   - `./scripts/run-quiet.sh gradle-test -- ./gradlew testDebugUnitTest`
   - `./scripts/run-quiet.sh gradle-check -- ./gradlew lintDebug check`
+- **Conditional Native UI Audit (`impeccable`):** When `impeccable` is installed and Jetpack Compose `features`/`ui` or `res/layout/*.xml` files change, maintain `PRODUCT.md` (`android`) for Material 3 review (`P0=0`, `P1=0`) and run `./scripts/stamp-gate.sh ui --verdict PASS --p0 0 --p1 0` before PR/merge.
 
 ## 4. Production Code Documentation Contract (English `KDoc`)
 

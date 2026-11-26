@@ -71,6 +71,7 @@ struct ArchitectureFitnessTests {
   - Optional: use `XcodeBuildMCP` when configured on macOS workstations for scheme/simulator inspection, while keeping full build/test invocations wrapped in `./scripts/run-quiet.sh`:
   - `./scripts/run-quiet.sh swift-test -- swift test`
   - `./scripts/run-quiet.sh ios-build -- xcodebuild -scheme App -destination 'platform=iOS Simulator,name=iPhone 16' build`
+- **Conditional Native UI Audit (`impeccable`):** When `impeccable` is installed and SwiftUI `Features`/`Views` UI files change, maintain `PRODUCT.md` (`ios`) for Apple HIG review (`P0=0`, `P1=0`) and run `./scripts/stamp-gate.sh ui --verdict PASS --p0 0 --p1 0` before PR/merge.
 
 ## 4. Production Code Documentation Contract (English `Swift DocC`)
 

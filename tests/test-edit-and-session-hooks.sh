@@ -845,4 +845,69 @@ test_session_start_swarm_protocol_branch_guard_and_detached_head() {
   assert_not_contains "$msg_nongit" "[DETACHED HEAD]" "Non-git directory must not emit [DETACHED HEAD]"
 }
 
-run_tests
+test_impeccable_workspace_paths_and_session_start_ui_status() {
+  export HARNESS_DISABLE_DAEMON=1
+  local repo mock_cfg mock_skill
+  repo=$(make_temp_repo)
+  mock_cfg="$repo/.mock-cfg"
+  mock_skill="$repo/.mock-impeccable-skill"
+  mkdir -p "$mock_cfg" "$mock_skill"
+  echo "# Impeccable" > "$mock_skill/SKILL.md"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+
+  # 1. .impeccable/ writes allowed on main without glossary, but private key inside .impeccable/ is denied
+  local p_imp_cache p_imp_md p_imp_key out_imp_cache out_imp_md out_imp_key
+  p_imp_cache=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: ".impeccable/hook.cache.json", Content: "{}"}}}')
+  out_imp_cache=$(printf '%s' "$p_imp_cache" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_imp_cache" ".decision" "allow" ".impeccable/hook.cache.json must be allowed on main"
+
+  p_imp_md=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: ".impeccable/review/report.md", Content: "# Review\nNo glossary needed"}}}')
+  out_imp_md=$(printf '%s' "$p_imp_md" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_imp_md" ".decision" "allow" ".impeccable/review/report.md must be allowed without glossary"
+
+  p_imp_key=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: ".impeccable/secret.txt", Content: "-----BEGIN RSA PRIVATE KEY-----\nABC\n-----END RSA PRIVATE KEY-----"}}}')
+  out_imp_key=$(printf '%s' "$p_imp_key" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_imp_key" ".decision" "deny" "Private key inside .impeccable/ must still be denied"
+
+  # 2. PRODUCT.md and DESIGN.md allowed on main without glossary, while src/App.tsx on main is still denied
+  local p_prod p_design p_tsx out_prod out_design out_tsx
+  p_prod=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: "PRODUCT.md", Content: "# Product\n## Platform\nweb"}}}')
+  out_prod=$(printf '%s' "$p_prod" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_prod" ".decision" "allow" "PRODUCT.md draft on main must be allowed"
+
+  p_design=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: "DESIGN.md", Content: "# Design System"}}}')
+  out_design=$(printf '%s' "$p_design" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_design" ".decision" "allow" "DESIGN.md draft on main must be allowed"
+
+  p_tsx=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: "src/App.tsx", Content: "export const App = () => null;"}}}')
+  out_tsx=$(printf '%s' "$p_tsx" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_tsx" ".decision" "deny" "src/App.tsx on main must still be denied"
+
+  # 3. SessionStart UI Gate status: dormant -> advisory -> active
+  local msg_dormant msg_advisory msg_active
+  msg_dormant=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' \
+    | HARNESS_CONFIG_DIR="$mock_cfg" env -u HARNESS_IMPECCABLE_SKILL_DIR -u HARNESS_IMPECCABLE_BIN "$SESSION_START" \
+    | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$msg_dormant" "Impeccable UI Gate: dormant"
+  assert_not_contains "$msg_dormant" "[UI ADVISORY]"
+
+  mkdir -p "$repo/src"
+  echo "export const App = () => <main />;" > "$repo/src/App.tsx"
+
+  msg_advisory=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' \
+    | HARNESS_CONFIG_DIR="$mock_cfg" env -u HARNESS_IMPECCABLE_SKILL_DIR -u HARNESS_IMPECCABLE_BIN "$SESSION_START" \
+    | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$msg_advisory" "Impeccable UI Gate: advisory"
+  assert_contains "$msg_advisory" "[UI ADVISORY]"
+
+  msg_active=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}' \
+    | HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$mock_skill" "$SESSION_START" \
+    | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$msg_active" "Impeccable UI Gate: active"
+  assert_not_contains "$msg_active" "[UI ADVISORY]"
+}
+
+run_tests "$@"

@@ -86,6 +86,9 @@ test_agents_md_no_frontmatter_and_under_8kb() {
   assert_contains "$content" "pr-auditor" "AGENTS.md must reference pr-auditor"
   assert_contains "$content" "Swarm" "AGENTS.md must document Swarm Coordinator/Worker mode"
   assert_contains "$content" 'workspace: "share"' "AGENTS.md must mandate workspace: \"share\" for writing Swarm workers"
+  assert_contains "$content" "impeccable" "AGENTS.md must document conditional Impeccable UI gate"
+  assert_contains "$content" "ui-pass.json" "AGENTS.md must document ui-pass.json stamp"
+  assert_contains "$content" "stamp-gate.sh ui" "AGENTS.md must document stamp-gate.sh ui command"
 }
 
 assert_platform_rule_contract() {

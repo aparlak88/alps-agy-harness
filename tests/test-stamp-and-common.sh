@@ -795,4 +795,163 @@ test_neon_gemini4_and_custom_model_classification_parity() {
   assert_json_field "$sel_g4_pro_bounded" ".model" "pro" "unmatched gemini-4-pro classifies as argon and routes bounded_execution -> pro"
 }
 
+test_ui_stamp_web_detect_enforcement_and_native_p0_p1_validation() {
+  # shellcheck source=/dev/null
+  source "$COMMON_SH"
+  local repo mock_bin mock_cfg env_log
+  repo=$(make_temp_repo)
+  mock_bin="$repo/.mock-impeccable"
+  mock_cfg="$repo/.mock-cfg"
+  env_log="$repo/.mock-detect-env.log"
+  mkdir -p "$mock_cfg"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/ui-card" --quiet
+
+  # 1. Pure backend change does NOT require ui-pass.json even when Impeccable is installed
+  mkdir -p "$repo/src"
+  echo "export class Order {}" > "$repo/src/Order.cs"
+  git -C "$repo" add src/Order.cs
+  git -C "$repo" commit -m "feat: backend order" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  cat << 'EOF' > "$mock_bin"
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$mock_bin"
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" verify-pr-stamps --workspace "$repo"
+
+  # 2. Add Web UI file -> verify-pr-stamps requires ui-pass.json when Impeccable is present,
+  #    and does NOT require it when Impeccable is absent
+  mkdir -p "$repo/src/app"
+  echo "<section class='hero'><h1>Hello</h1></section>" > "$repo/src/app/Hero.html"
+  git -C "$repo" add src/app/Hero.html
+  git -C "$repo" commit -m "feat: add Hero.html" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs" --allow-file "src/app/Hero.html"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  # Without Impeccable installed -> verify-pr-stamps passes without ui-pass.json
+  HARNESS_CONFIG_DIR="$mock_cfg" env -u HARNESS_IMPECCABLE_BIN -u HARNESS_IMPECCABLE_SKILL_DIR \
+    "$STAMP_GATE" verify-pr-stamps --workspace "$repo"
+
+  # With Impeccable installed -> verify-pr-stamps fails until ui-pass.json is stamped
+  local missing_ui_err
+  if missing_ui_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+      "$STAMP_GATE" verify-pr-stamps --workspace "$repo" 2>&1); then
+    echo "verify-pr-stamps must fail when Web UI changed and Impeccable is installed without ui-pass.json" >&2
+    return 1
+  fi
+  assert_contains "$missing_ui_err" "ui stamp"
+
+  # 3. Mock detector returning exit 2 (slop findings) blocks PASS stamp
+  cat << 'EOF' > "$mock_bin"
+#!/usr/bin/env bash
+echo '[{"rule":"overused-font","file":"src/app/Hero.html"}]'
+exit 2
+EOF
+  chmod +x "$mock_bin"
+
+  set +e
+  local detect_fail_err rc_detect=0
+  detect_fail_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0 2>&1)
+  rc_detect=$?
+  set -e
+  assert_eq "2" "$rc_detect" "Detector findings (exit 2) must reject ui PASS stamp with exit 2"
+  assert_contains "$detect_fail_err" "overused-font"
+
+  local state_dir
+  state_dir="$(harness_state_dir "$repo")"
+  [ ! -f "$state_dir/ui-pass.json" ] || { echo "ui-pass.json must not be written when detector exits 2" >&2; return 1; }
+
+  # 4. Non-zero p0 or p1 rejects PASS stamp (exit 1)
+  if HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+      "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 1 --p1 0 >/dev/null 2>&1; then
+    echo "ui PASS with p0=1 must be rejected" >&2
+    return 1
+  fi
+  if HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+      "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 2 >/dev/null 2>&1; then
+    echo "ui PASS with p1=2 must be rejected" >&2
+    return 1
+  fi
+
+  # 5. Clean detector (exit 0) verifies safe env and writes valid ui-pass.json
+  cat << EOF > "$mock_bin"
+#!/usr/bin/env bash
+printf 'DO_NOT_TRACK=%s\nIMPECCABLE_LIVE_COPY_AGENT=%s\nARGS=%s\n' \
+  "\${DO_NOT_TRACK:-}" "\${IMPECCABLE_LIVE_COPY_AGENT:-}" "\$*" > "$env_log"
+echo '[]'
+exit 0
+EOF
+  chmod +x "$mock_bin"
+
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0
+  [ -f "$state_dir/ui-pass.json" ] || { echo "ui-pass.json must be created on clean detector pass" >&2; return 1; }
+  assert_json_field "$state_dir/ui-pass.json" ".verdict" "PASS"
+  assert_json_field "$state_dir/ui-pass.json" ".p0Count" "0"
+  assert_json_field "$state_dir/ui-pass.json" ".p1Count" "0"
+  assert_json_field "$state_dir/ui-pass.json" ".scannedWebFiles[0]" "src/app/Hero.html"
+
+  local env_dump
+  env_dump=$(cat "$env_log")
+  assert_contains "$env_dump" "DO_NOT_TRACK=1"
+  assert_contains "$env_dump" "IMPECCABLE_LIVE_COPY_AGENT=off"
+  assert_contains "$env_dump" "detect --json src/app/Hero.html"
+
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+    "$STAMP_GATE" verify-pr-stamps --workspace "$repo"
+
+  # 6. Modifying Hero.html after stamping invalidates ui-pass.json (stale codeTreeSha)
+  echo "<section class='hero'><h1>Updated</h1></section>" > "$repo/src/app/Hero.html"
+  git -C "$repo" add src/app/Hero.html
+  git -C "$repo" commit -m "feat: update Hero.html" --quiet
+  "$STAMP_GATE" canon --workspace "$repo" --verdict PASS --allow-file "src/Order.cs" --allow-file "src/app/Hero.html"
+  "$STAMP_GATE" security --workspace "$repo" --verdict PASS --critical 0 --important 0
+
+  local stale_err
+  if stale_err=$(HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_BIN="$mock_bin" \
+      "$STAMP_GATE" verify-pr-stamps --workspace "$repo" 2>&1); then
+    echo "verify-pr-stamps must reject stale ui-pass.json after UI commit" >&2
+    return 1
+  fi
+  assert_contains "$stale_err" "ui-pass.json codeTreeSha"
+
+  # 7. Native SwiftUI change with SKILL.md only (no web files) requires ui-pass.json and passes without binary detector
+  local native_repo native_skill_dir
+  native_repo=$(make_temp_repo)
+  native_skill_dir="$native_repo/.mock-skill"
+  mkdir -p "$native_skill_dir" "$native_repo/Sources/Features"
+  echo "# Impeccable" > "$native_skill_dir/SKILL.md"
+  echo "init" > "$native_repo/README.md"
+  git -C "$native_repo" add README.md
+  git -C "$native_repo" commit -m "chore: init" --quiet
+  git -C "$native_repo" checkout -b "feat/paywall-view" --quiet
+  echo "struct PaywallView {}" > "$native_repo/Sources/Features/PaywallView.swift"
+  git -C "$native_repo" add Sources/Features/PaywallView.swift
+  git -C "$native_repo" commit -m "feat: add PaywallView" --quiet
+  "$STAMP_GATE" canon --workspace "$native_repo" --verdict PASS --allow-file "Sources/Features/PaywallView.swift"
+  "$STAMP_GATE" security --workspace "$native_repo" --verdict PASS --critical 0 --important 0
+
+  if HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$native_skill_dir" \
+      "$STAMP_GATE" verify-pr-stamps --workspace "$native_repo" >/dev/null 2>&1; then
+    echo "Native SwiftUI UI change with Impeccable skill must require ui-pass.json" >&2
+    return 1
+  fi
+
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$native_skill_dir" \
+    "$STAMP_GATE" ui --workspace "$native_repo" --verdict PASS --p0 0 --p1 0
+  local native_state_dir
+  native_state_dir="$(harness_state_dir "$native_repo")"
+  assert_json_field "$native_state_dir/ui-pass.json" ".auditedNativeFiles[0]" "Sources/Features/PaywallView.swift"
+  HARNESS_CONFIG_DIR="$mock_cfg" HARNESS_IMPECCABLE_SKILL_DIR="$native_skill_dir" \
+    "$STAMP_GATE" verify-pr-stamps --workspace "$native_repo"
+}
+
 run_tests "$@"

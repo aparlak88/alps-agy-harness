@@ -1221,4 +1221,71 @@ test_swarm_cwd_detached_and_parallel_dispatch_daemon_vs_cold_parity() {
   assert_json_field "$out_dq3_off" ".decision" "deny" "Cold OFF must deny after queue exhausted"
 }
 
+test_daemon_impeccable_parity_and_ui_stamp_tree_state() {
+  trap _td_cleanup EXIT INT TERM
+  local repo sock_dir data_dir sock_path dpid mock_bin
+  repo=$(make_temp_repo)
+  sock_dir=$(mktemp -d "/tmp/hd-imp.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-imp-d.XXXXXX")
+  _TD_DIRS+=("$sock_dir" "$data_dir")
+  sock_path="$sock_dir/d.sock"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.2" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
+
+  # 1. .impeccable/ edit parity (daemon ON vs cold OFF)
+  local p_imp_edit on_edit off_edit
+  p_imp_edit=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "write_file", args: {Path: ".impeccable/hook.cache.json", Content: "{}"}}}')
+  on_edit=$(printf '%s' "$p_imp_edit" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD")
+  off_edit=$(printf '%s' "$p_imp_edit" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD")
+  assert_json_field "$on_edit" ".decision" "allow" "Daemon ON must allow .impeccable/ cache writes"
+  assert_json_field "$off_edit" ".decision" "allow" "Cold OFF must allow .impeccable/ cache writes"
+
+  # 2. npx impeccable live guard parity (daemon ON vs cold OFF)
+  local p_live on_live off_live
+  p_live=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: "npx impeccable live"}}}')
+  on_live=$(printf '%s' "$p_live" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD")
+  off_live=$(printf '%s' "$p_live" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD")
+  assert_json_field "$on_live" ".decision" "deny" "Daemon ON must deny unguarded npx impeccable live"
+  assert_json_field "$off_live" ".decision" "deny" "Cold OFF must deny unguarded npx impeccable live"
+
+  # 3. tree-state.json tracks uiStampStatus fresh -> stale across UI commit
+  git -C "$repo" checkout -b "feat/daemon-ui" --quiet
+  mkdir -p "$repo/src"
+  echo "export const Hero = () => <section />;" > "$repo/src/Hero.tsx"
+  git -C "$repo" add src/Hero.tsx
+  git -C "$repo" commit -m "feat: add Hero.tsx" --quiet
+
+  mock_bin="$repo/.mock-impeccable"
+  cat << 'EOF' > "$mock_bin"
+#!/usr/bin/env bash
+echo '[]'
+exit 0
+EOF
+  chmod +x "$mock_bin"
+  HARNESS_IMPECCABLE_BIN="$mock_bin" "$REPO_ROOT/scripts/stamp-gate.sh" ui --workspace "$repo" --verdict PASS --p0 0 --p1 0
+
+  # Register workspace with daemon and wait for fresh uiStampStatus in tree-state.json
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws]}')" | HARNESS_DAEMON_SOCK="$sock_path" "$SESSION_START" >/dev/null
+  _wait_for_file_jq "$repo/.harness/cache/tree-state.json" '.uiStampStatus == "fresh" and .uiStampValid == true' 50 \
+    || { echo "tree-state.json did not record fresh uiStampStatus" >&2; return 1; }
+
+  # Commit another UI edit -> daemon refreshes tree-state.json to stale
+  echo "export const Hero = () => <section>v2</section>;" > "$repo/src/Hero.tsx"
+  git -C "$repo" add src/Hero.tsx
+  git -C "$repo" commit -m "feat: update Hero.tsx" --quiet
+  _wait_for_file_jq "$repo/.harness/cache/tree-state.json" '.uiStampStatus == "stale" and .uiStampValid == false' 50 \
+    || { echo "tree-state.json did not transition uiStampStatus to stale" >&2; return 1; }
+}
+
 run_tests "$@"
