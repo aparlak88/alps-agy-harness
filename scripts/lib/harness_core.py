@@ -1883,14 +1883,9 @@ def evaluate_pre_command(
     segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
 
     if is_active_swarm_coordinator(workspace, hook_input):
-        if cmd_line.strip() and not segments_with_cwd:
-            return {
-                "decision": "deny",
-                "reason": (
-                    "Swarm Coordinator-Only guard: command produced no executable segment (e.g. env -S or bare assignment) "
-                    "and is blocked for the active Swarm Coordinator."
-                ),
-            }
+        raw_err = _check_coordinator_raw_segments(cmd_line)
+        if raw_err:
+            return {"decision": "deny", "reason": raw_err}
         unsafe_syntax = _has_unsafe_shell_syntax_for_coordinator(cmd_line)
         if unsafe_syntax:
             return {
@@ -1900,9 +1895,14 @@ def evaluate_pre_command(
                     "Only read-only inspection and harness coordination commands are allowed; delegate work to Swarm workers."
                 ),
             }
-        raw_err = _check_coordinator_raw_segments(cmd_line)
-        if raw_err:
-            return {"decision": "deny", "reason": raw_err}
+        if cmd_line.strip() and not segments_with_cwd:
+            return {
+                "decision": "deny",
+                "reason": (
+                    "Swarm Coordinator-Only guard: command produced no executable segment (e.g. env -S or bare assignment) "
+                    "and is blocked for the active Swarm Coordinator."
+                ),
+            }
         for seg, seg_cwd in segments_with_cwd:
             if not seg:
                 continue
@@ -3277,7 +3277,7 @@ def _stale_resuming_threshold_sec(timeout_sec: float = DEFAULT_SWARM_RESUME_TIME
 
 
 def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
-    """Reject ``sudo``, ``env -S``, or dangerous execution env vars in raw segments."""
+    """Reject ``sudo``, ``env -S``, wrapper-prefixed bypasses, or dangerous env vars in raw segments."""
     for raw_seg, _ in _tokenize_raw_segments(cmd_line):
         if not raw_seg:
             continue
@@ -3287,6 +3287,8 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
             return (
                 "Swarm Coordinator-Only guard: malformed shell quoting is blocked for the active Swarm Coordinator."
             )
+        if not tokens:
+            continue
         idx = 0
         while idx < len(tokens):
             tok = tokens[idx]
@@ -3298,9 +3300,18 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
                     )
                 idx += 1
                 continue
-            if tok == "sudo":
+            base_tok = os.path.basename(tok)
+            if base_tok == "sudo":
                 return "Swarm Coordinator-Only guard: 'sudo' is blocked for the active Swarm Coordinator."
-            if tok == "env":
+            if base_tok in ("nohup", "time", "builtin", "command"):
+                idx += 1
+                while idx < len(tokens) and tokens[idx].startswith("-"):
+                    if tokens[idx] == "--":
+                        idx += 1
+                        break
+                    idx += 1
+                continue
+            if base_tok == "env":
                 idx += 1
                 while idx < len(tokens):
                     etok = tokens[idx]
@@ -3321,16 +3332,33 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
                         break
                 continue
             break
+        if idx >= len(tokens):
+            return (
+                "Swarm Coordinator-Only guard: bare assignment or wrapper-only segment is blocked for the active Swarm Coordinator."
+            )
     return None
 
 
 def _is_trusted_coordinator_exe(raw_exe: str) -> bool:
-    """Return True if ``raw_exe`` is a bare command name or under trusted OS system bin prefixes."""
+    """Return True if ``raw_exe`` is a bare command name or normalized trusted system bin path."""
     if not raw_exe:
         return False
     if "/" not in raw_exe and "\\" not in raw_exe:
         return True
-    return any(raw_exe.startswith(pref) for pref in COORDINATOR_TRUSTED_BIN_PREFIXES)
+    if "\\" in raw_exe or ".." in raw_exe.split("/"):
+        return False
+    norm = os.path.normpath(raw_exe)
+    if not any(norm.startswith(pref) for pref in COORDINATOR_TRUSTED_BIN_PREFIXES):
+        return False
+    if os.path.lexists(norm):
+        try:
+            real = os.path.realpath(norm)
+        except OSError:
+            return False
+        trusted_real = COORDINATOR_TRUSTED_BIN_PREFIXES + ("/opt/homebrew/Cellar/", "/usr/local/Cellar/", "/System/")
+        if not any(real.startswith(pref) for pref in trusted_real):
+            return False
+    return True
 
 
 def _is_trusted_harness_script_path(raw_script: str, seg_cwd: Path, workspace: Path, expected_name: str) -> bool:
@@ -3488,8 +3516,15 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
     if exe in COORDINATOR_READ_ONLY_BINS:
         if exe == "sort":
             for tok in seg[1:]:
-                if tok == "-o" or tok.startswith("-o") or tok == "--output" or tok.startswith(("--output=", "--compress-program=")) or tok == "--compress-program":
-                    return _deny_seg()
+                if tok == "--":
+                    break
+                if tok.startswith("--"):
+                    opt_name = tok.split("=", 1)[0]
+                    if opt_name.startswith("--o") or opt_name.startswith("--comp"):
+                        return _deny_seg()
+                elif tok.startswith("-") and len(tok) > 1:
+                    if "o" in tok[1:]:
+                        return _deny_seg()
         elif exe == "uniq":
             pos_args: list[str] = []
             idx = 1

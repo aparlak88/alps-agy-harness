@@ -1523,6 +1523,7 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "find . -maxdepth 2 -name '*.md'" \
     "grep '>' README.md" \
     "env FOO=bar git status" \
+    "/usr/bin/cat README.md" \
     "./scripts/stamp-gate.sh swarm-coordinator on --workspace \"$repo\" --conversation-id \"conv-coord\"" \
     "./scripts/stamp-gate.sh swarm-quota pause --workspace \"$repo\" --conversation-id \"conv-coord\" --wait-seconds 60" \
     "./scripts/stamp-gate.sh dispatch --workspace \"$repo\" --role explorer" \
@@ -1547,7 +1548,7 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_env_s" ".decision" "deny"
-  assert_contains "$(printf '%s' "$out_env_s" | jq -r '.reason')" "env -S"
+  assert_contains "$(printf '%s' "$out_env_s" | jq -r '.reason')" "env -S/--split-string"
 
   local denied_cmd
   for denied_cmd in \
@@ -1562,9 +1563,26 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git branch --set-upstream-to=origin/main" \
     "git branch new-branch" \
     "git -c core.fsmonitor=evil status" \
+    "git --config-env=core.fsmonitor=X status" \
+    "git --exec-path=/tmp/evil status" \
     "GIT_EXTERNAL_DIFF=evil git diff" \
     "PATH=/tmp/evil git status" \
+    "DYLD_INSERT_LIBRARIES=/tmp/x.dylib git status" \
+    "BASH_ENV=/tmp/x git status" \
+    "PYTHONPATH=/tmp/x git status" \
+    "GIT_PAGER=evil git log" \
     "sudo git status" \
+    "/usr/bin/sudo git status" \
+    "time sudo git status" \
+    "nohup sudo git status" \
+    "command sudo git status" \
+    "builtin sudo git status" \
+    "time PATH=/tmp/evil git status" \
+    "nohup LD_PRELOAD=/tmp/evil.so git status" \
+    "command GIT_SSH_COMMAND=evil git status" \
+    'time env -S "rm -rf src" && ls' \
+    'nohup env -S "rm -rf src" && git status' \
+    '/usr/bin/env -S "rm -rf src"' \
     "env GIT_EXTERNAL_DIFF=evil git status" \
     "env FOO=bar npm test" \
     "git diff --output=out.txt" \
@@ -1574,15 +1592,28 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git worktree add /tmp/wt" \
     "gh pr create --fill" \
     "gh pr merge 1" \
+    "gh auth login" \
+    "gh issue create --title x" \
+    "gh repo delete foo" \
     "bash -c 'echo hi'" \
     "rm -rf src" \
     "env -S \"rm -rf src\"" \
     "sort -o README.md README.md" \
+    "sort -ro README.md README.md" \
+    "sort -uo README.md README.md" \
     "sort --output=README.md README.md" \
+    "sort --out=README.md README.md" \
+    "sort --compress-program=sh README.md" \
     "uniq README.md out.txt" \
     "rg --pre evil pat" \
+    "rg --pre=evil pat" \
+    "rg --pre-glob='*.md' pat" \
     "/tmp/fake/stamp-gate.sh dispatch" \
+    "/usr/bin/../../tmp/x/cat README.md" \
     "./cat README.md" \
+    "git status 'unterminated" \
+    "git status >&2file" \
+    "git status >&1out" \
     "echo bad > README.md" \
     "echo bad >| README.md" \
     "echo bad >> README.md" \
@@ -1592,7 +1623,13 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "cat <(id)" \
     "find . -name '*.tmp' -delete" \
     "find . -exec rm {} \\;" \
+    "find . -execdir rm {} \\;" \
+    "find . -ok rm {} \\;" \
+    "find . -okdir rm {} \\;" \
     "find . -fprint out.txt" \
+    "find . -fprint0 out.txt" \
+    "find . -fprintf out.txt '%p'" \
+    "find . -fls out.txt" \
     "bash ./scripts/stamp-gate.sh canon --verdict PASS" \
     "./scripts/stamp-gate.sh canon --verdict PASS" \
     "./scripts/stamp-gate.sh security --verdict PASS --critical 0 --important 0" \
@@ -1600,6 +1637,7 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "./scripts/stamp-gate.sh swarm-coordinator status --action off --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-coordinator status --action=off --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-quota clear --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota attempt-resume --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-quota status --action clear --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-quota status --action=clear --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-quota status --action resume --workspace \"$repo\"" \
@@ -1621,6 +1659,14 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_res_ask" ".decision" "force_ask" "Premature swarm-quota resume must trigger force_ask"
+
+  jq '.status = "resuming"' "$repo/.harness/state/swarm/swarm-quota-wait.json" > "$repo/.harness/state/swarm/swarm-quota-wait.json.tmp" \
+    && mv "$repo/.harness/state/swarm/swarm-quota-wait.json.tmp" "$repo/.harness/state/swarm/swarm-quota-wait.json"
+  local out_resuming_ask
+  out_resuming_ask=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\"" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_resuming_ask" ".decision" "force_ask" "Premature swarm-quota resume while resuming must trigger force_ask"
 
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 0 --buffer-seconds 0 --window 5h >/dev/null
   out_res_ok=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\"" \

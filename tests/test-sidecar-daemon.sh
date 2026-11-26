@@ -1463,8 +1463,19 @@ EOF
   done
   [ -f "$started_flag" ] || { echo "stamp-gate.sh pause --workspace . did not trigger daemon auto-resume" >&2; return 1; }
 
-  # Sleep past HARNESS_SWARM_STALE_RESUMING_SEC (0.3s) across multiple 0.1s watcher cycles while attempt 1 holds barrier
-  sleep 0.45
+  # I6: Wait deterministically for >=4 completed watcherCycles AND >=0.35s (past 0.3s stale threshold) behind barrier
+  local c0 now_c cur_cyc waited_steps
+  c0=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.watcherCycles // 0')
+  waited_steps=0
+  while [ "$waited_steps" -lt 40 ]; do
+    sleep 0.1
+    waited_steps=$((waited_steps + 1))
+    cur_cyc=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.watcherCycles // 0')
+    if [ "$cur_cyc" -ge $((c0 + 4)) ] && [ "$waited_steps" -ge 4 ]; then
+      break
+    fi
+  done
+  [ "$cur_cyc" -ge $((c0 + 4)) ] || { echo "Expected >= 4 watcherCycles past stale threshold (c0=$c0, cur=$cur_cyc)" >&2; return 1; }
   local health_json
   health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
   assert_json_field "$health_json" ".quotaWaits" "1"
@@ -1483,8 +1494,8 @@ EOF
   assert_contains "$agy_log" "@worker-1"
   assert_not_contains "$agy_log" "ts_live_must_be_scrubbed" "Daemon must scrub TYPESAFE_API_KEY before invoking agy"
 
-  # 3. Registry reload across daemon restart retains workspace past expired TTL when quota wait is active
-  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-dq" --resume-at "2031-01-01T00:00:00Z" --buffer-seconds 0 --window weekly >/dev/null
+  # 3. Registry reload across daemon restart retains workspace past expired TTL when quota wait is active (I7 isolated)
+  HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-dq" --resume-at "2031-01-01T00:00:00Z" --buffer-seconds 0 --window weekly >/dev/null
   kill -TERM "$dpid" 2>/dev/null || true
   wait "$dpid" 2>/dev/null || true
   local real_repo
@@ -1507,10 +1518,13 @@ EOF
   assert_json_field "$health_json" ".activeWorkspaces" "1" "Registry reload must keep workspace with active quota wait even when TTL expired"
   assert_json_field "$health_json" ".quotaWaits" "1"
 
-  # 4. Stale 'resuming' state recovery & malformed swarm-quota-wait.json resilience
+  # 4. Stale 'resuming' state recovery & I5 lastSeenAt retention refresh + malformed nextProbeEpoch resilience
   jq '.status = "resuming" | .resumingStartedAtEpoch = 1 | .resumingToken = "stale-tok"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
   _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
     || { echo "Daemon failed to recover stale resuming state: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
+  local refreshed_seen
+  refreshed_seen=$(jq -r --arg ws "$real_repo" '.workspaces[$ws].lastSeenAt | floor' "$data_dir/workspaces.json")
+  [ "$refreshed_seen" -gt 1000000000 ] || { echo "Daemon must refresh & persist lastSeenAt after resume (got $refreshed_seen)" >&2; return 1; }
 
   jq '.status = "waiting" | .nextProbeEpoch = "not-a-number"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
   _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
@@ -1580,6 +1594,20 @@ EOF
   (cd "$unreg_b" && HARNESS_DAEMON_SOCK="$long_sock" "$STAMP_GATE" swarm-quota pause --workspace "." --conversation-id "conv-evb" --wait-seconds 0 --buffer-seconds 0 >/dev/null)
   _wait_for_file_jq "$unreg_b/.harness/state/swarm/swarm-quota-wait.json" '.status == "resumed"' 40 \
     || { echo "stamp-gate pause must immediately wake daemon via /event/swarm-quota-wait even under 30s poll" >&2; return 1; }
+
+  # Minor: /hook/stop-gate on_swarm_quota_wait immediately registers & increases quotaWaits under 30s poll
+  local unreg_c stop_c_out long_health
+  unreg_c=$(make_temp_repo)
+  HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-coordinator on --workspace "$unreg_c" --conversation-id "conv-evc" --title "Stop Callback" >/dev/null
+  stop_c_out=$(jq -nc --arg ws "$unreg_c" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-evc",
+    terminationReason: "ERROR",
+    error: "RESOURCE_EXHAUSTED: 5-hour quota exceeded"
+  }' | HARNESS_DAEMON_SOCK="$long_sock" "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$stop_c_out"
+  long_health=$(curl -fsS --unix-socket "$long_sock" "http://localhost/health")
+  assert_json_field "$long_health" ".quotaWaits" "2" "/hook/stop-gate callback must immediately arm quotaWaits under 30s poll"
 }
 
 run_tests "$@"

@@ -181,6 +181,7 @@ class HarnessDaemonState:
         self._dirty_workspaces: set[str] = set()
         self._graphify_queue: dict[str, dict[str, Any]] = {}
         self._quota_resume_inflight: set[str] = set()
+        self._watcher_cycles: int = 0
 
         self.poll_interval_sec = max(0.05, float(os.environ.get("HARNESS_DAEMON_POLL_INTERVAL_SEC", "1.5")))
         self.workspace_ttl_sec = max(0.1, float(os.environ.get("HARNESS_DAEMON_WORKSPACE_TTL_SEC", "1800")))
@@ -293,6 +294,11 @@ class HarnessDaemonState:
         """Return count of pending or active graphify jobs across workspaces."""
         with self._lock:
             return sum(1 for item in self._graphify_queue.values() if item.get("queued") or item.get("running"))
+
+    def watcher_cycle_count(self) -> int:
+        """Return total completed ``watcher_loop`` iterations."""
+        with self._lock:
+            return self._watcher_cycles
 
     def active_quota_wait_count(self) -> int:
         """Return count of registered workspaces with an active Swarm quota wait."""
@@ -769,6 +775,8 @@ class HarnessDaemonState:
                 except Exception as exc:
                     self.logger.log("WARN", f"Refresh error for {ws_key}: {exc}")
 
+            with self._lock:
+                self._watcher_cycles += 1
             self.wake_event.wait(timeout=self.poll_interval_sec)
             self.wake_event.clear()
 
@@ -859,6 +867,7 @@ class DaemonRequestHandler(http.server.BaseHTTPRequestHandler):
                     "activeWorkspaces": state.active_workspace_count(),
                     "queueDepth": state.queue_depth(),
                     "quotaWaits": state.active_quota_wait_count(),
+                    "watcherCycles": state.watcher_cycle_count(),
                 },
             )
             return

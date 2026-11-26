@@ -1407,6 +1407,7 @@ EOF
 }
 
 test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
+  export HARNESS_DISABLE_DAEMON=1
   local repo coord_file quota_file
   repo=$(make_temp_repo)
   coord_file="$repo/.harness/state/swarm/swarm-coordinator.json"
@@ -1715,7 +1716,7 @@ EOF
   assert_json_field "$out_tok_mis" ".status" "resuming"
   assert_json_field "$out_tok_mis" ".resumingToken" "other-worker-tok"
 
-  # (m) I9: Duration parsing unit coverage (minutes, seconds, Turkish units, negative lookahead)
+  # (m) I9, I4 & Minor: Duration parsing, ISO offsets, window boundaries, and isolated quota error patterns
   PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
 import harness_core
 now = 1700000000.0
@@ -1729,6 +1730,113 @@ ep, ex = harness_core.parse_quota_reset_epoch("1 gün 30 saniye", now_epoch=now,
 assert ex and ep == now + 86430.0, (ep, ex)
 ep, ex = harness_core.parse_quota_reset_epoch("5h quota exceeded", now_epoch=now, buffer_sec=0)
 assert not ex, (ep, ex)
+
+ep_z, ex_z = harness_core.parse_quota_reset_epoch("2030-11-27T04:00:00Z", now_epoch=now, buffer_sec=0)
+ep_off, ex_off = harness_core.parse_quota_reset_epoch("2030-11-27T07:00:00+03:00", now_epoch=now, buffer_sec=0)
+ep_naive, ex_naive = harness_core.parse_quota_reset_epoch("2030-11-27T04:00:00", now_epoch=now, buffer_sec=0)
+assert ex_z and ex_off and ex_naive and abs(ep_z - ep_off) < 0.001 and abs(ep_z - ep_naive) < 0.001, (ep_z, ep_off, ep_naive)
+
+assert harness_core.classify_quota_window("", wait_seconds=21600) == "5h"
+assert harness_core.classify_quota_window("", wait_seconds=21601) == "weekly"
+assert harness_core.classify_quota_window("haftalık kota window") == "weekly"
+assert harness_core.classify_quota_window("resets in 7d") == "weekly"
+assert harness_core.classify_quota_window("5 saat limit window") == "5h"
+
+for pos in (
+    "out of quota",
+    "insufficient quota",
+    "rate limit hit",
+    "too many requests",
+    "capacity exhausted",
+    "usage limit reached",
+    "HTTP 429 returned",
+    "weekly quota exceeded",
+    "5-hour limit reached",
+):
+    assert harness_core.is_quota_exhausted_error(pos), f"Expected quota match for: {pos}"
+
+for neg in ("connection refused", "syntax error", "4290 items processed", "rate of change"):
+    assert not harness_core.is_quota_exhausted_error(neg), f"Unexpected quota match for: {neg}"
+PYEOF
+
+  # (n) I1: Conversation ID fallback from HARNESS_CONVERSATION_ID & ANTIGRAVITY_CONVERSATION_ID, and CLI override
+  HARNESS_CONVERSATION_ID="conv-env-h" "$STAMP_GATE" swarm-coordinator on --workspace "$repo" --title "Env H" >/dev/null
+  assert_json_field "$coord_file" '.coordinators["conv-env-h"].active' "true" "HARNESS_CONVERSATION_ID fallback must register coordinator"
+  ANTIGRAVITY_CONVERSATION_ID="conv-env-a" "$STAMP_GATE" swarm-coordinator on --workspace "$repo" --title "Env A" >/dev/null
+  assert_json_field "$coord_file" '.coordinators["conv-env-a"].active' "true" "ANTIGRAVITY_CONVERSATION_ID fallback must register coordinator"
+
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  ANTIGRAVITY_CONVERSATION_ID="conv-env-q" "$STAMP_GATE" swarm-quota pause --workspace "$repo" --wait-seconds 60 --buffer-seconds 0 >/dev/null
+  assert_json_field "$quota_file" ".conversationId" "conv-env-q" "ANTIGRAVITY_CONVERSATION_ID fallback must populate swarm-quota pause"
+
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  ANTIGRAVITY_CONVERSATION_ID="conv-env-q" "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-explicit" --wait-seconds 60 --buffer-seconds 0 >/dev/null
+  assert_json_field "$quota_file" ".conversationId" "conv-explicit" "Explicit --conversation-id must override env fallback"
+
+  # (o) Minor: Non-executable HARNESS_AGY_BIN triggers OSError branch safely
+  local nonexec_bin="$mock_dir/not-exec-agy"
+  printf '#!/usr/bin/env bash\necho nope\n' > "$nonexec_bin"
+  chmod 0644 "$nonexec_bin"
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-os" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  local out_oserr
+  out_oserr=$(HARNESS_AGY_BIN="$nonexec_bin" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_oserr" ".status" "waiting"
+  assert_contains "$(printf '%s' "$out_oserr" | jq -r '.lastAttemptError')" "Failed to execute agy CLI"
+
+  # (p) I8: Barrier-synchronized concurrency tests for attempt_swarm_quota_resume and register_swarm_coordinator
+  local conc_count="$mock_dir/conc.count"
+  local conc_cwd_log="$mock_dir/conc.cwd"
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+echo "\$(pwd -P) | \$*" >> "$conc_cwd_log"
+echo x >> "$conc_count"
+sleep 0.15
+exit 0
+EOF
+  chmod +x "$mock_agy"
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-conc" --model "gemini-4-neon-high" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+
+  HARNESS_AGY_BIN="$mock_agy" CONC_REPO="$repo" CONC_COUNT="$conc_count" CONC_CWD="$conc_cwd_log" PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import os, threading
+from pathlib import Path
+import harness_core
+
+ws = Path(os.environ["CONC_REPO"])
+barrier = threading.Barrier(4)
+results = []
+def worker_resume():
+    barrier.wait()
+    results.append(harness_core.attempt_swarm_quota_resume(ws))
+
+threads = [threading.Thread(target=worker_resume) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+
+final_state = harness_core.get_swarm_quota_state(ws)
+assert final_state.get("status") == "resumed", final_state
+assert final_state.get("resumedAt"), final_state
+lines = Path(os.environ["CONC_COUNT"]).read_text().splitlines()
+assert len(lines) == 1, f"Expected exactly 1 concurrent agy launch, got {len(lines)}: {lines}"
+cwd_line = Path(os.environ["CONC_CWD"]).read_text()
+assert str(ws.resolve()) in cwd_line and "gemini-4-neon-high" in cwd_line, cwd_line
+
+w_barrier = threading.Barrier(6)
+def worker_reg(idx: int):
+    w_barrier.wait()
+    harness_core.register_swarm_coordinator(ws, conversation_id="conv-conc-w", active=True, worker_name=f"w-{idx}")
+
+w_threads = [threading.Thread(target=worker_reg, args=(i,)) for i in range(6)]
+for t in w_threads:
+    t.start()
+for t in w_threads:
+    t.join()
+
+coord_status = harness_core.get_swarm_coordinator_status(ws, conversation_id="conv-conc-w")
+assert sorted(coord_status.get("workers", [])) == [f"w-{i}" for i in range(6)], coord_status
 PYEOF
 }
 

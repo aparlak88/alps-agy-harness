@@ -1062,7 +1062,7 @@ test_swarm_coordinator_only_pre_edit_and_session_start() {
   assert_json_field "$out_slash" ".decision" "deny" "Turn-1 /swarm coordinator must be denied write_file"
   assert_contains "$(printf '%s' "$out_slash" | jq -r '.reason')" "Coordinator-Only"
 
-  # 3. Register coordinator via swarm(action="title") -> denies src, specs, walkthroughs, .superpowers; allows .harness and external plan.json
+  # 3. Register coordinator via swarm(action="title") -> denies src, specs, walkthroughs, .superpowers, and .harness/state/swarm/*; allows external plan.json
   local p_title
   p_title=$(jq -nc --arg ws "$repo" '{
     workspacePaths: [$ws],
