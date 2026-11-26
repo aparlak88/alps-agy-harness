@@ -56,8 +56,16 @@ sequenceDiagram
 ## 3. Dosya Bazlı Değişiklik Analizi
 
 ### `README.md` — [GÜNCELLENDİ] (`Documentation Layer`)
-- **Ne Değişti / Ne Üretildi?:** `§8 Bileşenler Özeti` tablosundaki `stamp-gate.sh` satırı koşullu `tdd-pass.json` damgası ile `claude -p` / `agy -p` (`review`) CLI inceleme yeteneklerini içerecek şekilde genişletildi. Mevcut tüm zorunlu MCP, Swarm ve `## Teknik Terimler Sözlüğü` sözleşmeleri aynen korundu.
-- **Neden Değişti / Neden Üretildi?:** Harness kullanıcılarının yeni CLI inceleme ve TDD kapısı yeteneklerini tek referans dokümandan görebilmesi ve `test-plugin-bundle.sh` doküman bütünlüğü kontrollerinin güncel kalması için değiştirildi.
+- **Ne Değişti / Ne Üretildi?:** Başlık `v1.3.0` olarak güncellendi; `§1 Neden "Engineering Harness"?` altına `Impeccable` koşullu UI anti-slop kapısı (`ui-pass.json`), `Antigravity Swarm` (`/swarm`) çoklu ajan orkestrasyon desteği ve yeni `claude -p` / `agy` 30 sn fallback + `tdd-pass.json` özet maddeleri eklendi; `§8 Bileşenler Özeti` tablosundaki `stamp-gate.sh` satırı genişletildi.
+- **Neden Değişti / Neden Üretildi?:** Eklentinin `v1.3.0` sürümüne kadar kazanılan tüm temel yeteneklerin (`Impeccable`, `Swarm`, `claude -p` review ve `tdd-pass.json`) giriş bölümünde görünür olması ve `test-plugin-bundle.sh` doküman bütünlüğü kontrollerinin güncel kalması için değiştirildi.
+
+### `plugin.json` — [GÜNCELLENDİ] (`Plugin Manifest Layer`)
+- **Ne Değişti / Ne Üretildi?:** Eklenti sürümü `"1.1.0"` değerinden `"1.3.0"` değerine yükseltildi.
+- **Neden Değişti / Neden Üretildi?:** Önceki oturumlardaki `Impeccable` UI kapısı, `Antigravity Swarm` / `Gemini 4 Orchestrator` desteği ve bu PR ile eklenen `claude -p` / `agy` review + `tdd-pass.json` sürüm paketini semantik sürümlemede `1.3.0` olarak yayınlamak için güncellendi.
+
+### `tests/test-manifest.sh` — [GÜNCELLENDİ] (`Test Suite Layer`)
+- **Ne Değişti / Ne Üretildi?:** `test_plugin_json_required_fields` içindeki `.version` doğrulaması `"1.1.0"` değerinden `"1.3.0"` değerine güncellendi.
+- **Neden Değişti / Neden Üretildi?:** Manifesto sürüm kilidi testinin yeni `1.3.0` sürümüyle tutarlı kalması için güncellendi.
 
 ### `docs/superpowers/specs/2026-11-26-claude-cli-review-and-tdd-gate-design.md` — [ÜRETİLDİ] (`Specification Layer`)
 - **Ne Değişti / Ne Üretildi?:** Birincil `claude -p` (`opus/medium` ve `sonnet/high`, `--permission-mode plan --tools Read,Grep,Glob --output-format text`) ile Antigravity fallback (`agy -p`, `claude-opus-5-5-medium`, `gemini-4-carbon-high`, `claude-sonnet-5-5-high`, `gemini-4-neon-medium`) model matrisini, `exit 42` şeffaf hata sözleşmesini, 30 sn `schedule` zaman aşımı akışını ve 3 ADR kararını içeren tam spesifikasyon üretildi. `tdd-pass.json` JSON şeması, doküman muafiyeti ve `## Teknik Terimler Sözlüğü` tablosu da belgelendi.
