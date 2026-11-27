@@ -75,8 +75,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** `always_on` kural dosyasında Antigravity'nin 8 KB sınırını aşmadan koordinatöre mutlak devretme kuralını, `integrator` rolünü ve Saf Bekleme kota kurtarma protokolünü zorunlu kılmak için güncellendi.
 
 ### `scripts/lib/harness_core.py` — [GÜNCELLENDİ] (`Paylaşımlı Çekirdek Kütüphane`)
-- **Ne Değişti / Ne Üretildi?:** Dal-bağımsız `get_swarm_state_dir()`, `register_swarm_coordinator()`, `is_active_swarm_coordinator()`, `_tokenize_raw_segments()` & `_has_unsafe_shell_syntax_for_coordinator()` (`at_token_start` durum takibiyle kaçışlı sınırlayıcı sonrası `#` yorumu, `$'...'` ANSI-C/`$"..."` locale tırnaklama ve `>|/dev/null`), `COORDINATOR_DANGEROUS_ENV_VARS` + `rg --hostname-bin`, `deny > force_ask` tam segment önceliklendirme, `parse_quota_reset_epoch()` ve `resumingToken` korumalı `attempt_swarm_quota_resume()` eklendi.
-- **Neden Değişti / Neden Üretildi?:** Kaçışlı sınırlayıcı (`\;#`) veya kelime içi `a#` yorumu atlatmasını, `$'...'` tırnaklama/süre ayrıştırma hatalarını ve erken `force_ask` öncelik açığını kapatmak için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** Dal-bağımsız `get_swarm_state_dir()`, `register_swarm_coordinator()`, `is_active_swarm_coordinator()`, `_tokenize_raw_segments()` & `_has_unsafe_shell_syntax_for_coordinator()` (`at_token_start` durum takibiyle kaçışlı sınırlayıcı sonrası `#` yorumu, `$'...'` ANSI-C/`$"..."` locale tırnaklama ve `>|/dev/null`), `extract_install_packages()` (önde gelen bayrakları/`--prefix`/`--dir`/`--cwd`/`--directory`/`--manifest-path` seçeneklerini tarayan `_scan_subcmd()` ve `pnpm -w` düzeltmesi), `COORDINATOR_DANGEROUS_ENV_VARS` + `rg --hostname-bin`, `deny > force_ask` tam segment önceliklendirme, `parse_quota_reset_epoch()` ve `resumingToken` korumalı `attempt_swarm_quota_resume()` eklendi.
+- **Neden Değişti / Neden Üretildi?:** Kaçışlı sınırlayıcı (`\;#`) veya kelime içi `a#` yorumu atlatmasını, `$'...'` tırnaklama/süre ayrıştırma hatalarını, paket yöneticisi bayrak atlamalarını ve erken `force_ask` öncelik açığını kapatmak için güncellendi.
 
 ### `scripts/stamp-gate.sh` — [GÜNCELLENDİ] (`Damga ve Durum CLI`)
 - **Ne Değişti / Ne Üretildi?:** `usage()` ve hata mesajlarında `attempt-resume` belgelendi; `cmd_swarm_coordinator()` ve `cmd_swarm_quota()` alt komutları eklendi (`pause`, `resume`, `status`, `clear`, `attempt-resume`), yinelenen/çakışan `--action` bayraklarını (`--action` ve `--action=`) reddetme eklendi ve `pause` sonrası `--workspace` yolu `pwd -P` ile çözümlenerek `/event/swarm-quota-wait` bildirimi gönderildi.
@@ -103,8 +103,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Çok adımlı geliştirme sırasında kapsam disiplinini ve doğrulama kriterlerini sabitlemek için üretildi.
 
 ### `tests/test-command-hooks.sh` — [GÜNCELLENDİ] (`Komut Kancası Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_command_allowlist_and_bypass_guards` testi genişletildi (`bash <trusted>`, `>>/dev/null`, `>|/dev/null`, `&>/dev/null`, `git status ; # comment` izinleri; `\;#`/`\&#`/`\|#`/`a#;` yorum atlatma engelleri, `echo $'a'`/`echo $"a"`/`cat <(ls)` özgül red nedenleri, `git tag -l -d` & `git branch --unset-upstream`, `GIT_CONFIG_GLOBAL`/`GIT_SSH`/`GIT_EDITOR`/`LD_LIBRARY_PATH`, geçersiz/eksik `stamp-gate` eylemleri ve önceki atlatma engelleri).
-- **Neden Değişti / Neden Üretildi?:** `pre-command-guard.sh` üzerinden `at_token_start` yorum sınırını, izole sözdizimi nedenlerini ve git mutasyon bayraklarını mutasyonlara karşı kilitlemek için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_command_allowlist_and_bypass_guards`, `test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists` ve `test_chained_package_install_requires_context7_stamp` (`HARNESS_DISABLE_DAEMON=1`) genişletildi (`bash <trusted>`, `uniq -f 1`, `./bash` & `# comment only`, ANSI-C `$'\''` + `sudo`/`nohup`/`time`/`builtin` ile `git push origin main` / `command npm install`, `yarn`/`uv`/`cargo` + `--prefix`/`--dir`/`--cwd`/`--directory`/`--manifest-path`/`pnpm -w` Context7 doğrulamaları, `\;#`/`\&#`/`\|#`/`a#;` yorum atlatma engelleri ve önceki atlatma engelleri).
+- **Neden Değişti / Neden Üretildi?:** Hem koordinatör dışı ANSI-C/sarmalayıcı/paket bayrağı yollarını hem koordinatör içi `at_token_start` ve güvenilen yol kontrollerini mutasyonlara karşı kilitlemek için güncellendi.
 
 ### `tests/test-edit-and-session-hooks.sh` — [GÜNCELLENDİ] (`Dosya ve Oturum Testleri`)
 - **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_pre_edit_and_session_start` testi genişletildi (`/swarming` alt dizesinde yanlış pozitif olmaması, kardeş worktree ve `.harness/state/swarm/*` hedeflerinin aktif koordinatöre kapatılması, harici UI `plan.json` izni, `__default__` anahtarı ve bozuk JSON dayanıklılığı).
@@ -131,11 +131,11 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Arka plan daemon'unun başlangıç güvenlik retlerini, gerçek yedek devralmayı ve kota/graphify eşzamanlılığını deterministik biçimde kanıtlamak için güncellendi.
 
 ### `tests/test-stamp-and-common.sh` — [GÜNCELLENDİ] (`Damga CLI Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_stamp_gate_swarm_coordinator_and_swarm_quota_cli` (`HARNESS_DISABLE_DAEMON=1`) testi genişletildi (`hours`/`minutes`/`seconds`/`hrs`/`mins`/`secs` + `resets in` cümle tercihi, varsayılan `--buffer-seconds=60`, `--flag=value` CLI biçimleri, kompakt `1h30m`/`3d4h`, `ghp_`/`AIza`/`Bearer` gizleme, `resumed` idempotency ve `threading.Event` kritik kesit kapılı deterministik `flock` dışlama/eşzamanlılık testleri).
+- **Ne Değişti / Ne Üretildi?:** `test_stamp_gate_swarm_coordinator_and_swarm_quota_cli` (`HARNESS_DISABLE_DAEMON=1`) testi genişletildi (`hours`/`minutes`/`seconds`/`hrs`/`mins`/`secs` + `resets in` cümle tercihi, varsayılan `--buffer-seconds=60`, `--flag=value` CLI biçimleri, kompakt `1h30m`/`3d4h`, `ghp_`/`AIza`/`Bearer` gizleme, `resumed` idempotency, `reason` `500` karakter kırpma / `wait_seconds=-1` `ValueError` ve `threading.Event` kritik kesit kapılı deterministik `flock` dışlama/eşzamanlılık testleri).
 - **Neden Değişti / Neden Üretildi?:** Tüm süre birimlerini, CLI bayrak ayrıştırmasını, `resumed` tekrarlanmama kilidini ve `flock` kritik kesit dışlamasını mutasyonlara karşı kilitlemek için güncellendi.
 
 ### `tests/test-subagent-and-stop-hooks.sh` — [GÜNCELLENDİ] (`Alt Ajan ve Stop Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure_wait` ve `test_stop_gate_detects_coordinator_quota_error_without_looping` testleri genişletildi (`swarm(add)` otomatik kayıt, `off` sonrası `swarm(title)`, aktif koordinatörsüz temiz depoda bağlı worktree `swarm(add)` dışlaması, `integrator` türevleri ve boş `conversationId` ile `force_ask`).
+- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure_wait` ve `test_stop_gate_detects_coordinator_quota_error_without_looping` testleri genişletildi (`swarm(add)` otomatik kayıt, `off` sonrası `swarm(title)`, aktif koordinatör varken `/swarm` ile ikinci `conv-coord-2` eşzamanlı koordinatör kaydı, aktif koordinatörsüz temiz depoda bağlı worktree `swarm(add)` dışlaması, `integrator` türevleri ve boş `conversationId` ile `force_ask`).
 - **Neden Değişti / Neden Üretildi?:** Bağlı worktree izolasyonunun başka koordinatör olmadan da bağımsız çalıştığını ve koordinatör yaşam döngüsünü tam doğrulamak için güncellendi.
 
 ---
@@ -158,7 +158,7 @@ sequenceDiagram
 ## 5. Somut Doğrulama Kanıtları
 
 1. **Tam Depo Test Paketi (`./scripts/run-quiet.sh full-tests -- ./tests/run-all.sh`):**
-   `✅ PASS [full-tests] (süre: 395.3s, warnings: 0 — log: .harness/logs/last.log)` — **9/9 paket, 108/108 test, 0 hata:**
+   `✅ PASS [full-tests] (süre: 364.3s, warnings: 0 — log: .harness/logs/last.log)` — **9/9 paket, 108/108 test, 0 hata:**
    - `tests/test-command-hooks.sh`: `14 passed, 0 failed`
    - `tests/test-edit-and-session-hooks.sh`: `14 passed, 0 failed`
    - `tests/test-manifest.sh`: `9 passed, 0 failed`

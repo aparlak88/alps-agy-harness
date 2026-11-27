@@ -718,32 +718,60 @@ def extract_install_packages(tokens: list[str]) -> list[str]:
     exe = os.path.basename(tokens[0])
     pkgs: list[str] = []
 
-    if exe == "npm" and len(tokens) > 1 and tokens[1] in ("install", "i", "add"):
-        i = 2
+    def _scan_subcmd(verbs: tuple[str, ...], val_flags: tuple[str, ...]) -> Optional[int]:
+        i = 1
         while i < len(tokens):
             t = tokens[i]
-            if t in ("--prefix", "-w", "--workspace", "--registry", "--cache", "--tag"):
+            if t in verbs:
+                return i + 1
+            if t in val_flags:
+                i += 2
+            elif t.startswith("-"):
+                i += 1
+            else:
+                return None
+        return None
+
+    def _collect_pkgs(start_idx: Optional[int], val_flags: tuple[str, ...]) -> None:
+        if start_idx is None:
+            return
+        i = start_idx
+        while i < len(tokens):
+            t = tokens[i]
+            if t in val_flags:
                 i += 2
             elif t.startswith("-"):
                 i += 1
             else:
                 pkgs.append(t)
                 i += 1
-    elif exe == "pnpm" and len(tokens) > 1 and tokens[1] in ("add", "install", "i"):
-        i = 2
-        while i < len(tokens):
-            t = tokens[i]
-            if t in ("--dir", "-C", "-w", "--filter"):
-                i += 2
-            elif t.startswith("-"):
-                i += 1
-            else:
-                pkgs.append(t)
-                i += 1
-    elif exe == "yarn" and len(tokens) > 1 and tokens[1] == "add":
-        for t in tokens[2:]:
-            if not t.startswith("-"):
-                pkgs.append(t)
+
+    pkg_specs: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+        "npm": (
+            ("install", "i", "add"),
+            ("--prefix", "-w", "--workspace", "--registry", "--cache", "--tag"),
+        ),
+        "pnpm": (
+            ("add", "install", "i"),
+            ("--dir", "-C", "--filter"),
+        ),
+        "yarn": (
+            ("add",),
+            ("--cwd", "--modules-folder", "--cache-folder", "--registry"),
+        ),
+        "uv": (
+            ("add",),
+            ("--features", "-F", "-p", "--package", "--target", "--optional", "--python", "--directory", "--project", "--manifest-path"),
+        ),
+        "cargo": (
+            ("add",),
+            ("--features", "-F", "-p", "--package", "--target", "--optional", "--python", "--directory", "--project", "--manifest-path"),
+        ),
+    }
+
+    if exe in pkg_specs:
+        verbs, val_flags = pkg_specs[exe]
+        _collect_pkgs(_scan_subcmd(verbs, val_flags), val_flags)
     elif exe == "dotnet":
         start_idx: Optional[int] = None
         if len(tokens) > 2 and tokens[1] == "add" and "package" in tokens[2:]:
@@ -761,17 +789,6 @@ def extract_install_packages(tokens: list[str]) -> list[str]:
                 else:
                     pkgs.append(t)
                     break
-    elif exe in ("uv", "cargo") and len(tokens) > 1 and tokens[1] == "add":
-        i = 2
-        while i < len(tokens):
-            t = tokens[i]
-            if t in ("--features", "-F", "-p", "--package", "--target", "--optional", "--python"):
-                i += 2
-            elif t.startswith("-"):
-                i += 1
-            else:
-                pkgs.append(t)
-                i += 1
 
     cleaned: list[str] = []
     for raw_pkg in pkgs:

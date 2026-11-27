@@ -2012,6 +2012,18 @@ for t in w_threads:
 coord_status = harness_core.get_swarm_coordinator_status(ws, conversation_id="conv-conc-w")
 workers = set(coord_status.get("workers", []))
 assert {"w-gate", "w-peer", *(f"w-{i}" for i in range(6))}.issubset(workers), coord_status
+
+# Reason truncation (<= 500 chars) and negative wait_seconds validation
+import tempfile
+with tempfile.TemporaryDirectory() as tmp_q:
+    tmp_ws = Path(tmp_q)
+    rec = harness_core.record_swarm_quota_pause(tmp_ws, wait_seconds=10, buffer_seconds=0, reason="x" * 600)
+    assert len(rec["reason"]) <= 500, len(rec["reason"])
+    try:
+        harness_core.record_swarm_quota_pause(tmp_ws, wait_seconds=-1)
+        raise AssertionError("Expected ValueError for wait_seconds=-1")
+    except ValueError:
+        pass
 PYEOF
 }
 

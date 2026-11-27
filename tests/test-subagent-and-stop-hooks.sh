@@ -2107,6 +2107,15 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
     assert_contains "$(printf '%s' "$out_ir" | jq -r '.overwrite.brief')" "[SWARM_INTEGRATOR_CONTRACT"
   done
 
+  # I5: Explicit /swarm command allows a second conversationId to register as Coordinator while another exists
+  printf '%s' "$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord-2",
+    lastUserInput: "/swarm launch peer coordinator",
+    toolCall: {name: "swarm", args: {action: "add", name: "peer-worker", workspace: "share", brief: "Work."}}
+  }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  assert_json_field "$repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-coord-2"].active' "true" "/swarm swarm(add) by conv-coord-2 must register active coordinator"
+
   # Empty conversationId still triggers force_ask when active quota wait matches workspace or has empty stored conversationId
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 300 --buffer-seconds 0 >/dev/null
   local out_empty_ask out_empty_stored_ask

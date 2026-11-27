@@ -111,6 +111,7 @@ test_quoted_commit_message_does_not_trigger_gates() {
 
 test_chained_package_install_requires_context7_stamp() {
   [ -x "$PRE_COMMAND_GUARD" ] || { echo "pre-command-guard.sh missing or not executable: $PRE_COMMAND_GUARD" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
 
   local repo
   repo=$(make_temp_repo)
@@ -214,10 +215,52 @@ EOF
   out_dotnet_deny=$(printf '%s' "$p_dotnet_deny" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_dotnet_deny" ".decision" "deny" "Unverified dotnet package must be denied"
   assert_contains "$(printf '%s' "$out_dotnet_deny" | jq -r '.reason')" "Serilog.AspNetCore"
+
+  # 8. I1 & I2: Wrapper commands + yarn/uv/cargo + leading/directory package-manager flags must require Context7
+  local pkg_case pkg_cmd pkg_expected out_pkg_cmd
+  for pkg_case in \
+    "command npm install dayjs|dayjs" \
+    "yarn add lodash|lodash" \
+    "uv add requests|requests" \
+    "cargo add serde|serde" \
+    "npm --prefix app install axios|axios" \
+    "pnpm add -w dayjs|dayjs" \
+    "pnpm --dir app add dayjs|dayjs" \
+    "yarn --cwd app add lodash|lodash" \
+    "uv add --directory app requests|requests" \
+    "uv --directory app add requests|requests" \
+    "cargo add --manifest-path app/Cargo.toml serde|serde"
+  do
+    pkg_cmd="${pkg_case%%|*}"
+    pkg_expected="${pkg_case#*|}"
+    out_pkg_cmd=$(jq -nc --arg ws "$repo" --arg cmd "$pkg_cmd" \
+      '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_pkg_cmd" ".decision" "deny" "Unverified package install must be denied: $pkg_cmd"
+    assert_contains "$(printf '%s' "$out_pkg_cmd" | jq -r '.reason')" "$pkg_expected"
+  done
+
+  PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import harness_core
+
+cases = [
+    (["npm", "--prefix", "app", "install", "axios"], ["axios"]),
+    (["pnpm", "add", "-w", "zod"], ["zod"]),
+    (["pnpm", "--dir", "app", "add", "zod"], ["zod"]),
+    (["yarn", "--cwd", "app", "add", "lodash"], ["lodash"]),
+    (["uv", "add", "--directory", "app", "requests"], ["requests"]),
+    (["uv", "--directory", "app", "add", "requests"], ["requests"]),
+    (["cargo", "add", "--manifest-path", "app/Cargo.toml", "serde"], ["serde"]),
+]
+for tokens, expected in cases:
+    got = harness_core.extract_install_packages(tokens)
+    assert got == expected, (tokens, got, expected)
+PYEOF
 }
 
 test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
   [ -x "$PRE_COMMAND_GUARD" ] || { echo "pre-command-guard.sh missing or not executable: $PRE_COMMAND_GUARD" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
 
   local repo
   repo=$(make_temp_repo)
@@ -267,6 +310,21 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
   local out_merge_ff
   out_merge_ff=$(printf '%s' "$p_merge_ff" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_merge_ff" ".decision" "allow" "git merge --ff-only must be allowed"
+
+  # 5b. C1 & C2: Non-coordinator ANSI-C quote + command wrapper bypasses before git push origin main -> deny
+  local bypass_push_cmd out_bypass_push
+  for bypass_push_cmd in \
+    "echo \$'\\''; git push origin main" \
+    "sudo git push origin main" \
+    "nohup git push origin main" \
+    "time git push origin main" \
+    "builtin git push origin main"
+  do
+    out_bypass_push=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_push_cmd" \
+      '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_bypass_push" ".decision" "deny" "Wrapper/ANSI-C push to main must be denied: $bypass_push_cmd"
+  done
 
   # 6. On feature branch, git push origin feature-x -> allow
   git -C "$repo" checkout -b "feature-x" --quiet
@@ -1531,6 +1589,8 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "/usr/bin/cat README.md" \
     "./scripts/stamp-gate.sh swarm-coordinator on --workspace \"$repo\" --conversation-id \"conv-coord\"" \
     "bash ./scripts/stamp-gate.sh tree-sha --workspace \"$repo\"" \
+    "bash \"$REPO_ROOT/scripts/stamp-gate.sh\" tree-sha --workspace \"$repo\"" \
+    "uniq -f 1 README.md" \
     "git status >>/dev/null" \
     "git status >|/dev/null" \
     "git status &>/dev/null" \
@@ -1689,6 +1749,8 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "./scripts/stamp-gate.sh swarm-quota status --action=clear --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-quota status --action resume --workspace \"$repo\"" \
     "./scripts/stamp-gate.sh swarm-quota status --action=resume --workspace \"$repo\"" \
+    "./bash scripts/stamp-gate.sh tree-sha" \
+    "# comment only" \
     "python3 -c 'print(1)'"
   do
     local out_bad
