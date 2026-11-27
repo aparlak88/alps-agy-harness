@@ -603,6 +603,22 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
     if not tokens:
         return []
 
+    def _short_flag_needs_next_arg(flag: str, val_chars: str) -> bool:
+        if not flag.startswith("-") or flag.startswith("--") or len(flag) < 2:
+            return False
+        for pos, ch in enumerate(flag[1:], start=1):
+            if ch in val_chars:
+                return pos == len(flag) - 1
+        return False
+
+    SUDO_SHORT_VAL = "ughpD"
+    SUDO_LONG_VAL = ("--user", "--group", "--host", "--prompt", "--chdir")
+    ENV_SHORT_VAL = "uCP"
+    ENV_LONG_VAL = ("--unset", "--chdir")
+    TIME_SHORT_VAL = "of"
+    TIME_LONG_VAL = ("--output", "--format")
+
+    splices = 0
     idx = 0
     while idx < len(tokens):
         tok = tokens[idx]
@@ -616,11 +632,7 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
                 if tokens[idx] == "--":
                     idx += 1
                     break
-                if tokens[idx] in (
-                    "-u", "-g", "-h", "-p", "-U", "-C", "-T", "-r", "-t", "-D",
-                    "--user", "--group", "--host", "--prompt", "--other-user",
-                    "--close-from", "--command-timeout", "--role", "--type", "--chdir",
-                ):
+                if tokens[idx] in SUDO_LONG_VAL or _short_flag_needs_next_arg(tokens[idx], SUDO_SHORT_VAL):
                     idx += 2
                 else:
                     idx += 1
@@ -628,23 +640,68 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
         if base == "env":
             idx += 1
             while idx < len(tokens):
-                if tokens[idx] == "--":
+                etok = tokens[idx]
+                if etok == "--":
                     idx += 1
                     break
-                if tokens[idx] in (
-                    "-u", "-C", "-S", "-P",
-                    "--unset", "--chdir", "--split-string",
-                    "--block-signal", "--default-signal", "--ignore-signal",
-                ):
+                if etok == "--split-string" and idx + 1 < len(tokens) and splices < 4:
+                    try:
+                        expanded = shlex.split(tokens[idx + 1])
+                    except Exception:
+                        expanded = tokens[idx + 1].split()
+                    tokens[idx : idx + 2] = expanded
+                    splices += 1
+                    continue
+                if etok.startswith("--split-string=") and splices < 4:
+                    raw_val = etok[len("--split-string=") :]
+                    try:
+                        expanded = shlex.split(raw_val)
+                    except Exception:
+                        expanded = raw_val.split()
+                    tokens[idx : idx + 1] = expanded
+                    splices += 1
+                    continue
+                if etok.startswith("-") and not etok.startswith("--") and "S" in etok[1:] and splices < 4:
+                    s_pos = etok.index("S", 1)
+                    if s_pos == len(etok) - 1 and idx + 1 < len(tokens):
+                        raw_val = tokens[idx + 1]
+                        try:
+                            expanded = shlex.split(raw_val)
+                        except Exception:
+                            expanded = raw_val.split()
+                        tokens[idx : idx + 2] = expanded
+                        splices += 1
+                        continue
+                    if s_pos < len(etok) - 1:
+                        raw_val = etok[s_pos + 1 :]
+                        try:
+                            expanded = shlex.split(raw_val)
+                        except Exception:
+                            expanded = raw_val.split()
+                        tokens[idx : idx + 1] = expanded
+                        splices += 1
+                        continue
+                if etok in ENV_LONG_VAL or _short_flag_needs_next_arg(etok, ENV_SHORT_VAL):
                     idx += 2
-                elif tokens[idx].startswith("-"):
+                elif etok.startswith("-"):
                     idx += 1
-                elif "=" in tokens[idx] and tokens[idx].split("=", 1)[0].isidentifier():
+                elif "=" in etok and etok.split("=", 1)[0].isidentifier():
                     idx += 1
                 else:
                     break
             continue
-        if base in ("time", "command"):
+        if base == "time":
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                if tokens[idx] in TIME_LONG_VAL or _short_flag_needs_next_arg(tokens[idx], TIME_SHORT_VAL):
+                    idx += 2
+                else:
+                    idx += 1
+            continue
+        if base == "command":
             idx += 1
             while idx < len(tokens) and tokens[idx].startswith("-"):
                 if tokens[idx] == "--":
@@ -3322,12 +3379,21 @@ def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
                 return "backtick command substitution"
             if c == "$" and i + 1 < n and cmd_line[i + 1] == "(":
                 return "$(...) command substitution"
+            if c == "$" and i + 1 < n and (
+                cmd_line[i + 1] == "{"
+                or cmd_line[i + 1].isalpha()
+                or cmd_line[i + 1] in ("_", "*", "@", "#", "?", "-", "$", "!")
+                or cmd_line[i + 1].isdigit()
+            ):
+                return "shell parameter expansion"
 
         if not in_single and not in_double:
             if c == "#" and at_token_start:
                 while i < n and cmd_line[i] != "\n":
                     i += 1
                 continue
+            if c == "{":
+                return "brace expansion or command group"
             if c == "$" and i + 1 < n and cmd_line[i + 1] == "'":
                 return "ANSI-C $'...' quoting"
             if c == "$" and i + 1 < n and cmd_line[i + 1] == '"':
@@ -3407,7 +3473,14 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
             base_tok = os.path.basename(tok)
             if base_tok == "sudo":
                 return "Swarm Coordinator-Only guard: 'sudo' is blocked for the active Swarm Coordinator."
-            if base_tok in ("nohup", "time", "builtin", "command"):
+            if base_tok in ("nohup", "time", "builtin", "command", "env") and not _is_trusted_coordinator_exe(tok):
+                return f"Swarm Coordinator-Only guard: untrusted wrapper path '{tok}' is blocked for the active Swarm Coordinator."
+            if base_tok in ("time", "nohup"):
+                idx += 1
+                if idx < len(tokens) and tokens[idx].startswith("-"):
+                    return f"Swarm Coordinator-Only guard: options on '{base_tok}' are blocked for the active Swarm Coordinator."
+                continue
+            if base_tok in ("builtin", "command"):
                 idx += 1
                 while idx < len(tokens) and tokens[idx].startswith("-"):
                     if tokens[idx] == "--":
@@ -3424,7 +3497,7 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
                     ):
                         return "Swarm Coordinator-Only guard: 'env -S/--split-string' is blocked for the active Swarm Coordinator."
                     if etok.startswith("-"):
-                        idx += 2 if etok in ("-u", "-C") else 1
+                        return "Swarm Coordinator-Only guard: options on 'env' are blocked for the active Swarm Coordinator."
                     elif "=" in etok and etok.split("=", 1)[0].isidentifier():
                         key = etok.split("=", 1)[0]
                         if key in COORDINATOR_DANGEROUS_ENV_VARS:

@@ -266,6 +266,104 @@ try:
 finally:
     pathlib.Path.lstat = orig_lstat
 PYEOF
+
+  # I2: Stale-socket recovery on startup + foreign-UID socket file, lstat OSError, and unlink OSError
+  local stale_sdir stale_ddir stale_sock spid
+  stale_sdir=$(mktemp -d "/tmp/hd-stale.XXXXXX")
+  stale_ddir=$(mktemp -d "${TMPDIR:-/tmp}/hd-stale-d.XXXXXX")
+  _TD_DIRS+=("$stale_sdir" "$stale_ddir")
+  stale_sock="$stale_sdir/d.sock"
+  chmod 0700 "$stale_sdir"
+  STALE_SOCK="$stale_sock" python3 - << 'PYEOF'
+import os, socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(os.environ["STALE_SOCK"])
+s.close()
+PYEOF
+  [ -S "$stale_sock" ] || { echo "Expected leftover stale socket before daemon start" >&2; return 1; }
+
+  HARNESS_DAEMON_SOCK="$stale_sock" \
+  HARNESS_DAEMON_DATA_DIR="$stale_ddir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.2" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  spid=$!
+  _TD_PIDS+=("$spid")
+  _wait_for_socket_health "$stale_sock" 50 || { echo "Daemon did not recover from stale socket" >&2; return 1; }
+  grep -q "Removed stale Unix socket" "$stale_ddir/daemon.log" || {
+    echo "Expected 'Removed stale Unix socket' log entry" >&2
+    return 1
+  }
+  kill -TERM "$spid" 2>/dev/null || true
+  wait "$spid" 2>/dev/null || true
+
+  STALE_BASE="$stale_sdir" STALE_DD="$stale_ddir" PYTHONPATH="$REPO_ROOT/sidecars/harness-daemon" python3 - << 'PYEOF'
+import os, pathlib, socket, types
+import daemon
+
+sdir = pathlib.Path(os.environ["STALE_BASE"])
+ddir = pathlib.Path(os.environ["STALE_DD"])
+
+def make_dead_sock(name: str) -> pathlib.Path:
+    sp = sdir / name
+    if sp.exists() or sp.is_symlink():
+        sp.unlink()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(sp))
+    s.close()
+    return sp
+
+sp1 = make_dead_sock("foreign.sock")
+sp2 = make_dead_sock("stat-err.sock")
+sp3 = make_dead_sock("unlink-err.sock")
+
+orig_env = {k: os.environ.get(k) for k in ("HARNESS_DAEMON_SOCK", "HARNESS_DAEMON_DATA_DIR", "HARNESS_SKIP_SHELL_PATH_SYNC")}
+orig_lstat = pathlib.Path.lstat
+orig_unlink = pathlib.Path.unlink
+try:
+    os.environ["HARNESS_DAEMON_DATA_DIR"] = str(ddir)
+    os.environ["HARNESS_SKIP_SHELL_PATH_SYNC"] = "1"
+
+    # 1. Foreign-UID socket file -> exit 1 + log
+    os.environ["HARNESS_DAEMON_SOCK"] = str(sp1)
+    def fake_lstat_uid(self):
+        res = orig_lstat(self)
+        if self == sp1:
+            return types.SimpleNamespace(st_mode=res.st_mode, st_uid=os.getuid() + 1)
+        return res
+    pathlib.Path.lstat = fake_lstat_uid
+    assert daemon.run_daemon() == 1
+    assert "Refusing socket not owned by UID" in (ddir / "daemon.log").read_text(encoding="utf-8")
+
+    # 2. Socket lstat OSError -> exit 1 + log
+    os.environ["HARNESS_DAEMON_SOCK"] = str(sp2)
+    def fake_lstat_err(self):
+        if self == sp2:
+            raise OSError("mock socket stat failure")
+        return orig_lstat(self)
+    pathlib.Path.lstat = fake_lstat_err
+    assert daemon.run_daemon() == 1
+    assert "Cannot stat socket" in (ddir / "daemon.log").read_text(encoding="utf-8")
+    pathlib.Path.lstat = orig_lstat
+
+    # 3. Socket unlink OSError -> exit 1 + log
+    os.environ["HARNESS_DAEMON_SOCK"] = str(sp3)
+    def fake_unlink_err(self, missing_ok=False):
+        if self == sp3:
+            raise PermissionError("mock socket unlink failure")
+        return orig_unlink(self, missing_ok=missing_ok)
+    pathlib.Path.unlink = fake_unlink_err
+    assert daemon.run_daemon() == 1
+    assert "Cannot unlink stale socket" in (ddir / "daemon.log").read_text(encoding="utf-8")
+finally:
+    pathlib.Path.lstat = orig_lstat
+    pathlib.Path.unlink = orig_unlink
+    for k, v in orig_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+PYEOF
 }
 
 test_daemon_on_vs_off_hook_parity() {

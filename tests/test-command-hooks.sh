@@ -375,7 +375,26 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "time -- git push origin main" \
     "command -- git push origin main" \
     "nohup -- git push origin main" \
-    "builtin -- git push origin main"
+    "builtin -- git push origin main" \
+    "sudo -nu root git push origin main" \
+    "sudo -p 'pw:' git push origin main" \
+    "sudo --prompt 'pw:' git push origin main" \
+    "sudo --host host1 git push origin main" \
+    "sudo -D /tmp git push origin main" \
+    "sudo --chdir /tmp git push origin main" \
+    'env -S "git push origin main"' \
+    'env --split-string "git push origin main"' \
+    'env --split-string="FOO=1 git push origin main"' \
+    'env -iS "git push origin main"' \
+    "env --ignore-signal git push origin main" \
+    "env --block-signal git push origin main" \
+    "env --default-signal git push origin main" \
+    "env -vu HOME git push origin main" \
+    "/usr/bin/time -o log git push origin main" \
+    "/usr/bin/time -ao log git push origin main" \
+    "/usr/bin/time --output log git push origin main" \
+    "/usr/bin/time -f fmt git push origin main" \
+    "/usr/bin/time --format fmt git push origin main"
   do
     out_bypass_push=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_push_cmd" \
       '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
@@ -1692,6 +1711,8 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "ls # a > b" \
     "gh pr view 1" \
     "gh issue list" \
+    'echo '\''${Z:--delete}'\''' \
+    'echo '\''{-delete,}'\''' \
     "./scripts/stamp-gate.sh swarm-quota pause --workspace \"$repo\" --conversation-id \"conv-coord\" --wait-seconds 60" \
     "./scripts/stamp-gate.sh dispatch --workspace \"$repo\" --role explorer" \
     "./scripts/stamp-gate.sh select-model --workspace \"$repo\" --tier pro" \
@@ -1778,6 +1799,16 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "env --split-string 'rm -rf src' git status" \
     "env -iS 'rm -rf src' git status" \
     "env -vS 'rm -rf src' git status" \
+    "/usr/bin/time -o cat rm -rf src" \
+    "./time git status" \
+    "/tmp/x/nohup ls" \
+    "/tmp/x/env git status" \
+    "env -vu cat rm -rf src" \
+    'find . ${Z:--delete}' \
+    'find . $FLAG' \
+    'echo "$HOME"' \
+    'find . {-delete,}' \
+    '{ rm -rf src; }' \
     "sudo git status" \
     "/usr/bin/sudo git status" \
     "time sudo git status" \
