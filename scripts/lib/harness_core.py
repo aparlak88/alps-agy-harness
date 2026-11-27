@@ -538,9 +538,6 @@ def _strip_shell_line_continuations(cmd_line: str) -> str:
             if i + 1 < n and cmd_line[i + 1] == "\n":
                 i += 2
                 continue
-            if i + 2 < n and cmd_line[i + 1] == "\r" and cmd_line[i + 2] == "\n":
-                i += 3
-                continue
             escape = True
             at_token_start = False
             out.append(c)
@@ -640,9 +637,16 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
                 current.append(c)
                 i += 1
                 continue
+            if c == ";" and i + 2 < n and cmd_line[i + 1] == ";" and cmd_line[i + 2] == "&":
+                seg = "".join(current).strip()
+                segments.append((seg, ";;&"))
+                current = []
+                at_token_start = True
+                i += 3
+                continue
             if (
                 (c in ("&", "|", ";") and i + 1 < n and cmd_line[i + 1] == c)
-                or (c == "|" and i + 1 < n and cmd_line[i + 1] == "&")
+                or (c in ("|", ";") and i + 1 < n and cmd_line[i + 1] == "&")
             ):
                 delim = cmd_line[i : i + 2]
                 seg = "".join(current).strip()
@@ -904,12 +908,14 @@ def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> t
 _CONTROL_KEYWORD_RE = re.compile(r"^\s*(?:(?:if|then|else|elif|while|until|do)\b|[!{](?:\s|$))")
 
 
-def _scan_leading_unquoted_words(raw_seg: str) -> list[tuple[str, bool]]:
-    """Return whitespace-separated ``(word, was_quoted)`` pairs from ``raw_seg``."""
-    words: list[tuple[str, bool]] = []
+def _scan_leading_unquoted_words(raw_seg: str) -> list[tuple[str, bool, bool]]:
+    """Return whitespace-separated ``(word, was_quoted, lhs_quoted)`` tuples from ``raw_seg``."""
+    words: list[tuple[str, bool, bool]] = []
     buf: list[str] = []
     has_token = False
     was_quoted = False
+    lhs_quoted = False
+    saw_eq = False
     in_single = False
     in_double = False
     in_ansi_c = False
@@ -923,11 +929,15 @@ def _scan_leading_unquoted_words(raw_seg: str) -> list[tuple[str, bool]]:
             escape = False
             has_token = True
             was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
             i += 1
             continue
         if in_ansi_c:
             has_token = True
             was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
             if c == "\\":
                 buf.append(c)
                 if i + 1 < n:
@@ -943,12 +953,16 @@ def _scan_leading_unquoted_words(raw_seg: str) -> list[tuple[str, bool]]:
             escape = True
             has_token = True
             was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
             i += 1
             continue
         if not in_single and not in_double and c == "$" and i + 1 < n and raw_seg[i + 1] == "'":
             in_ansi_c = True
             has_token = True
             was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
             buf.append("$'")
             i += 2
             continue
@@ -956,27 +970,35 @@ def _scan_leading_unquoted_words(raw_seg: str) -> list[tuple[str, bool]]:
             in_single = not in_single
             has_token = True
             was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
             i += 1
             continue
         if c == '"' and not in_single:
             in_double = not in_double
             has_token = True
             was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
             i += 1
             continue
         if not in_single and not in_double and c in (" ", "\t", "\r", "\n"):
             if has_token:
-                words.append(("".join(buf), was_quoted))
+                words.append(("".join(buf), was_quoted, lhs_quoted))
                 buf = []
                 has_token = False
                 was_quoted = False
+                lhs_quoted = False
+                saw_eq = False
             i += 1
             continue
+        if not in_single and not in_double and c == "=":
+            saw_eq = True
         buf.append(c)
         has_token = True
         i += 1
     if has_token:
-        words.append(("".join(buf), was_quoted))
+        words.append(("".join(buf), was_quoted, lhs_quoted))
     return words
 
 
@@ -1016,22 +1038,24 @@ def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tup
     return out
 
 
-def _is_shell_builtin_cd(raw_tokens: list[str]) -> tuple[bool, bool]:
-    """Return ``(is_builtin_cd, portable_wrapper)`` for ``raw_tokens`` across bash/zsh."""
+def _is_shell_builtin_cd(raw_words: list[tuple[str, bool, bool]]) -> tuple[bool, bool]:
+    """Return ``(is_builtin_cd, portable_wrapper)`` for ``raw_words`` across bash/zsh."""
     idx = 0
+    saw_assignment = False
     portable_wrapper = True
-    while idx < len(raw_tokens):
-        tok = raw_tokens[idx]
-        if "=" in tok and tok.split("=", 1)[0].isidentifier():
+    while idx < len(raw_words):
+        tok, was_quoted, lhs_quoted = raw_words[idx]
+        if not lhs_quoted and "=" in tok and tok.split("=", 1)[0].isidentifier():
+            saw_assignment = True
             idx += 1
             continue
-        if tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
+        if not was_quoted and not saw_assignment and tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
             idx += 1
             continue
-        if tok == "time":
+        if not was_quoted and not saw_assignment and tok == "time":
             idx += 1
-            while idx < len(raw_tokens) and raw_tokens[idx].startswith("-"):
-                ttok = raw_tokens[idx]
+            while idx < len(raw_words) and raw_words[idx][0].startswith("-"):
+                ttok = raw_words[idx][0]
                 if ttok == "--":
                     idx += 1
                     break
@@ -1044,19 +1068,19 @@ def _is_shell_builtin_cd(raw_tokens: list[str]) -> tuple[bool, bool]:
             continue
         if tok == "builtin":
             idx += 1
-            if idx < len(raw_tokens) and raw_tokens[idx] == "--":
+            if idx < len(raw_words) and raw_words[idx][0] == "--":
                 idx += 1
             continue
         if tok == "command":
             idx += 1
-            while idx < len(raw_tokens) and raw_tokens[idx].startswith("-"):
-                ctok = raw_tokens[idx]
+            portable_wrapper = False
+            while idx < len(raw_words) and raw_words[idx][0].startswith("-"):
+                ctok = raw_words[idx][0]
                 if ctok == "--":
                     idx += 1
                     break
                 if not ctok.startswith("--") and ("v" in ctok[1:] or "V" in ctok[1:]):
                     return False, True
-                portable_wrapper = False
                 idx += 1
             continue
         return tok == "cd", portable_wrapper
@@ -1090,29 +1114,44 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
 
     for raw_seg, delim in _tokenize_raw_segments(cmd_line):
         is_cond = bool(_CONTROL_KEYWORD_RE.match(raw_seg))
-        try:
-            raw_tokens = shlex.split(raw_seg)
-        except Exception:
-            raw_tokens = raw_seg.split()
-        for w, was_quoted in _scan_leading_unquoted_words(raw_seg):
+        raw_words = _scan_leading_unquoted_words(raw_seg)
+        wi = 0
+        while wi < len(raw_words):
+            w, was_quoted, _ = raw_words[wi]
             if was_quoted:
                 break
+            if w == "time":
+                wi += 1
+                while wi < len(raw_words) and raw_words[wi][0].startswith("-"):
+                    ttok = raw_words[wi][0]
+                    if ttok == "--":
+                        wi += 1
+                        break
+                    if ttok in _TIME_LONG_VAL or _short_flag_needs_next_arg(ttok, _TIME_SHORT_VAL):
+                        wi += 2
+                    else:
+                        wi += 1
+                continue
             if w in ("if", "while", "until", "for", "select", "{"):
                 control_depth += 1
+                wi += 1
             elif w == "case":
                 control_depth += 1
                 case_stack.append(True)
+                wi += 1
             elif w in ("fi", "done", "}"):
                 control_depth = max(0, control_depth - 1)
+                wi += 1
             elif w == "esac":
                 control_depth = max(0, control_depth - 1)
                 if case_stack:
                     case_stack.pop()
+                wi += 1
             elif w in ("then", "do", "else", "elif", "!"):
-                continue
+                wi += 1
             else:
                 break
-        is_shell_cd, cd_wrapper_portable = _is_shell_builtin_cd(raw_tokens)
+        is_shell_cd, cd_wrapper_portable = _is_shell_builtin_cd(raw_words)
         cleaned = _strip_segment_wrappers(raw_seg)
         if prev_delim not in ("&&", "||"):
             pipeline_entry = list(possible_states)
@@ -1142,7 +1181,7 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
         if delim not in ("&&", "||") and pipeline_uncertain:
             possible_states = _dedup_states(possible_states + pipeline_entry)
 
-        if delim == ";;" and case_stack:
+        if delim in (";;", ";&", ";;&") and case_stack:
             case_stack[-1] = True
         elif delim == "(":
             if not (case_stack and case_stack[-1]):
@@ -4080,14 +4119,14 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
             after_dd = False
             while idx < len(seg):
                 tok = seg[idx]
-                if not after_dd and tok == "--":
+                if not after_dd and not pos_args and tok == "--":
                     after_dd = True
                     idx += 1
                     continue
-                if not after_dd and tok in ("-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"):
+                if not after_dd and not pos_args and tok in ("-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"):
                     idx += 2
                     continue
-                if not after_dd and tok.startswith("-") and tok != "-":
+                if not after_dd and not pos_args and tok.startswith("-") and tok != "-":
                     idx += 1
                     continue
                 pos_args.append(tok)

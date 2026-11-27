@@ -454,9 +454,18 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "cd \"$repo\"; echo x | cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; true |& cd \"$wt_cd\" && git push" \
     "cd \"$wt_cd\"; time cd \"$repo\"; git push" \
+    "cd \"$repo\"; FOO=bar time cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; \"time\" cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; \\time cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; command -v cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; command -V cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; command -p cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; command cd \"$wt_cd\"; git push" \
+    "cd \"$wt_cd\"; command cd \"$repo\"; git push" \
+    "cd \"$repo\"; time if false; then echo ok; cd \"$wt_cd\"; fi; git push" \
+    "cd \"$wt_cd\"; ( cd \"$repo\"; case x in x) true ;& true) git push ;; esac )" \
+    "cd \"$wt_cd\"; ( cd \"$repo\"; case x in x) true ;;& true) git push ;; esac )" \
+    "$(printf 'echo ok\\\r\ngit push')" \
     "cd \"$repo/link_to_wt\" && cd .. && git push" \
     "cd \"$repo\" && cd -PL \"$repo/link_to_wt/..\" && git push" \
     "cd \"$repo\"; cd -e \"$wt_cd\"; git push" \
@@ -477,11 +486,11 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_valid_cd_push" ".decision" "allow" "Valid unconditional cd <wt> && git push feature-branch must stay allowed"
-  out_phys_lp_push=$(jq -nc --arg ws "$repo" --arg cmd "cd -LP \"$repo/link_to_wt/..\" && git push origin feat/cd-bg" \
+  out_phys_lp_push=$(jq -nc --arg ws "$repo" --arg cmd "cd -LP \"$repo/link_to_wt/..\" && git push" \
     '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_phys_lp_push" ".decision" "allow" "cd -LP through symlink/.. resolves physically to feature worktree"
-  out_phys_p_push=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$repo/link_to_wt\" && cd -P .. && git push origin feat/cd-bg" \
+  out_phys_p_push=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$repo/link_to_wt\" && cd -P .. && git push" \
     '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_phys_p_push" ".decision" "allow" "cd -P .. inside symlinked dir resolves physically to symlink target parent"
@@ -1956,6 +1965,10 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "uniq README.md out.txt" \
     "uniq - .harness/state/swarm/swarm-coordinator.json" \
     "uniq -- README.md out.txt" \
+    "uniq -- -c out.txt" \
+    "uniq -- -f out.txt" \
+    "uniq README.md --" \
+    "uniq README.md -out.txt" \
     "rg --pre evil pat" \
     "rg --pre=evil pat" \
     "rg --pre-glob='*.md' pat" \
@@ -2060,7 +2073,7 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
   assert_json_field "$out_procsub_only" ".decision" "deny"
   assert_contains "$(printf '%s' "$out_procsub_only" | jq -r '.reason')" "process substitution"
 
-  local heredoc_cmd out_heredoc lc1_cmd out_lc1 lc2_cmd out_lc2 lc3_cmd out_lc3
+  local heredoc_cmd out_heredoc lc1_cmd out_lc1 lc2_cmd out_lc2 lc3_cmd out_lc3 lc_crlf_cmd
   heredoc_cmd=$(printf "cat << true\necho '\$(rm -rf src)'\ntrue")
   out_heredoc=$(jq -nc --arg ws "$repo" --arg cmd "$heredoc_cmd" \
     '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
@@ -2071,7 +2084,8 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
   lc1_cmd=$(printf 'echo "$\\\n(rm -rf src)"')
   lc2_cmd=$(printf 'cat <\\\n<EOF\nhi\nEOF')
   lc3_cmd=$(printf 'cat <\\\n(ls)')
-  for out_lc1 in "$lc1_cmd" "$lc2_cmd" "$lc3_cmd"; do
+  lc_crlf_cmd=$(printf 'echo ok\\\r\nrm -rf src')
+  for out_lc1 in "$lc1_cmd" "$lc2_cmd" "$lc3_cmd" "$lc_crlf_cmd"; do
     out_lc2=$(jq -nc --arg ws "$repo" --arg cmd "$out_lc1" \
       '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
       | "$PRE_COMMAND_GUARD")
@@ -2104,7 +2118,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "cd \"$spoof_dir\" && ./harness-doctor.sh --json" \
     "cd \"$spoof_dir\" && ./scripts/stamp-gate.sh dispatch" \
     "time cd \"$spoof_dir\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; FOO=bar time cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; \"time\" cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; \\time cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; command -v cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; command cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; echo x | cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir/sym_to_repo\"; cd ..; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch" \
