@@ -1,4 +1,4 @@
-# Tasarım Spesifikasyonu: Swarm Coordinator-Only Koruması ve Çift Katmanlı Kota Bekleme / Otomatik Devam (`v1.4.0`)
+# Tasarım Spesifikasyonu: Swarm Coordinator-Only Koruması ve Çift Katmanlı Kota Bekleme / Otomatik Devam (`v1.3.2`)
 
 **Tarih:** 2026-11-26  
 **Durum:** Onaylandı  

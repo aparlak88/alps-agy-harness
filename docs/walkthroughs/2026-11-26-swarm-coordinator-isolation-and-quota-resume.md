@@ -1,4 +1,4 @@
-# Pull Request Mühendislik Rehberi: Swarm Coordinator-Only Koruması ve Çift Katmanlı Kota Bekleme / Otomatik Devam (`v1.4.0`)
+# Pull Request Mühendislik Rehberi: Swarm Coordinator-Only Koruması ve Çift Katmanlı Kota Bekleme / Otomatik Devam (`v1.3.2`)
 
 ---
 
@@ -63,11 +63,11 @@ sequenceDiagram
 ## 3. Dosya Bazlı Değişiklik Analizi
 
 ### `README.md` — [GÜNCELLENDİ] (`Dokümantasyon`)
-- **Ne Değişti / Ne Üretildi?:** Başlık sürümü `v1.4.0` olarak güncellendi; `### Antigravity Swarm ile Kullanım` altına Sıkı Coordinator-Only (`swarm-coordinator.json`), `integrator` Swarm işçisi ve 5 Saatlik/Haftalık Saf Bekleme Kota Kurtarma (`swarm-quota-wait.json`, `harness-daemon` `agy --conversation` watchdog) maddeleri eklendi; Bölüm 8 bileşen tablosu ve `## Teknik Terimler Sözlüğü` güncellendi.
+- **Ne Değişti / Ne Üretildi?:** Başlık sürümü `v1.3.2` olarak güncellendi; `### Antigravity Swarm ile Kullanım` altına Sıkı Coordinator-Only (`swarm-coordinator.json`), `integrator` Swarm işçisi ve 5 Saatlik/Haftalık Saf Bekleme Kota Kurtarma (`swarm-quota-wait.json`, `harness-daemon` `agy --conversation` watchdog) maddeleri eklendi; Bölüm 8 bileşen tablosu ve `## Teknik Terimler Sözlüğü` güncellendi.
 - **Neden Değişti / Neden Üretildi?:** Kullanıcıların ve geliştiricilerin Coordinator-Only kurallarını ve uzun soluklu oturumlardaki otomatik kota bekleme/devam akışını doğrudan dokümantasyondan öğrenebilmesi için güncellendi.
 
 ### `plugin.json` — [GÜNCELLENDİ] (`Eklenti Manifestosu`)
-- **Ne Değişti / Ne Üretildi?:** `version` alanı `"1.3.1"` değerinden `"1.4.0"` değerine yükseltildi.
+- **Ne Değişti / Ne Üretildi?:** `version` alanı `"1.3.1"` değerinden `"1.3.2"` değerine yükseltildi.
 - **Neden Değişti / Neden Üretildi?:** Yeni Coordinator-Only fiziksel kanca koruması ve çift katmanlı kota kurtarma yeteneği minör sürüm artışı olarak işaretlendi.
 
 ### `rules/AGENTS.md` — [GÜNCELLENDİ] (`Evrensel Orkestrasyon Kuralı`)
@@ -115,7 +115,7 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Canlı bir Antigravity sohbeti içinde `./tests/run-all.sh` koşulurken `--conversation-id` verilmeyen birim testlerinin ana sohbet kimliğinden izole kalmasını sağlamak için güncellendi.
 
 ### `tests/test-manifest.sh` — [GÜNCELLENDİ] (`Manifesto Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_plugin_json_required_fields` içindeki beklenen sürüm `"1.4.0"` olarak güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_plugin_json_required_fields` içindeki beklenen sürüm `"1.3.2"` olarak güncellendi.
 - **Neden Değişti / Neden Üretildi?:** `plugin.json` sürüm artışını manifesto test sözleşmesiyle eşitlemek için güncellendi.
 
 ### `tests/test-plugin-bundle.sh` — [GÜNCELLENDİ] (`Paket Bütünlüğü Testleri`)

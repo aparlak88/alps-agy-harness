@@ -1,4 +1,4 @@
-# Uygulama Planı: Swarm Coordinator-Only Koruması ve Çift Katmanlı Kota Bekleme / Otomatik Devam (`v1.4.0`)
+# Uygulama Planı: Swarm Coordinator-Only Koruması ve Çift Katmanlı Kota Bekleme / Otomatik Devam (`v1.3.2`)
 
 **Tarih:** 2026-11-26  
 **Hedef:** Antigravity Swarm oturumlarında koordinatör ajanın yalnızca koordinasyon yapmasını fiziksel `PreToolUse` kancalarıyla zorunlu kılmak; 5 saatlik veya haftalık kota dolduğunda işçileri öldürmeden/model değiştirmeden çift katmanlı (`schedule` + `harness-daemon` `agy --conversation`) otomatik bekleme ve devam mekanizmasını eklemek.
@@ -28,6 +28,7 @@
 - `skills/pre-pr-readiness/SKILL.md`
 - `tests/test-command-hooks.sh`
 - `tests/test-edit-and-session-hooks.sh`
+- `tests/test-helpers.sh`
 - `tests/test-manifest.sh`
 - `tests/test-plugin-bundle.sh`
 - `tests/test-rules-and-agents.sh`
@@ -49,7 +50,7 @@
    - `GET /health` (`quotaWaits`), `POST /hook/stop-gate` ve `POST /event/swarm-quota-wait` uçları.
 3. **CLI (`scripts/stamp-gate.sh`):**
    - `swarm-coordinator` ve `swarm-quota` alt komutları + daemon olay bildirimi.
-4. **Kurallar, Skill'ler, `README.md` ve `plugin.json` (`1.4.0`):**
+4. **Kurallar, Skill'ler, `README.md` ve `plugin.json` (`1.3.2`):**
    - `rules/AGENTS.md` (`< 8192`B), `skills/harness-orchestrator/SKILL.md`, `skills/pre-pr-readiness/SKILL.md`, `README.md`, `plugin.json`.
 5. **Kapsamlı TDD Testleri ve Tam Doğrulama:**
    - Tüm 9 test paketi `run-quiet.sh` ile yeşil; CWD-bağımsız `(cd /tmp && ...)` koşu; `docs/walkthroughs/2026-11-26-swarm-coordinator-isolation-and-quota-resume.md` ve `stamp-gate.sh review --kind tdd --auto-stamp`.

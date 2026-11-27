@@ -16,7 +16,7 @@ test_plugin_json_required_fields() {
   [ -f "$REPO_ROOT/plugin.json" ] || { echo "plugin.json does not exist" >&2; return 1; }
   assert_json_field "$REPO_ROOT/plugin.json" ".name" "alps-agy-harness"
   assert_json_field "$REPO_ROOT/plugin.json" ".displayName" "Alps AGY Engineering Harness"
-  assert_json_field "$REPO_ROOT/plugin.json" ".version" "1.4.0"
+  assert_json_field "$REPO_ROOT/plugin.json" ".version" "1.3.2"
 
   # Verify suggestedPrompts structure (array of 3 non-empty strings per Antigravity plugin.json schema)
   jq -e '(.suggestedPrompts | type == "array") and (.suggestedPrompts | length == 3) and (.suggestedPrompts | all(type == "string" and length > 0))' "$REPO_ROOT/plugin.json" >/dev/null

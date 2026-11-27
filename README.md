@@ -1,4 +1,4 @@
-# Alps AGY Engineering Harness (`alps-agy-harness` — `v1.4.0`)
+# Alps AGY Engineering Harness (`alps-agy-harness` — `v1.3.2`)
 
 Google Antigravity (AGY) ortamı için kurumsal düzeyde deterministik mühendislik harness eklentisi.
 
