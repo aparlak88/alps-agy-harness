@@ -394,7 +394,14 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "/usr/bin/time -ao log git push origin main" \
     "/usr/bin/time --output log git push origin main" \
     "/usr/bin/time -f fmt git push origin main" \
-    "/usr/bin/time --format fmt git push origin main"
+    "/usr/bin/time --format fmt git push origin main" \
+    "if npm test; then git push origin main; fi" \
+    "{ git push origin main; }" \
+    "! git push origin main" \
+    "exec git push origin main" \
+    "exec -a fake git push origin main" \
+    "for x in a; do git push origin main; done" \
+    "if false; then echo x; else git push origin main; fi"
   do
     out_bypass_push=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_push_cmd" \
       '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
@@ -1713,6 +1720,8 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "gh issue list" \
     'echo '\''${Z:--delete}'\''' \
     'echo '\''{-delete,}'\''' \
+    "printf 'ok\n'" \
+    "[ -f README.md ]" \
     "./scripts/stamp-gate.sh swarm-quota pause --workspace \"$repo\" --conversation-id \"conv-coord\" --wait-seconds 60" \
     "./scripts/stamp-gate.sh dispatch --workspace \"$repo\" --role explorer" \
     "./scripts/stamp-gate.sh select-model --workspace \"$repo\" --tier pro" \
@@ -1809,6 +1818,15 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     'echo "$HOME"' \
     'find . {-delete,}' \
     '{ rm -rf src; }' \
+    'printf -v '\''a[$(rm -rf src)]'\'' x' \
+    'test -v '\''a[$(rm -rf src)]'\''' \
+    '[ -v '\''a[$(rm -rf src)]'\'' ]' \
+    "exec git status" \
+    "git branch --unset-up" \
+    "git branch --set-upstream-t=origin/main" \
+    "git branch --edit-desc" \
+    "git --git-dir=/tmp status" \
+    "git --work-tree=/tmp status" \
     "sudo git status" \
     "/usr/bin/sudo git status" \
     "time sudo git status" \

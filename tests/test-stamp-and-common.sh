@@ -1887,7 +1887,7 @@ EOF
 
   HARNESS_AGY_BIN="$mock_agy" CONC_REPO="$repo" CONC_COUNT="$conc_count" CONC_CWD="$conc_cwd_log" \
     CONC_STARTED="$conc_started" CONC_RELEASE="$conc_release" PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
-import os, threading, time
+import fcntl, os, threading, time
 from pathlib import Path
 import harness_core
 
@@ -1895,12 +1895,19 @@ ws = Path(os.environ["CONC_REPO"])
 started_p = Path(os.environ["CONC_STARTED"])
 release_p = Path(os.environ["CONC_RELEASE"])
 
-# I7: Deterministic lock-exclusion proof using Events inside critical section before concurrent barrier
+# I7 / I3: Deterministic lock-exclusion proof using flock-entry + critical-section Events
 t1_in_lock = threading.Event()
 t1_release = threading.Event()
+t2_trying = threading.Event()
 t2_entered = threading.Event()
 orig_read = harness_core.read_json_file
+orig_flock = fcntl.flock
 t1_tid = None
+
+def gated_quota_flock(fd, op):
+    if t1_tid is not None and threading.get_ident() != t1_tid and (op & fcntl.LOCK_EX):
+        t2_trying.set()
+    return orig_flock(fd, op)
 
 def gated_quota_read(path: Path):
     data = orig_read(path)
@@ -1920,6 +1927,7 @@ def lock_holder_resume():
     res_lock_gate.append(harness_core.attempt_swarm_quota_resume(ws))
 
 release_p.write_text("go")
+fcntl.flock = gated_quota_flock
 harness_core.read_json_file = gated_quota_read
 try:
     th1 = threading.Thread(target=lock_holder_resume)
@@ -1927,13 +1935,16 @@ try:
     assert t1_in_lock.wait(timeout=5), "Thread 1 did not enter quota lock critical section"
     th2 = threading.Thread(target=lambda: res_lock_gate.append(harness_core.attempt_swarm_quota_resume(ws)))
     th2.start()
-    assert not t2_entered.wait(timeout=0.15), "Thread 2 entered quota read while Thread 1 held flock!"
+    assert t2_trying.wait(timeout=5), "Thread 2 never reached fcntl.flock acquisition"
+    assert not t2_entered.wait(timeout=0.1), "Thread 2 entered quota read while Thread 1 held flock!"
     t1_release.set()
     th1.join(timeout=5)
     th2.join(timeout=5)
     assert not th1.is_alive() and not th2.is_alive()
+    assert t2_entered.is_set(), "Thread 2 did not enter quota read after lock release"
 finally:
     harness_core.read_json_file = orig_read
+    fcntl.flock = orig_flock
 
 Path(os.environ["CONC_COUNT"]).write_text("")
 Path(os.environ["CONC_CWD"]).write_text("")
@@ -1981,11 +1992,17 @@ assert len(lines) == 1, f"Expected exactly 1 concurrent agy launch, got {len(lin
 cwd_line = Path(os.environ["CONC_CWD"]).read_text()
 assert str(ws.resolve()) in cwd_line and "gemini-4-neon-high" in cwd_line, cwd_line
 
-# I7: Event-gated lock-exclusion test for register_swarm_coordinator (plus 6-thread completion)
+# I7 / I3: Event-gated lock-exclusion test for register_swarm_coordinator with flock-entry barrier (plus 6-thread completion)
 c1_in = threading.Event()
 c1_rel = threading.Event()
+c2_trying = threading.Event()
 c2_in = threading.Event()
 c1_tid = None
+
+def gated_coord_flock(fd, op):
+    if c1_tid is not None and threading.get_ident() != c1_tid and (op & fcntl.LOCK_EX):
+        c2_trying.set()
+    return orig_flock(fd, op)
 
 def gated_coord_read(path: Path):
     data = orig_read(path)
@@ -2003,6 +2020,7 @@ def reg_holder():
     c1_tid = threading.get_ident()
     harness_core.register_swarm_coordinator(ws, conversation_id="conv-conc-w", active=True, worker_name="w-gate")
 
+fcntl.flock = gated_coord_flock
 harness_core.read_json_file = gated_coord_read
 try:
     ch1 = threading.Thread(target=reg_holder)
@@ -2010,13 +2028,16 @@ try:
     assert c1_in.wait(timeout=5), "Coordinator Thread 1 did not enter flock critical section"
     ch2 = threading.Thread(target=lambda: harness_core.register_swarm_coordinator(ws, conversation_id="conv-conc-w", active=True, worker_name="w-peer"))
     ch2.start()
-    assert not c2_in.wait(timeout=0.15), "Thread 2 entered coordinator read while Thread 1 held flock!"
+    assert c2_trying.wait(timeout=5), "Coordinator Thread 2 never reached fcntl.flock acquisition"
+    assert not c2_in.wait(timeout=0.1), "Thread 2 entered coordinator read while Thread 1 held flock!"
     c1_rel.set()
     ch1.join(timeout=5)
     ch2.join(timeout=5)
     assert not ch1.is_alive() and not ch2.is_alive()
+    assert c2_in.is_set(), "Thread 2 did not enter coordinator read after lock release"
 finally:
     harness_core.read_json_file = orig_read
+    fcntl.flock = orig_flock
 
 w_barrier = threading.Barrier(6)
 def worker_reg(idx: int):

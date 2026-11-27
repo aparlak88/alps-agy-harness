@@ -625,6 +625,17 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
         if "=" in tok and tok.split("=", 1)[0].isidentifier():
             idx += 1
             continue
+        if tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
+            idx += 1
+            continue
+        if tok == "exec":
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                idx += 2 if tokens[idx] == "-a" else 1
+            continue
         base = os.path.basename(tok)
         if base == "sudo":
             idx += 1
@@ -2792,27 +2803,7 @@ COORDINATOR_READ_ONLY_GIT_SUBCMDS = frozenset(
     )
 )
 COORDINATOR_GIT_FORBIDDEN_GLOBAL_FLAGS = frozenset(
-    ("-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack")
-)
-COORDINATOR_GIT_BRANCH_MUTATE_FLAGS = frozenset(
-    (
-        "-d",
-        "-D",
-        "-m",
-        "-M",
-        "-c",
-        "-C",
-        "-f",
-        "--delete",
-        "--move",
-        "--copy",
-        "--force",
-        "--set-upstream-to",
-        "-u",
-        "--unset-upstream",
-        "--edit-description",
-        "--create-reflog",
-    )
+    ("-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack", "--git-dir", "--work-tree")
 )
 COORDINATOR_READ_ONLY_GH_VERBS = {
     "auth": frozenset(("status",)),
@@ -3473,6 +3464,8 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
             base_tok = os.path.basename(tok)
             if base_tok == "sudo":
                 return "Swarm Coordinator-Only guard: 'sudo' is blocked for the active Swarm Coordinator."
+            if base_tok == "exec":
+                return "Swarm Coordinator-Only guard: 'exec' is blocked for the active Swarm Coordinator."
             if base_tok in ("nohup", "time", "builtin", "command", "env") and not _is_trusted_coordinator_exe(tok):
                 return f"Swarm Coordinator-Only guard: untrusted wrapper path '{tok}' is blocked for the active Swarm Coordinator."
             if base_tok in ("time", "nohup"):
@@ -3721,6 +3714,9 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
             for tok in seg[1:]:
                 if tok in ("--pre", "--pre-glob", "--hostname-bin") or tok.startswith(("--pre=", "--pre-glob=", "--hostname-bin=")):
                     return _deny_seg()
+        elif exe in ("printf", "test", "["):
+            if any(tok == "-v" or (exe == "printf" and tok.startswith("-v")) for tok in seg[1:]):
+                return _deny_seg()
         return "allow", ""
 
     if exe == "find":
@@ -3738,7 +3734,7 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
         for gtok in global_opts:
             if (
                 gtok in COORDINATOR_GIT_FORBIDDEN_GLOBAL_FLAGS
-                or gtok.startswith(("-c", "--config-env=", "--exec-path=", "--upload-pack=", "--receive-pack="))
+                or gtok.startswith(("-c", "--config-env=", "--exec-path=", "--upload-pack=", "--receive-pack=", "--git-dir=", "--work-tree="))
             ):
                 return _deny_seg()
 
@@ -3746,17 +3742,24 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
             return "allow", ""
         rest = seg[subcmd_idx + 1 :] if subcmd_idx >= 0 else []
         if git_subcmd == "branch":
-            for tok in rest:
-                if tok in COORDINATOR_GIT_BRANCH_MUTATE_FLAGS or tok.startswith(("--set-upstream-to=", "-u=", "--edit-description=")):
-                    return _deny_seg()
             value_flags = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format"}
+            value_eq_prefixes = tuple(f"{f}=" for f in value_flags)
+            bool_flags = {
+                "-a", "--all", "-r", "--remotes", "-l", "--list",
+                "-v", "-vv", "--verbose", "--show-current",
+                "-i", "--ignore-case", "--no-color", "--color",
+                "--abbrev", "--no-abbrev", "--column", "--no-column",
+                "-q", "--quiet",
+            }
             idx = 0
             while idx < len(rest):
                 tok = rest[idx]
                 if tok in value_flags:
+                    if idx + 1 >= len(rest):
+                        return _deny_seg()
                     idx += 2
                     continue
-                if tok.startswith("-"):
+                if tok in bool_flags or tok.startswith(value_eq_prefixes + ("--color=", "--abbrev=", "--column=")):
                     idx += 1
                     continue
                 return _deny_seg()

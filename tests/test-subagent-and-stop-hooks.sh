@@ -967,18 +967,25 @@ test_parallel_subagent_dispatch_locking_and_sibling_worktree_discovery() {
     return 1
   }
 
-  # 2b. I5: Deterministic threading.Event barrier proof for dispatch_register flock mutual exclusion
+  # 2b. I5 / I3: Deterministic threading.Event barrier proof for dispatch_register flock mutual exclusion
   DISPATCH_REPO="$main_repo" PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
-import os, threading
+import fcntl, os, threading
 from pathlib import Path
 import harness_core
 
 ws = Path(os.environ["DISPATCH_REPO"])
 t1_in = threading.Event()
 t1_rel = threading.Event()
+t2_trying = threading.Event()
 t2_in = threading.Event()
 orig_read = harness_core.read_json_file
+orig_flock = fcntl.flock
 t1_tid = None
+
+def gated_dispatch_flock(fd, op):
+    if t1_tid is not None and threading.get_ident() != t1_tid and (op & fcntl.LOCK_EX):
+        t2_trying.set()
+    return orig_flock(fd, op)
 
 def gated_dispatch_read(path: Path):
     data = orig_read(path)
@@ -996,6 +1003,7 @@ def hold_dispatch():
     t1_tid = threading.get_ident()
     harness_core.dispatch_register(ws, "BarrierRoleA", "self", "bounded_execution", "inherit", "")
 
+fcntl.flock = gated_dispatch_flock
 harness_core.read_json_file = gated_dispatch_read
 try:
     th1 = threading.Thread(target=hold_dispatch)
@@ -1003,13 +1011,16 @@ try:
     assert t1_in.wait(timeout=5), "Thread 1 did not enter dispatch flock critical section"
     th2 = threading.Thread(target=lambda: harness_core.dispatch_register(ws, "BarrierRoleB", "self", "bounded_execution", "inherit", ""))
     th2.start()
-    assert not t2_in.wait(timeout=0.25), "Thread 2 entered subagent-dispatch read while Thread 1 held flock!"
+    assert t2_trying.wait(timeout=5), "Thread 2 never reached fcntl.flock acquisition"
+    assert not t2_in.wait(timeout=0.1), "Thread 2 entered subagent-dispatch read while Thread 1 held flock!"
     t1_rel.set()
     th1.join(timeout=5)
     th2.join(timeout=5)
     assert not th1.is_alive() and not th2.is_alive()
+    assert t2_in.is_set(), "Thread 2 did not enter subagent-dispatch read after lock release"
 finally:
     harness_core.read_json_file = orig_read
+    fcntl.flock = orig_flock
 
 disp = orig_read(harness_core.get_state_dir(ws) / "subagent-dispatch.json")
 entries = disp.get("entries", {})
