@@ -2077,21 +2077,23 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
   }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
   assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-worker-title"] == null' "true"
 
-  # Linked-worktree swarm(add) must not register Coordinator
-  echo "init" > "$auto_repo/README.md"
-  git -C "$auto_repo" add README.md
-  git -C "$auto_repo" commit -m "chore: init" --quiet
-  local auto_wt
+  # I1: Linked-worktree swarm(add) on a fresh repo with NO active coordinators must NOT register Coordinator
+  local wt_only_repo auto_wt
+  wt_only_repo=$(make_temp_repo)
+  echo "init" > "$wt_only_repo/README.md"
+  git -C "$wt_only_repo" add README.md
+  git -C "$wt_only_repo" commit -m "chore: init" --quiet
   auto_wt=$(mktemp -d "${TMPDIR:-/tmp}/swarm-wt-auto.XXXXXX")
   echo "$auto_wt" >> "$_HARNESS_TEMP_TRACKER"
-  git -C "$auto_repo" worktree add "$auto_wt" -b "feat/wt-helper" --quiet
-  printf '%s' "$(jq -nc --arg ws "$auto_repo" --arg cwd "$auto_wt" '{
+  git -C "$wt_only_repo" worktree add "$auto_wt" -b "feat/wt-helper" --quiet
+  printf '%s' "$(jq -nc --arg ws "$wt_only_repo" --arg cwd "$auto_wt" '{
     workspacePaths: [$ws],
     cwd: $cwd,
     conversationId: "conv-wt-helper",
     toolCall: {name: "swarm", args: {action: "add", name: "helper-wt", workspace: "inherit", brief: "Sub."}}
   }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
-  assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-wt-helper"] == null' "true" "Linked worktree swarm(add) must not register Coordinator"
+  [ ! -f "$wt_only_repo/.harness/state/swarm/swarm-coordinator.json" ] \
+    || assert_json_field "$wt_only_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-wt-helper"] == null' "true" "Linked worktree swarm(add) on clean repo must not register Coordinator"
 
   # Integrator role variants receive [SWARM_INTEGRATOR_CONTRACT]
   local int_role

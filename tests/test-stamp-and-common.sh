@@ -1445,6 +1445,17 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
   assert_json_field "$("$STAMP_GATE" swarm-quota --action status --workspace "$repo")" ".status" "waiting"
   assert_json_field "$("$STAMP_GATE" swarm-quota --action=status --workspace "$repo")" ".status" "waiting"
 
+  # Minor: default buffer_seconds=60 when omitted + all --flag=value CLI forms
+  "$STAMP_GATE" swarm-quota clear --workspace="$repo" >/dev/null
+  local out_defbuf
+  out_defbuf=$("$STAMP_GATE" swarm-quota pause --workspace="$repo" --conversation-id="conv-eq" --wait-seconds=100 --window=5h --model="gemini-4-neon-high" --reason="eq-test" --member="m-eq")
+  assert_json_field "$out_defbuf" ".recommendedScheduleSeconds" "160" "Default buffer_seconds must be 60 when --buffer-seconds omitted"
+  assert_json_field "$out_defbuf" ".conversationId" "conv-eq"
+  assert_json_field "$("$STAMP_GATE" swarm-coordinator on --workspace="$repo" --conversation-id="conv-eq" --title="Eq Title")" ".title" "Eq Title"
+  "$STAMP_GATE" swarm-coordinator off --workspace="$repo" --conversation-id="conv-eq" >/dev/null
+  "$STAMP_GATE" swarm-quota clear --workspace="$repo" >/dev/null
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --wait-seconds 18000 --buffer-seconds 60 --window 5h --model "gemini-4-neon-high" --reason "5-hour rolling window exhausted" --member "worker-a" --member "worker-b" >/dev/null
+
   # Valid --resume-at + --buffer-seconds 60
   out_iso=$("$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-cli" --resume-at "2030-05-01T10:00:00Z" --buffer-seconds 60 --window 5h)
   assert_json_field "$out_iso" ".resumeAt" "2030-05-01T10:01:00Z"
@@ -1755,6 +1766,16 @@ ep, ex = harness_core.parse_quota_reset_epoch("1h30m", now_epoch=now, buffer_sec
 assert ex and ep == now + 5400.0, (ep, ex)
 ep, ex = harness_core.parse_quota_reset_epoch("3d4h", now_epoch=now, buffer_sec=0)
 assert ex and ep == now + 273600.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("resets in 2 hours", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 7200.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("resets in 15 minutes", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 900.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("resets in 45 seconds", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 45.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("3 hrs 20 mins 10 secs", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 12010.0, (ep, ex)
+ep, ex = harness_core.parse_quota_reset_epoch("timeout 10s, resets in 5 minutes", now_epoch=now, buffer_sec=0)
+assert ex and ep == now + 300.0, (ep, ex)
 ep, ex = harness_core.parse_quota_reset_epoch("agy --conversation timed out after 120.0s", now_epoch=now, buffer_sec=0)
 assert not ex, (ep, ex)
 ep, ex = harness_core.parse_quota_reset_epoch("5h quota exceeded", now_epoch=now, buffer_sec=0)
@@ -1852,6 +1873,54 @@ import harness_core
 ws = Path(os.environ["CONC_REPO"])
 started_p = Path(os.environ["CONC_STARTED"])
 release_p = Path(os.environ["CONC_RELEASE"])
+
+# I7: Deterministic lock-exclusion proof using Events inside critical section before concurrent barrier
+t1_in_lock = threading.Event()
+t1_release = threading.Event()
+t2_entered = threading.Event()
+orig_read = harness_core.read_json_file
+t1_tid = None
+
+def gated_quota_read(path: Path):
+    data = orig_read(path)
+    if path.name == "swarm-quota-wait.json":
+        cur_tid = threading.get_ident()
+        if t1_tid is not None and cur_tid == t1_tid and not t1_in_lock.is_set():
+            t1_in_lock.set()
+            assert t1_release.wait(timeout=5), "Timed out releasing quota lock gate"
+        elif t1_tid is not None and cur_tid != t1_tid:
+            t2_entered.set()
+    return data
+
+res_lock_gate = []
+def lock_holder_resume():
+    global t1_tid
+    t1_tid = threading.get_ident()
+    res_lock_gate.append(harness_core.attempt_swarm_quota_resume(ws))
+
+release_p.write_text("go")
+harness_core.read_json_file = gated_quota_read
+try:
+    th1 = threading.Thread(target=lock_holder_resume)
+    th1.start()
+    assert t1_in_lock.wait(timeout=5), "Thread 1 did not enter quota lock critical section"
+    th2 = threading.Thread(target=lambda: res_lock_gate.append(harness_core.attempt_swarm_quota_resume(ws)))
+    th2.start()
+    assert not t2_entered.wait(timeout=0.15), "Thread 2 entered quota read while Thread 1 held flock!"
+    t1_release.set()
+    th1.join(timeout=5)
+    th2.join(timeout=5)
+    assert not th1.is_alive() and not th2.is_alive()
+finally:
+    harness_core.read_json_file = orig_read
+
+Path(os.environ["CONC_COUNT"]).write_text("")
+Path(os.environ["CONC_CWD"]).write_text("")
+started_p.unlink(missing_ok=True)
+release_p.unlink(missing_ok=True)
+harness_core.clear_swarm_quota_wait(ws)
+harness_core.record_swarm_quota_pause(ws, conversation_id="conv-conc", model="gemini-4-neon-high", wait_seconds=0, buffer_seconds=0)
+
 barrier = threading.Barrier(4)
 results = []
 res_lock = threading.Lock()
@@ -1891,32 +1960,58 @@ assert len(lines) == 1, f"Expected exactly 1 concurrent agy launch, got {len(lin
 cwd_line = Path(os.environ["CONC_CWD"]).read_text()
 assert str(ws.resolve()) in cwd_line and "gemini-4-neon-high" in cwd_line, cwd_line
 
-# Force read-modify-write overlap test (without flock, simultaneous 0.02s sleeps would lose workers)
-orig_read = harness_core.read_json_file
-def slow_read(path: Path):
+# I7: Event-gated lock-exclusion test for register_swarm_coordinator (plus 6-thread completion)
+c1_in = threading.Event()
+c1_rel = threading.Event()
+c2_in = threading.Event()
+c1_tid = None
+
+def gated_coord_read(path: Path):
     data = orig_read(path)
     if path.name == "swarm-coordinator.json":
-        time.sleep(0.02)
+        cur_tid = threading.get_ident()
+        if c1_tid is not None and cur_tid == c1_tid and not c1_in.is_set():
+            c1_in.set()
+            assert c1_rel.wait(timeout=5), "Timed out releasing coordinator lock gate"
+        elif c1_tid is not None and cur_tid != c1_tid:
+            c2_in.set()
     return data
 
-harness_core.read_json_file = slow_read
-try:
-    w_barrier = threading.Barrier(6)
-    def worker_reg(idx: int):
-        w_barrier.wait(timeout=5)
-        harness_core.register_swarm_coordinator(ws, conversation_id="conv-conc-w", active=True, worker_name=f"w-{idx}")
+def reg_holder():
+    global c1_tid
+    c1_tid = threading.get_ident()
+    harness_core.register_swarm_coordinator(ws, conversation_id="conv-conc-w", active=True, worker_name="w-gate")
 
-    w_threads = [threading.Thread(target=worker_reg, args=(i,)) for i in range(6)]
-    for t in w_threads:
-        t.start()
-    for t in w_threads:
-        t.join(timeout=5)
-        assert not t.is_alive(), "Concurrent coordinator registration thread timed out"
+harness_core.read_json_file = gated_coord_read
+try:
+    ch1 = threading.Thread(target=reg_holder)
+    ch1.start()
+    assert c1_in.wait(timeout=5), "Coordinator Thread 1 did not enter flock critical section"
+    ch2 = threading.Thread(target=lambda: harness_core.register_swarm_coordinator(ws, conversation_id="conv-conc-w", active=True, worker_name="w-peer"))
+    ch2.start()
+    assert not c2_in.wait(timeout=0.15), "Thread 2 entered coordinator read while Thread 1 held flock!"
+    c1_rel.set()
+    ch1.join(timeout=5)
+    ch2.join(timeout=5)
+    assert not ch1.is_alive() and not ch2.is_alive()
 finally:
     harness_core.read_json_file = orig_read
 
+w_barrier = threading.Barrier(6)
+def worker_reg(idx: int):
+    w_barrier.wait(timeout=5)
+    harness_core.register_swarm_coordinator(ws, conversation_id="conv-conc-w", active=True, worker_name=f"w-{idx}")
+
+w_threads = [threading.Thread(target=worker_reg, args=(i,)) for i in range(6)]
+for t in w_threads:
+    t.start()
+for t in w_threads:
+    t.join(timeout=5)
+    assert not t.is_alive(), "Concurrent coordinator registration thread timed out"
+
 coord_status = harness_core.get_swarm_coordinator_status(ws, conversation_id="conv-conc-w")
-assert sorted(coord_status.get("workers", [])) == [f"w-{i}" for i in range(6)], coord_status
+workers = set(coord_status.get("workers", []))
+assert {"w-gate", "w-peer", *(f"w-{i}" for i in range(6))}.issubset(workers), coord_status
 PYEOF
 }
 

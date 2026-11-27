@@ -508,6 +508,7 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
     in_double = False
     in_ansi_c = False
     escape = False
+    at_token_start = True
     i = 0
     n = len(cmd_line)
 
@@ -516,15 +517,18 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
         if escape:
             current.append(c)
             escape = False
+            at_token_start = False
             i += 1
             continue
         if c == "\\" and not in_single:
             escape = True
+            at_token_start = False
             current.append(c)
             i += 1
             continue
         if not in_single and not in_double and not in_ansi_c and c == "$" and i + 1 < n and cmd_line[i + 1] == "'":
             in_ansi_c = True
+            at_token_start = False
             current.append("$'")
             i += 2
             continue
@@ -533,31 +537,41 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
                 in_ansi_c = False
             else:
                 in_single = not in_single
+            at_token_start = False
             current.append(c)
             i += 1
             continue
         if c == '"' and not in_single and not in_ansi_c:
             in_double = not in_double
+            at_token_start = False
             current.append(c)
             i += 1
             continue
 
         if not in_single and not in_double and not in_ansi_c:
-            if c == "#" and (i == 0 or cmd_line[i - 1] in (" ", "\t", "\n", ";", "&", "|", "(", ")")):
+            if c == "#" and at_token_start:
                 while i < n and cmd_line[i] != "\n":
                     i += 1
+                continue
+            if c in (" ", "\t"):
+                at_token_start = True
+                current.append(c)
+                i += 1
                 continue
             if c in ("&", "|") and i + 1 < n and cmd_line[i + 1] == c:
                 seg = "".join(current).strip()
                 segments.append((seg, c + c))
                 current = []
+                at_token_start = True
                 i += 2
                 continue
             if c == "&" and ((i > 0 and cmd_line[i - 1] in (">", "<")) or (i + 1 < n and cmd_line[i + 1] == ">")):
+                at_token_start = False
                 current.append(c)
                 i += 1
                 continue
             if c == "|" and i > 0 and cmd_line[i - 1] == ">":
+                at_token_start = False
                 current.append(c)
                 i += 1
                 continue
@@ -565,8 +579,10 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
                 seg = "".join(current).strip()
                 segments.append((seg, c))
                 current = []
+                at_token_start = True
                 i += 1
                 continue
+        at_token_start = False
         current.append(c)
         i += 1
 
@@ -3233,6 +3249,7 @@ def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
     in_single = False
     in_double = False
     escape = False
+    at_token_start = True
     n = len(cmd_line)
     i = 0
 
@@ -3240,18 +3257,22 @@ def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
         c = cmd_line[i]
         if escape:
             escape = False
+            at_token_start = False
             i += 1
             continue
         if c == "\\" and not in_single:
             escape = True
+            at_token_start = False
             i += 1
             continue
         if c == "'" and not in_double:
             in_single = not in_single
+            at_token_start = False
             i += 1
             continue
         if c == '"' and not in_single:
             in_double = not in_double
+            at_token_start = False
             i += 1
             continue
 
@@ -3262,7 +3283,7 @@ def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
                 return "$(...) command substitution"
 
         if not in_single and not in_double:
-            if c == "#" and (i == 0 or cmd_line[i - 1] in (" ", "\t", "\n", ";", "&", "|", "(", ")")):
+            if c == "#" and at_token_start:
                 while i < n and cmd_line[i] != "\n":
                     i += 1
                 continue
@@ -3278,14 +3299,21 @@ def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
                 rest = cmd_line[gt_idx:]
                 # Allow 2>&1, 1>&2, >&1, >&2 (fd duplication)
                 if re.match(r"^>&[12](?:\s|$|[;&|)])", rest):
+                    at_token_start = False
                     i = gt_idx + 3
                     continue
                 # Allow >/dev/null, >>/dev/null, >|/dev/null (and fd-prefixed 1>/dev/null, 2>/dev/null, &>/dev/null)
                 m_devnull = re.match(r"^>(?:>|\|)?\s*/dev/null(?:\s|$|[;&|)])", rest)
                 if m_devnull:
+                    at_token_start = False
                     i = gt_idx + m_devnull.end() - 1
                     continue
                 return "output redirection"
+            if c in (" ", "\t", "\n", ";", "&", "|", "(", ")"):
+                at_token_start = True
+                i += 1
+                continue
+        at_token_start = False
         i += 1
     return None
 

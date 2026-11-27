@@ -1534,6 +1534,7 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git status >>/dev/null" \
     "git status >|/dev/null" \
     "git status &>/dev/null" \
+    "git status ; # harmless comment" \
     "./scripts/stamp-gate.sh swarm-quota pause --workspace \"$repo\" --conversation-id \"conv-coord\" --wait-seconds 60" \
     "./scripts/stamp-gate.sh dispatch --workspace \"$repo\" --role explorer" \
     "./scripts/stamp-gate.sh select-model --workspace \"$repo\" --tier pro" \
@@ -1576,8 +1577,20 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git --exec-path=/tmp/evil status" \
     "GIT_EXTERNAL_DIFF=evil git diff" \
     "GIT_CONFIG_PARAMETERS=evil git status" \
+    "GIT_CONFIG_GLOBAL=/tmp/g git status" \
+    "GIT_SSH=evil git status" \
+    "GIT_EDITOR=evil git status" \
     "GIT_EXEC_PATH=/tmp/x git status" \
+    "LD_LIBRARY_PATH=/tmp/x git status" \
     "IFS=: git status" \
+    "git tag -l -d v1.0" \
+    "git branch --unset-upstream" \
+    'echo \;#; rm -rf src' \
+    'echo \&#; rm -rf src' \
+    'echo \|#; rm -rf src' \
+    'echo a#; rm -rf src' \
+    "./scripts/stamp-gate.sh swarm-coordinator bogus --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota --workspace \"$repo\"" \
     "RIPGREP_CONFIG_PATH=/tmp/rc rg pat" \
     "HOME=/tmp/evil git status" \
     "XDG_CONFIG_HOME=/tmp/evil git status" \
@@ -1706,6 +1719,26 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_ansic" ".decision" "deny" "C2: ANSI-C quoting \$'...' must fail closed"
+
+  # I2: Isolated syntax guards verified directly via exact reason strings on otherwise-allowed commands
+  local out_ansic_only out_locale_only out_procsub_only
+  out_ansic_only=$(jq -nc --arg ws "$repo" --arg cmd "echo \$'a'" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_ansic_only" ".decision" "deny"
+  assert_contains "$(printf '%s' "$out_ansic_only" | jq -r '.reason')" "ANSI-C"
+
+  out_locale_only=$(jq -nc --arg ws "$repo" --arg cmd 'echo $"a"' \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_locale_only" ".decision" "deny"
+  assert_contains "$(printf '%s' "$out_locale_only" | jq -r '.reason')" "locale"
+
+  out_procsub_only=$(jq -nc --arg ws "$repo" --arg cmd 'cat <(ls)' \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_procsub_only" ".decision" "deny"
+  assert_contains "$(printf '%s' "$out_procsub_only" | jq -r '.reason')" "process substitution"
 
   spoof_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-spoof.XXXXXX")
   echo "$spoof_dir" >> "$_HARNESS_TEMP_TRACKER"

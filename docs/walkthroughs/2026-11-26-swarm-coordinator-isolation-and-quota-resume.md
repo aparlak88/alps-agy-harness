@@ -75,8 +75,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** `always_on` kural dosyasında Antigravity'nin 8 KB sınırını aşmadan koordinatöre mutlak devretme kuralını, `integrator` rolünü ve Saf Bekleme kota kurtarma protokolünü zorunlu kılmak için güncellendi.
 
 ### `scripts/lib/harness_core.py` — [GÜNCELLENDİ] (`Paylaşımlı Çekirdek Kütüphane`)
-- **Ne Değişti / Ne Üretildi?:** Dal-bağımsız `get_swarm_state_dir()`, `register_swarm_coordinator()`, `is_active_swarm_coordinator()`, `_tokenize_raw_segments()` (`#` kabuk yorumları, `$'...'` ANSI-C tırnaklama ve `>|/dev/null` yönlendirme desteği), `_has_unsafe_shell_syntax_for_coordinator()` (`$'...'`/`$"..."` engelleri), `COORDINATOR_DANGEROUS_ENV_VARS` (`RIPGREP_CONFIG_PATH`, `HOME`, `XDG_CONFIG_HOME`, `GIT_DIR`, `GIT_WORK_TREE`) ve `rg --hostname-bin`, `deny > force_ask` tam segment önceliklendirme, `parse_quota_reset_epoch()` (`timed out after` filtresi + kompakt `1h30m`/`3d4h` + uzun birim öncelikli ayrıştırma) ve `resumingToken` korumalı `attempt_swarm_quota_resume()` eklendi.
-- **Neden Değişti / Neden Üretildi?:** Kabuk `#` yorumu / ANSI-C tırnaklama atlatma açıklarını, `rg --hostname-bin` / ortam değişkeni enjeksiyonlarını, timeout metninin yanlış pozitif sıfırlama olarak ayrıştırılmasını ve erken `force_ask` öncelik hatasını kapatmak için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** Dal-bağımsız `get_swarm_state_dir()`, `register_swarm_coordinator()`, `is_active_swarm_coordinator()`, `_tokenize_raw_segments()` & `_has_unsafe_shell_syntax_for_coordinator()` (`at_token_start` durum takibiyle kaçışlı sınırlayıcı sonrası `#` yorumu, `$'...'` ANSI-C/`$"..."` locale tırnaklama ve `>|/dev/null`), `COORDINATOR_DANGEROUS_ENV_VARS` + `rg --hostname-bin`, `deny > force_ask` tam segment önceliklendirme, `parse_quota_reset_epoch()` ve `resumingToken` korumalı `attempt_swarm_quota_resume()` eklendi.
+- **Neden Değişti / Neden Üretildi?:** Kaçışlı sınırlayıcı (`\;#`) veya kelime içi `a#` yorumu atlatmasını, `$'...'` tırnaklama/süre ayrıştırma hatalarını ve erken `force_ask` öncelik açığını kapatmak için güncellendi.
 
 ### `scripts/stamp-gate.sh` — [GÜNCELLENDİ] (`Damga ve Durum CLI`)
 - **Ne Değişti / Ne Üretildi?:** `usage()` ve hata mesajlarında `attempt-resume` belgelendi; `cmd_swarm_coordinator()` ve `cmd_swarm_quota()` alt komutları eklendi (`pause`, `resume`, `status`, `clear`, `attempt-resume`), yinelenen/çakışan `--action` bayraklarını (`--action` ve `--action=`) reddetme eklendi ve `pause` sonrası `--workspace` yolu `pwd -P` ile çözümlenerek `/event/swarm-quota-wait` bildirimi gönderildi.
@@ -103,8 +103,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Çok adımlı geliştirme sırasında kapsam disiplinini ve doğrulama kriterlerini sabitlemek için üretildi.
 
 ### `tests/test-command-hooks.sh` — [GÜNCELLENDİ] (`Komut Kancası Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_command_allowlist_and_bypass_guards` testi genişletildi (`bash <trusted>`, `>>/dev/null`, `>|/dev/null`, `&>/dev/null` izinleri; `#` kabuk yorumu içinde tırnak, `$'...'` ANSI-C tırnaklama, `RIPGREP_CONFIG_PATH`/`HOME`/`XDG_CONFIG_HOME`/`GIT_DIR`/`GIT_WORK_TREE`, `rg --hostname-bin`, `git --upload-pack`/`--receive-pack`, yasaklı `stamp-gate` alt komutları ve tüm önceki atlatma engelleri).
-- **Neden Değişti / Neden Üretildi?:** `pre-command-guard.sh` üzerinden yorum/ANSI-C ayrıştırması, `rg`/`env` açıkları ve yönlendirme sınırlarının mutasyonlara karşı kilitlenmesi için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_command_allowlist_and_bypass_guards` testi genişletildi (`bash <trusted>`, `>>/dev/null`, `>|/dev/null`, `&>/dev/null`, `git status ; # comment` izinleri; `\;#`/`\&#`/`\|#`/`a#;` yorum atlatma engelleri, `echo $'a'`/`echo $"a"`/`cat <(ls)` özgül red nedenleri, `git tag -l -d` & `git branch --unset-upstream`, `GIT_CONFIG_GLOBAL`/`GIT_SSH`/`GIT_EDITOR`/`LD_LIBRARY_PATH`, geçersiz/eksik `stamp-gate` eylemleri ve önceki atlatma engelleri).
+- **Neden Değişti / Neden Üretildi?:** `pre-command-guard.sh` üzerinden `at_token_start` yorum sınırını, izole sözdizimi nedenlerini ve git mutasyon bayraklarını mutasyonlara karşı kilitlemek için güncellendi.
 
 ### `tests/test-edit-and-session-hooks.sh` — [GÜNCELLENDİ] (`Dosya ve Oturum Testleri`)
 - **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_pre_edit_and_session_start` testi genişletildi (`/swarming` alt dizesinde yanlış pozitif olmaması, kardeş worktree ve `.harness/state/swarm/*` hedeflerinin aktif koordinatöre kapatılması, harici UI `plan.json` izni, `__default__` anahtarı ve bozuk JSON dayanıklılığı).
@@ -127,16 +127,16 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** `< 8192` bayt sıkıştırmaları sırasında yeni Swarm koordinatör ve kota kurallarının silinmemesini garanti altına almak için güncellendi.
 
 ### `tests/test-sidecar-daemon.sh` — [GÜNCELLENDİ] (`Sidecar Daemon Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_async_graphify_queue_and_coalescing` tek-uçuş (`single-flight` / `OVERLAP=0` / `rerunPending=1` bariyerli yeniden çalıştırma) ve `test_daemon_swarm_coordinator_parity_and_quota_auto_resume_watchdog` testleri (`HARNESS_DISABLE_DAEMON=1` yalıtımı, `watcherCycles` deterministik döngü kanıtı, `resumed` sonrası `lastSeenAt` yenilemesi, bayat `"resuming"`/bozuk `nextProbeEpoch` ve `30s` poll altında `/hook/stop-gate` geri çağrısının `4s` içinde `.status == "resumed"` tamamlaması) genişletildi.
-- **Neden Değişti / Neden Üretildi?:** Arka plan daemon'unun dinamik uyanma zaman aşımı ve geri çağrı ile `30s` poll beklemeden otomatik devam yürüttüğünü ve tek-uçuş graphify birleştirmesini çakışmasız işlettiğini kanıtlamak için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_daemon_lifecycle_health_permissions_and_standby` (`0755->0700` sıkılaştırma, sembolik bağ dizin/soket, uzun `sun_path`, yabancı UID ve aktif soket çakışma redleri; HTTP `404`/`400`; birincil süreç sonlandırıldığında yedek devralma), `test_async_graphify_queue_and_coalescing` tek-uçuş ve `test_daemon_swarm_coordinator_parity_and_quota_auto_resume_watchdog` (`lastSeenAt` yoklaması ve `30s` poll altında `/hook/stop-gate` `4s` uyandırma) testleri genişletildi.
+- **Neden Değişti / Neden Üretildi?:** Arka plan daemon'unun başlangıç güvenlik retlerini, gerçek yedek devralmayı ve kota/graphify eşzamanlılığını deterministik biçimde kanıtlamak için güncellendi.
 
 ### `tests/test-stamp-and-common.sh` — [GÜNCELLENDİ] (`Damga CLI Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_stamp_gate_swarm_coordinator_and_swarm_quota_cli` (`HARNESS_DISABLE_DAEMON=1`) testi genişletildi (eksik ikili/timeout `nextProbeEpoch` geri çekilmesi, kompakt `1h30m`/`3d4h`, `ghp_`/`AIza`/`Bearer` gizleme, `resumed` idempotency, `--action status` başarıları, serbest bırakma dosyası bariyerli 4 iş parçacıklı `attempt-resume` ve yapay gecikmeli 6 iş parçacıklı kilit çakışma testi).
-- **Neden Değişti / Neden Üretildi?:** Zaman aşımı geri çekilmesini, kompakt süreleri, `resumed` tekrarlanmama kilidini ve deterministik eşzamanlılığı doğrulamak için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_stamp_gate_swarm_coordinator_and_swarm_quota_cli` (`HARNESS_DISABLE_DAEMON=1`) testi genişletildi (`hours`/`minutes`/`seconds`/`hrs`/`mins`/`secs` + `resets in` cümle tercihi, varsayılan `--buffer-seconds=60`, `--flag=value` CLI biçimleri, kompakt `1h30m`/`3d4h`, `ghp_`/`AIza`/`Bearer` gizleme, `resumed` idempotency ve `threading.Event` kritik kesit kapılı deterministik `flock` dışlama/eşzamanlılık testleri).
+- **Neden Değişti / Neden Üretildi?:** Tüm süre birimlerini, CLI bayrak ayrıştırmasını, `resumed` tekrarlanmama kilidini ve `flock` kritik kesit dışlamasını mutasyonlara karşı kilitlemek için güncellendi.
 
 ### `tests/test-subagent-and-stop-hooks.sh` — [GÜNCELLENDİ] (`Alt Ajan ve Stop Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure_wait` ve `test_stop_gate_detects_coordinator_quota_error_without_looping` testleri genişletildi (`swarm(add)` ile otomatik kayıt, `off` sonrası `swarm(title)` ile yeniden etkinleştirme, işçi `title`/worktree dışlamaları, `integrator` türevleri, boş `conversationId` ile `force_ask` ve `_HARNESS_TEMP_TRACKER` temizliği).
-- **Neden Değişti / Neden Üretildi?:** Koordinatör yaşam döngüsü geçişlerini, alt ajan delegasyon sınırlarını ve `Stop` kancası kota tespitini tam kapsamlı doğrulamak için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure_wait` ve `test_stop_gate_detects_coordinator_quota_error_without_looping` testleri genişletildi (`swarm(add)` otomatik kayıt, `off` sonrası `swarm(title)`, aktif koordinatörsüz temiz depoda bağlı worktree `swarm(add)` dışlaması, `integrator` türevleri ve boş `conversationId` ile `force_ask`).
+- **Neden Değişti / Neden Üretildi?:** Bağlı worktree izolasyonunun başka koordinatör olmadan da bağımsız çalıştığını ve koordinatör yaşam döngüsünü tam doğrulamak için güncellendi.
 
 ---
 
@@ -145,11 +145,12 @@ sequenceDiagram
 | Senaryo / Kenar Durum | Sistemin Davranışı ve Korunan Kural (*Invariant*) | Üretilen Yanıt / Durum |
 | :--- | :--- | :--- |
 | **Düz metinde `"swarm"` kelimesi** | Yalnızca `/swarm` slash komutu (`SWARM_SLASH_CMD_RE`) veya `swarm-coordinator.json` kaydı koordinatör sayılır. | Normal görevlerde yanlış pozitif `deny` oluşmaz |
+| **Öncelik kuralı (`deny > force_ask`)** | `evaluate_pre_command` zincirdeki tüm segmentleri değerlendirir; erken `force_ask` sonraki `deny` kararını gizlemez. | `swarm-quota resume && rm -rf src` her zaman `deny` döner |
 | **Çakışan `--action` bayrak enjeksiyonu** | `_extract_stamp_gate_subcmd_and_actions` tüm eylem jetonlarını toplar (`> 1` -> `deny`); `stamp-gate.sh` de yinelenen `--action` bayrağında exit `1` verir. | `status --action off/clear/resume` bypass'ı çalışmaz |
 | **Sarmalayıcı, kümeleme ve `..` yol geçişi** | `_check_coordinator_raw_segments` `time`/`nohup`/`command`/`builtin` sarmalayıcılarını geçip iç `sudo`/`env -S`/tehlikeli env yakalar; `sort` `-o`/`-ro`/`--out=`/`--comp*` engeller; `_is_trusted_coordinator_exe` `..` ve `realpath` denetler. | `time sudo`, `time env -S`, `sort -ro` ve `/usr/bin/../../tmp/...` engellenir |
 | **Koordinatör `.harness/state/swarm/*` yazması** | `evaluate_pre_edit` içindeki `is_active_swarm_coordinator` kontrolü `.harness/` muafiyetinden önce çalışır; `stamp-gate.sh` kendini kapatma komutları engellenir. | Koordinatör kendi koruma dosyasını silemez veya değiştiremez |
 | **Uçuş içi yeniden pause & bayat `resuming`** | `attempt_swarm_quota_resume` benzersiz `resumingToken` ve kilit kullanır; `watcher_loop` `stale_threshold` aşımında bayat durumu devralır ve `resumed` sonrasında `lastSeenAt` yenilenir. | Uzun prob sırasında yeni `pause`/`clear` ezilmez; eşzamanlı prob yalnızca 1 `agy` başlatır |
-| **Kabuk `#` yorumu & `$'...'` ANSI-C** | `_tokenize_raw_segments` yorumları satır sonunda keser, `$'...'` ve `>|` ayrıştırır; `_has_unsafe_shell_syntax_for_coordinator` `$'...'`/`$"..."` reddeder. | Yorum içi tek tırnak ve `$'\''` kaçışı `rm -rf`'i gizleyemez |
+| **Kabuk `#` yorumu, kaçışlı `\;#` & `$'...'`** | `at_token_start` durumu kaçışlı sınırlayıcı/kelime içi `#` karakterini yorum saymaz; `_has_unsafe_shell_syntax_for_coordinator` `$'...'`/`$"..."` reddeder. | `echo \;#; rm -rf src` gizlenemez; gerçek `; #` yorumu geçer |
 | **Haftalık beklemelerde daemon ömrü** | `has_active_swarm_quota_wait(ws)` True iken `_load_registry` ve `watcher_loop` TTL eviction atlar; `watcher_loop` en yakın prob süresine göre `wait_timeout` kısaltır. | 5 saatlik / 7 günlük beklemelerde kayıt silinmez ve zamanında uyanır |
 
 ---
@@ -157,7 +158,7 @@ sequenceDiagram
 ## 5. Somut Doğrulama Kanıtları
 
 1. **Tam Depo Test Paketi (`./scripts/run-quiet.sh full-tests -- ./tests/run-all.sh`):**
-   `✅ PASS [full-tests] (süre: 408.6s, warnings: 0 — log: .harness/logs/last.log)` — **9/9 paket, 108/108 test, 0 hata:**
+   `✅ PASS [full-tests] (süre: 395.3s, warnings: 0 — log: .harness/logs/last.log)` — **9/9 paket, 108/108 test, 0 hata:**
    - `tests/test-command-hooks.sh`: `14 passed, 0 failed`
    - `tests/test-edit-and-session-hooks.sh`: `14 passed, 0 failed`
    - `tests/test-manifest.sh`: `9 passed, 0 failed`

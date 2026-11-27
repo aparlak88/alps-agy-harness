@@ -90,6 +90,7 @@ test_daemon_lifecycle_health_permissions_and_standby() {
   _TD_DIRS+=("$sock_dir" "$data_dir")
   sock_path="$sock_dir/d.sock"
 
+  chmod 0755 "$sock_dir"
   touch "$sock_path"
 
   HARNESS_DAEMON_SOCK="$sock_path" \
@@ -105,13 +106,27 @@ test_daemon_lifecycle_health_permissions_and_standby() {
   local dir_perm sock_perm
   dir_perm=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$sock_dir")
   sock_perm=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$sock_path")
-  assert_eq "0o700" "$dir_perm" "Socket dir must have 0700 permissions"
+  assert_eq "0o700" "$dir_perm" "Daemon must harden 0755 socket dir to 0700"
   assert_eq "0o600" "$sock_perm" "Socket file must have 0600 permissions"
 
-  local health_json
+  local health_json http_404 http_400
   health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
   assert_json_field "$health_json" ".status" "ok"
   assert_json_field "$health_json" ".pid" "$dpid1"
+  http_404=$(curl -s -o /dev/null -w "%{http_code}" --unix-socket "$sock_path" "http://localhost/unknown")
+  assert_eq "404" "$http_404" "Unknown GET route must return 404"
+  http_400=$(curl -s -o /dev/null -w "%{http_code}" --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST -d '{bad' "http://localhost/event/swarm-quota-wait")
+  assert_eq "400" "$http_400" "Malformed JSON POST must return 400"
+
+  # I5: Already-served socket under separate data_dir must be refused cleanly
+  local alt_data_dir
+  alt_data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d1-alt.XXXXXX")
+  _TD_DIRS+=("$alt_data_dir")
+  if HARNESS_DAEMON_SOCK="$sock_path" HARNESS_DAEMON_DATA_DIR="$alt_data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
+    echo "Daemon must refuse starting when socket is already served by a live instance" >&2
+    return 1
+  fi
 
   HARNESS_DAEMON_SOCK="$sock_path" \
   HARNESS_DAEMON_DATA_DIR="$data_dir" \
@@ -121,20 +136,90 @@ test_daemon_lifecycle_health_permissions_and_standby() {
   dpid2=$!
   _TD_PIDS+=("$dpid2")
 
-  sleep 0.5
+  # I6: Wait until dpid2 enters passive standby, kill PRIMARY first, and assert real failover to dpid2
+  local sb_tries=0
+  while [ "$sb_tries" -lt 40 ]; do
+    if grep -q "waiting in passive standby" "$data_dir/daemon.log" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+    sb_tries=$((sb_tries + 1))
+  done
+  grep -q "waiting in passive standby" "$data_dir/daemon.log" 2>/dev/null \
+    || { echo "Secondary daemon did not enter passive standby" >&2; return 1; }
   kill -0 "$dpid2" 2>/dev/null || { echo "Secondary daemon must stay alive in passive standby" >&2; return 1; }
-
-  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
-  assert_json_field "$health_json" ".pid" "$dpid1"
-
-  kill -TERM "$dpid2" 2>/dev/null || true
-  wait "$dpid2" 2>/dev/null || true
 
   kill -TERM "$dpid1" 2>/dev/null || true
   wait "$dpid1" 2>/dev/null || true
 
+  local fo_tries=0 fo_pid=""
+  while [ "$fo_tries" -lt 40 ]; do
+    fo_pid=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" 2>/dev/null | jq -r '.pid // empty' || true)
+    if [ "$fo_pid" = "$dpid2" ]; then
+      break
+    fi
+    sleep 0.1
+    fo_tries=$((fo_tries + 1))
+  done
+  assert_eq "$dpid2" "$fo_pid" "Standby daemon dpid2 must take over /health after primary dpid1 terminates"
+
+  kill -TERM "$dpid2" 2>/dev/null || true
+  wait "$dpid2" 2>/dev/null || true
+
   [ ! -S "$sock_path" ] || { echo "Socket file should be unlinked on graceful SIGTERM" >&2; return 1; }
   [ ! -f "$sock_dir/d.pid" ] || { echo "PID file should be removed on graceful SIGTERM" >&2; return 1; }
+
+  # I5: Startup security refusals (symlink dir, symlink socket, over-long sun_path, foreign UID owner)
+  local sec_base sym_dir_target sym_dir sym_sock_dir sym_sock_target long_dir
+  sec_base=$(mktemp -d "/tmp/hd-sec.XXXXXX")
+  _TD_DIRS+=("$sec_base")
+  sym_dir_target="$sec_base/real_dir"
+  mkdir -p "$sym_dir_target"
+  sym_dir="$sec_base/sym_dir"
+  ln -s "$sym_dir_target" "$sym_dir"
+  if HARNESS_DAEMON_SOCK="$sym_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
+    echo "Daemon must refuse symlinked socket directory" >&2
+    return 1
+  fi
+
+  sym_sock_dir="$sec_base/real_sock_dir"
+  mkdir -p "$sym_sock_dir" && chmod 0700 "$sym_sock_dir"
+  sym_sock_target="$sec_base/evil.target"
+  touch "$sym_sock_target"
+  ln -s "$sym_sock_target" "$sym_sock_dir/d.sock"
+  if HARNESS_DAEMON_SOCK="$sym_sock_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
+    echo "Daemon must refuse symlinked socket file" >&2
+    return 1
+  fi
+
+  long_dir="/tmp/hd-long-$(python3 -c 'print("x"*105)')"
+  if HARNESS_DAEMON_SOCK="$long_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
+    echo "Daemon must refuse over-long Unix socket path on macOS" >&2
+    return 1
+  fi
+
+  SEC_DIR="$sym_sock_dir" PYTHONPATH="$REPO_ROOT/sidecars/harness-daemon" python3 - << 'PYEOF'
+import os, pathlib, types
+import daemon
+
+orig_lstat = pathlib.Path.lstat
+def fake_lstat(self):
+    res = orig_lstat(self)
+    return types.SimpleNamespace(st_mode=res.st_mode, st_uid=os.getuid() + 1)
+
+pathlib.Path.lstat = fake_lstat
+try:
+    try:
+        daemon.validate_and_prepare_socket_dir(pathlib.Path(os.environ["SEC_DIR"]) / "d.sock")
+        raise AssertionError("Expected PermissionError for foreign UID socket dir")
+    except PermissionError:
+        pass
+finally:
+    pathlib.Path.lstat = orig_lstat
+PYEOF
 }
 
 test_daemon_on_vs_off_hook_parity() {
@@ -1570,9 +1655,8 @@ EOF
   jq '.status = "resuming" | .resumingStartedAtEpoch = 1 | .resumingToken = "stale-tok"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
   _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
     || { echo "Daemon failed to recover stale resuming state: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
-  local refreshed_seen
-  refreshed_seen=$(jq -r --arg ws "$real_repo" '.workspaces[$ws].lastSeenAt | floor' "$data_dir/workspaces.json")
-  [ "$refreshed_seen" -gt 1000000000 ] || { echo "Daemon must refresh & persist lastSeenAt after resume (got $refreshed_seen)" >&2; return 1; }
+  _wait_for_file_jq "$data_dir/workspaces.json" ".workspaces[\"$real_repo\"].lastSeenAt > 1000000000" 30 \
+    || { echo "Daemon must refresh & persist lastSeenAt after resume: $(cat "$data_dir/workspaces.json" 2>/dev/null || true)" >&2; return 1; }
 
   jq '.status = "waiting" | .nextProbeEpoch = "not-a-number"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
   _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
