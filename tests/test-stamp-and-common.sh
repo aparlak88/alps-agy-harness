@@ -1451,6 +1451,9 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
   out_defbuf=$("$STAMP_GATE" swarm-quota pause --workspace="$repo" --conversation-id="conv-eq" --wait-seconds=100 --window=5h --model="gemini-4-neon-high" --reason="eq-test" --member="m-eq")
   assert_json_field "$out_defbuf" ".recommendedScheduleSeconds" "160" "Default buffer_seconds must be 60 when --buffer-seconds omitted"
   assert_json_field "$out_defbuf" ".conversationId" "conv-eq"
+  assert_json_field "$out_defbuf" ".model" "gemini-4-neon-high"
+  assert_json_field "$out_defbuf" ".reason" "eq-test"
+  assert_json_field "$out_defbuf" '.pausedMembers | join(",")' "m-eq"
   assert_json_field "$("$STAMP_GATE" swarm-coordinator on --workspace="$repo" --conversation-id="conv-eq" --title="Eq Title")" ".title" "Eq Title"
   "$STAMP_GATE" swarm-coordinator off --workspace="$repo" --conversation-id="conv-eq" >/dev/null
   "$STAMP_GATE" swarm-quota clear --workspace="$repo" >/dev/null
@@ -1519,18 +1522,36 @@ test_stamp_gate_swarm_coordinator_and_swarm_quota_cli() {
   mock_agy="$mock_dir/mock-agy"
   env_log="$mock_dir/agy-env.log"
 
-  # (a) Empty conversationId & dash-prefixed conversationId (arg-injection guard)
+  # (a) Empty conversationId & dash-prefixed conversationId (arg-injection guard + I3 backoff)
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --wait-seconds 0 --buffer-seconds 0 >/dev/null
-  local out_empty_cid
-  out_empty_cid=$("$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  local before_empty out_empty_cid out_empty_cid2 ep_empty first_empty_at
+  before_empty=$(date +%s)
+  out_empty_cid=$(HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="60" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
   assert_json_field "$out_empty_cid" ".status" "waiting"
   assert_contains "$(printf '%s' "$out_empty_cid" | jq -r '.lastAttemptError')" "conversationId"
+  ep_empty=$(printf '%s' "$out_empty_cid" | jq -r '.nextProbeEpoch | floor')
+  [ "$ep_empty" -ge $((before_empty + 55)) ] || { echo "Empty cid backoff nextProbeEpoch too small: $ep_empty vs $before_empty" >&2; return 1; }
+  [ -n "$(printf '%s' "$out_empty_cid" | jq -r '.resumeAt')" ] || { echo "Expected resumeAt on empty cid backoff" >&2; return 1; }
+  first_empty_at=$(printf '%s' "$out_empty_cid" | jq -r '.lastAttemptAt')
+  out_empty_cid2=$(HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="60" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_empty_cid2" ".status" "waiting"
+  assert_json_field "$out_empty_cid2" ".nextProbeEpoch" "$(printf '%s' "$out_empty_cid" | jq -r '.nextProbeEpoch')"
+  assert_json_field "$quota_file" ".lastAttemptAt" "$first_empty_at" "Immediate retry after invalid cid must respect backoff without mutating lastAttemptAt"
 
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "-evil-flag" --wait-seconds 0 --buffer-seconds 0 >/dev/null
-  local out_dash_cid
-  out_dash_cid=$("$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  local before_dash out_dash_cid out_dash_cid2 ep_dash first_dash_at
+  before_dash=$(date +%s)
+  out_dash_cid=$(HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="60" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
   assert_json_field "$out_dash_cid" ".status" "waiting"
   assert_contains "$(printf '%s' "$out_dash_cid" | jq -r '.lastAttemptError')" "conversationId"
+  ep_dash=$(printf '%s' "$out_dash_cid" | jq -r '.nextProbeEpoch | floor')
+  [ "$ep_dash" -ge $((before_dash + 55)) ] || { echo "Dash cid backoff nextProbeEpoch too small: $ep_dash vs $before_dash" >&2; return 1; }
+  [ -n "$(printf '%s' "$out_dash_cid" | jq -r '.resumeAt')" ] || { echo "Expected resumeAt on dash cid backoff" >&2; return 1; }
+  first_dash_at=$(printf '%s' "$out_dash_cid" | jq -r '.lastAttemptAt')
+  out_dash_cid2=$(HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="60" "$STAMP_GATE" swarm-quota attempt-resume --workspace "$repo")
+  assert_json_field "$out_dash_cid2" ".status" "waiting"
+  assert_json_field "$out_dash_cid2" ".nextProbeEpoch" "$(printf '%s' "$out_dash_cid" | jq -r '.nextProbeEpoch')"
+  assert_json_field "$quota_file" ".lastAttemptAt" "$first_dash_at" "Immediate retry after dash cid must respect backoff without mutating lastAttemptAt"
 
   # (b) Missing agy binary -> waiting + backoff nextProbeEpoch
   "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-r" --wait-seconds 0 --buffer-seconds 0 >/dev/null
@@ -2013,7 +2034,10 @@ coord_status = harness_core.get_swarm_coordinator_status(ws, conversation_id="co
 workers = set(coord_status.get("workers", []))
 assert {"w-gate", "w-peer", *(f"w-{i}" for i in range(6))}.issubset(workers), coord_status
 
-# Reason truncation (<= 500 chars) and negative wait_seconds validation
+# Reason truncation (<= 500 chars), negative wait_seconds validation, and _safe_float non-finite guard
+assert harness_core._safe_float("nan", 7.5) == 7.5
+assert harness_core._safe_float("inf", 7.5) == 7.5
+assert harness_core._safe_float("-inf", 7.5) == 7.5
 import tempfile
 with tempfile.TemporaryDirectory() as tmp_q:
     tmp_ws = Path(tmp_q)

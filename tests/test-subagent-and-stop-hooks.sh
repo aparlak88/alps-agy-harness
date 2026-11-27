@@ -967,6 +967,55 @@ test_parallel_subagent_dispatch_locking_and_sibling_worktree_discovery() {
     return 1
   }
 
+  # 2b. I5: Deterministic threading.Event barrier proof for dispatch_register flock mutual exclusion
+  DISPATCH_REPO="$main_repo" PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import os, threading
+from pathlib import Path
+import harness_core
+
+ws = Path(os.environ["DISPATCH_REPO"])
+t1_in = threading.Event()
+t1_rel = threading.Event()
+t2_in = threading.Event()
+orig_read = harness_core.read_json_file
+t1_tid = None
+
+def gated_dispatch_read(path: Path):
+    data = orig_read(path)
+    if path.name == "subagent-dispatch.json":
+        cur = threading.get_ident()
+        if t1_tid is not None and cur == t1_tid and not t1_in.is_set():
+            t1_in.set()
+            assert t1_rel.wait(timeout=5), "Timed out releasing dispatch lock gate"
+        elif t1_tid is not None and cur != t1_tid:
+            t2_in.set()
+    return data
+
+def hold_dispatch():
+    global t1_tid
+    t1_tid = threading.get_ident()
+    harness_core.dispatch_register(ws, "BarrierRoleA", "self", "bounded_execution", "inherit", "")
+
+harness_core.read_json_file = gated_dispatch_read
+try:
+    th1 = threading.Thread(target=hold_dispatch)
+    th1.start()
+    assert t1_in.wait(timeout=5), "Thread 1 did not enter dispatch flock critical section"
+    th2 = threading.Thread(target=lambda: harness_core.dispatch_register(ws, "BarrierRoleB", "self", "bounded_execution", "inherit", ""))
+    th2.start()
+    assert not t2_in.wait(timeout=0.25), "Thread 2 entered subagent-dispatch read while Thread 1 held flock!"
+    t1_rel.set()
+    th1.join(timeout=5)
+    th2.join(timeout=5)
+    assert not th1.is_alive() and not th2.is_alive()
+finally:
+    harness_core.read_json_file = orig_read
+
+disp = orig_read(harness_core.get_state_dir(ws) / "subagent-dispatch.json")
+entries = disp.get("entries", {})
+assert "BarrierRoleA" in entries and "BarrierRoleB" in entries, entries
+PYEOF
+
   # 3. Sibling worktree discovery: Prompt-mentioned worktree first, then git worktree list fallback
   wt_parent=$(mktemp -d "${TMPDIR:-/tmp}/harness-wt-sub.XXXXXX")
   echo "$wt_parent" >> "$_HARNESS_TEMP_TRACKER"

@@ -229,7 +229,9 @@ EOF
     "yarn --cwd app add lodash|lodash" \
     "uv add --directory app requests|requests" \
     "uv --directory app add requests|requests" \
-    "cargo add --manifest-path app/Cargo.toml serde|serde"
+    "cargo add --manifest-path app/Cargo.toml serde|serde" \
+    "sudo -u root npm install left-pad|left-pad" \
+    "sudo -g wheel npm install left-pad|left-pad"
   do
     pkg_cmd="${pkg_case%%|*}"
     pkg_expected="${pkg_case#*|}"
@@ -256,6 +258,41 @@ for tokens, expected in cases:
     got = harness_core.extract_install_packages(tokens)
     assert got == expected, (tokens, got, expected)
 PYEOF
+
+  # 9. I1: Behavioural directory-flag resolution against linked worktree with distinct Context7 state
+  local wt_pkg_root wt_pkg pkg_name wt_cmd out_wt
+  wt_pkg_root=$(mktemp -d "${TMPDIR:-/tmp}/harness-pkg-wt.XXXXXX")
+  echo "$wt_pkg_root" >> "$_HARNESS_TEMP_TRACKER"
+  wt_pkg="$wt_pkg_root/wt"
+  git -C "$repo" worktree add "$wt_pkg" -b "feat/pkg-wt" --quiet
+  touch "$wt_pkg/Cargo.toml"
+  for pkg_name in axios dayjs lodash requests serde; do
+    "$STAMP_GATE" context7 --package "$pkg_name" --version 1.0.0 --source locked --workspace "$wt_pkg" >/dev/null
+  done
+  for wt_cmd in \
+    "npm --prefix \"$wt_pkg\" install axios" \
+    "npm --prefix=\"$wt_pkg\" install axios" \
+    "pnpm --dir \"$wt_pkg\" add dayjs" \
+    "pnpm --dir=\"$wt_pkg\" add dayjs" \
+    "pnpm -C \"$wt_pkg\" add dayjs" \
+    "yarn --cwd \"$wt_pkg\" add lodash" \
+    "yarn --cwd=\"$wt_pkg\" add lodash" \
+    "uv --directory \"$wt_pkg\" add requests" \
+    "uv --directory=\"$wt_pkg\" add requests" \
+    "uv add --project \"$wt_pkg\" requests" \
+    "uv add --project=\"$wt_pkg\" requests" \
+    "cargo add --manifest-path \"$wt_pkg/Cargo.toml\" serde" \
+    "cargo add --manifest-path=\"$wt_pkg/Cargo.toml\" serde"
+  do
+    out_wt=$(jq -nc --arg ws "$repo" --arg cmd "$wt_cmd" \
+      '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_wt" ".decision" "allow" "Directory-flagged install stamped in linked worktree must be allowed: $wt_cmd"
+  done
+  out_wt=$(jq -nc --arg ws "$repo" --arg cmd "npm --prefix \"$wt_pkg\" install left-pad" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_wt" ".decision" "deny" "Unstamped package in linked worktree must still be denied"
 }
 
 test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
@@ -318,7 +355,13 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "sudo git push origin main" \
     "nohup git push origin main" \
     "time git push origin main" \
-    "builtin git push origin main"
+    "builtin git push origin main" \
+    "time -p git push origin main" \
+    "command -p git push origin main" \
+    "/usr/bin/sudo git push origin main" \
+    "/usr/bin/env git push origin main" \
+    "sudo -u root git push origin main" \
+    "sudo -g wheel git push origin main"
   do
     out_bypass_push=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_push_cmd" \
       '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
@@ -1662,6 +1705,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "BASH_ENV=/tmp/x git status" \
     "PYTHONPATH=/tmp/x git status" \
     "GIT_PAGER=evil git log" \
+    "GIT_ASKPASS=/tmp/x git status" \
+    "GIT_CONFIG_COUNT=1 git status" \
+    "EDITOR=vim git status" \
+    "CDPATH=/tmp git status" \
+    "git branch --edit-description" \
     "sudo git status" \
     "/usr/bin/sudo git status" \
     "time sudo git status" \

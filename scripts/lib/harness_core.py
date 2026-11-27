@@ -609,29 +609,45 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
         if "=" in tok and tok.split("=", 1)[0].isidentifier():
             idx += 1
             continue
-        if tok == "sudo":
+        base = os.path.basename(tok)
+        if base == "sudo":
             idx += 1
             while idx < len(tokens) and tokens[idx].startswith("-"):
-                if tokens[idx] in ("-u", "-g", "-h", "-p", "-U"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                if tokens[idx] in ("-u", "-g", "-h", "-p", "-U", "-C", "-T", "-r", "-t"):
                     idx += 2
                 else:
                     idx += 1
             continue
-        if tok == "env":
+        if base == "env":
             idx += 1
             while idx < len(tokens):
-                if tokens[idx].startswith("-"):
-                    if tokens[idx] in ("-u", "-C", "-S"):
-                        idx += 2
-                    else:
-                        idx += 1
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                if tokens[idx] in ("-u", "-C", "-S", "-P"):
+                    idx += 2
+                elif tokens[idx].startswith("-"):
+                    idx += 1
                 elif "=" in tokens[idx] and tokens[idx].split("=", 1)[0].isidentifier():
                     idx += 1
                 else:
                     break
             continue
-        if tok in ("nohup", "time", "builtin", "command"):
+        if base in ("time", "command"):
             idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                idx += 1
+            continue
+        if base in ("nohup", "builtin"):
+            idx += 1
+            if idx < len(tokens) and tokens[idx] == "--":
+                idx += 1
             continue
         break
 

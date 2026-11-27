@@ -1076,6 +1076,14 @@ print(dt)
   health_after=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
   assert_json_field "$health_after" ".pid" "$dpid" "Singleton daemon PID must remain unchanged across concurrent calls"
 
+  # I4: Starting daemon directly with HARNESS_DAEMON_EXIT_ON_LOCK_BUSY=1 while lock is held exits 0 and logs clean exit
+  HARNESS_DAEMON_SOCK="$sock_path" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_DAEMON_EXIT_ON_LOCK_BUSY=1 \
+    python3 -B "$DAEMON_PY" || { echo "Expected exit 0 when HARNESS_DAEMON_EXIT_ON_LOCK_BUSY=1 encounters busy lock" >&2; return 1; }
+  grep -q "auto-start helper exiting cleanly" "$data_dir/daemon.log" || {
+    echo "Expected busy-lock exit log line in $data_dir/daemon.log" >&2
+    return 1
+  }
+
   # HARNESS_DISABLE_DAEMON=1 must never auto-start even when HARNESS_AUTO_START_DAEMON=1
   local sock_disabled="$sock_dir/disabled.sock"
   local out_disabled

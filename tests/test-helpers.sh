@@ -140,10 +140,10 @@ run_tests() {
 
     if [ "$status" -eq 0 ]; then
       echo "PASS"
-      ((passed++))
+      passed=$((passed + 1))
     else
       echo "FAIL"
-      ((failed++))
+      failed=$((failed + 1))
       if [ -n "$output" ]; then
         echo "$output" | sed 's/^/    /' >&2
       fi
