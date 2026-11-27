@@ -616,7 +616,11 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
                 if tokens[idx] == "--":
                     idx += 1
                     break
-                if tokens[idx] in ("-u", "-g", "-h", "-p", "-U", "-C", "-T", "-r", "-t"):
+                if tokens[idx] in (
+                    "-u", "-g", "-h", "-p", "-U", "-C", "-T", "-r", "-t", "-D",
+                    "--user", "--group", "--host", "--prompt", "--other-user",
+                    "--close-from", "--command-timeout", "--role", "--type", "--chdir",
+                ):
                     idx += 2
                 else:
                     idx += 1
@@ -627,7 +631,11 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
                 if tokens[idx] == "--":
                     idx += 1
                     break
-                if tokens[idx] in ("-u", "-C", "-S", "-P"):
+                if tokens[idx] in (
+                    "-u", "-C", "-S", "-P",
+                    "--unset", "--chdir", "--split-string",
+                    "--block-signal", "--default-signal", "--ignore-signal",
+                ):
                     idx += 2
                 elif tokens[idx].startswith("-"):
                     idx += 1

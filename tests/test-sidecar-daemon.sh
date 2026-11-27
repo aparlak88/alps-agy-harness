@@ -118,6 +118,48 @@ test_daemon_lifecycle_health_permissions_and_standby() {
   http_400=$(curl -s -o /dev/null -w "%{http_code}" --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST -d '{bad' "http://localhost/event/swarm-quota-wait")
   assert_eq "400" "$http_400" "Malformed JSON POST must return 400"
 
+  # I4: HTTP 413 oversized request, 400 non-numeric Content-Length, 400 non-object JSON body, and 404 unknown POST route
+  DAEMON_SOCK_CHECK="$sock_path" python3 - << 'PYEOF'
+import os, socket
+
+sock_path = os.environ["DAEMON_SOCK_CHECK"]
+
+def send_raw(req_bytes: bytes) -> tuple[int, str]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(5.0)
+        s.connect(sock_path)
+        s.sendall(req_bytes)
+        chunks = []
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    resp = b"".join(chunks).decode("utf-8", errors="replace")
+    status = int(resp.split(" ", 2)[1])
+    return status, resp
+
+st_413, _ = send_raw(
+    b"POST /hook/pre-command HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2097153\r\nConnection: close\r\n\r\n"
+)
+assert st_413 == 413, f"Expected 413 for > MAX_REQUEST_BYTES, got {st_413}"
+
+st_nan, _ = send_raw(
+    b"POST /hook/pre-command HTTP/1.1\r\nHost: localhost\r\nContent-Length: notanumber\r\nConnection: close\r\n\r\n"
+)
+assert st_nan == 400, f"Expected 400 for non-numeric Content-Length, got {st_nan}"
+
+st_arr, _ = send_raw(
+    b"POST /hook/pre-command HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 5\r\nConnection: close\r\n\r\n[1,2]"
+)
+assert st_arr == 400, f"Expected 400 for non-object JSON array, got {st_arr}"
+
+st_404, resp_404 = send_raw(
+    b'POST /unknown-post-route HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{"workspace":"/tmp"}'
+)
+assert st_404 == 404 and "not_found" in resp_404, (st_404, resp_404)
+PYEOF
+
   # I5: Already-served socket under separate data_dir must be refused cleanly
   local alt_data_dir
   alt_data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d1-alt.XXXXXX")
@@ -195,6 +237,10 @@ test_daemon_lifecycle_health_permissions_and_standby() {
   fi
 
   long_dir="/tmp/hd-long-$(python3 -c 'print("x"*105)')"
+  local long_err
+  long_err=$(HARNESS_DAEMON_SOCK="$long_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" 2>&1 || true)
+  assert_contains "$long_err" "sun_path limit" "Over-long socket path must fail with explicit sun_path limit guard"
   if HARNESS_DAEMON_SOCK="$long_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
     python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
     echo "Daemon must refuse over-long Unix socket path on macOS" >&2
@@ -463,6 +509,57 @@ print(dt)
   assert_eq "2" "$(grep -c '^START:' "$call_log" || true)" "Expected 1 initial run + 1 coalesced rerun"
   assert_eq "2" "$(grep -c '^END:' "$call_log" || true)" "Expected 2 completed runs"
   assert_eq "0" "$(grep -c '^OVERLAP' "$call_log" || true)" "Single-flight runs must never overlap"
+
+  # I5: Non-zero exit and non-executable binary failure paths for graphify + exception cleanup of _quota_resume_inflight
+  cat << 'EOF' > "$mock_graphify"
+#!/usr/bin/env bash
+echo "boom-42" >&2
+exit 42
+EOF
+  chmod +x "$mock_graphify"
+  curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST \
+    --data-binary "$(jq -nc --arg ws "$repo" '{workspace: $ws, reason: "fail-rc"}')" \
+    "http://localhost/event/graphify" >/dev/null
+  _wait_for_file_jq "$repo/.harness/cache/graphify-status.json" '.reason == "fail-rc" and .state == "failed" and .exitCode == 42' 60 || {
+    echo "Expected failed state with exitCode 42 on non-zero graphify mock" >&2
+    return 1
+  }
+  grep -q "boom-42" "$repo/.harness/logs/graphify-hook.log" || {
+    echo "Expected boom-42 output in graphify-hook.log" >&2
+    return 1
+  }
+
+  chmod 0644 "$mock_graphify"
+  curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST \
+    --data-binary "$(jq -nc --arg ws "$repo" '{workspace: $ws, reason: "fail-exec"}')" \
+    "http://localhost/event/graphify" >/dev/null
+  _wait_for_file_jq "$repo/.harness/cache/graphify-status.json" '.reason == "fail-exec" and .state == "failed" and .exitCode == 1' 60 || {
+    echo "Expected failed state with exitCode 1 on non-executable graphify mock" >&2
+    return 1
+  }
+  grep -q "graphify invocation failed:" "$repo/.harness/logs/graphify-hook.log" || {
+    echo "Expected graphify invocation failed error in graphify-hook.log" >&2
+    return 1
+  }
+
+  PYTHONPATH="$REPO_ROOT/sidecars/harness-daemon:$REPO_ROOT/scripts/lib" DAEMON_DATA="$data_dir" python3 - << 'PYEOF'
+import os, pathlib
+import daemon, harness_core
+
+ddir = pathlib.Path(os.environ["DAEMON_DATA"])
+st = daemon.HarnessDaemonState(ddir, daemon.DaemonLogger(ddir / "exc-test.log"), False)
+ws_key = "/tmp/exc-ws"
+st._quota_resume_inflight.add(ws_key)
+orig_attempt = harness_core.attempt_swarm_quota_resume
+def boom(_ws):
+    raise RuntimeError("injected resume boom")
+harness_core.attempt_swarm_quota_resume = boom
+try:
+    st._run_swarm_quota_resume(ws_key)
+finally:
+    harness_core.attempt_swarm_quota_resume = orig_attempt
+assert ws_key not in st._quota_resume_inflight, "Exception in _run_swarm_quota_resume must clear _quota_resume_inflight"
+PYEOF
 }
 
 test_tree_state_and_stale_stamp_safety() {

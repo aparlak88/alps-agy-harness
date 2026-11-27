@@ -361,13 +361,64 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "/usr/bin/sudo git push origin main" \
     "/usr/bin/env git push origin main" \
     "sudo -u root git push origin main" \
-    "sudo -g wheel git push origin main"
+    "sudo -g wheel git push origin main" \
+    "sudo --user root git push origin main" \
+    "sudo --group wheel git push origin main" \
+    "sudo -h host1 git push origin main" \
+    "sudo -- git push origin main" \
+    "env -u HOME git push origin main" \
+    "env --unset HOME git push origin main" \
+    "env -C /tmp git push origin main" \
+    "env --chdir /tmp git push origin main" \
+    "env -P /usr/bin git push origin main" \
+    "env -- git push origin main" \
+    "time -- git push origin main" \
+    "command -- git push origin main" \
+    "nohup -- git push origin main" \
+    "builtin -- git push origin main"
   do
     out_bypass_push=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_push_cmd" \
       '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
       | "$PRE_COMMAND_GUARD")
     assert_json_field "$out_bypass_push" ".decision" "deny" "Wrapper/ANSI-C push to main must be denied: $bypass_push_cmd"
   done
+
+  # 5c. I2: cd before '&' or '|' must not shift git push cwd into feature branch, plus cd -P/--/-/~/bare unit checks
+  local wt_cd_root wt_cd out_cd_bg out_cd_pipe
+  wt_cd_root=$(mktemp -d "${TMPDIR:-/tmp}/harness-cd-wt.XXXXXX")
+  echo "$wt_cd_root" >> "$_HARNESS_TEMP_TRACKER"
+  wt_cd="$wt_cd_root/wt-cd"
+  git -C "$repo" worktree add "$wt_cd" -b "feat/cd-bg" --quiet
+  out_cd_bg=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$wt_cd\" & git push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_cd_bg" ".decision" "deny" "cd before '&' must not move git push off main"
+  out_cd_pipe=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$wt_cd\" | git push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_cd_pipe" ".decision" "deny" "cd before '|' must not move git push off main"
+
+  CD_BASE="$wt_cd_root" PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import os
+from pathlib import Path
+import harness_core
+
+base = Path(os.environ["CD_BASE"])
+sub1 = base / "sub1"
+sub2 = base / "sub2"
+sub1.mkdir(parents=True, exist_ok=True)
+sub2.mkdir(parents=True, exist_ok=True)
+real_base = Path(os.path.realpath(str(base)))
+real_sub1 = Path(os.path.realpath(str(sub1)))
+real_sub2 = Path(os.path.realpath(str(sub2)))
+
+segs = harness_core.iter_command_segments_with_cwd(
+    f"cd -P {sub1} && cd -- {sub2} && cd - && cd ~ && cd && pwd",
+    base,
+)
+cwds = [cwd for _, cwd in segs]
+assert cwds == [real_base, real_sub1, real_sub2, real_sub1, Path.home(), Path.home()], cwds
+PYEOF
 
   # 6. On feature branch, git push origin feature-x -> allow
   git -C "$repo" checkout -b "feature-x" --quiet
@@ -1638,6 +1689,9 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "git status >|/dev/null" \
     "git status &>/dev/null" \
     "git status ; # harmless comment" \
+    "ls # a > b" \
+    "gh pr view 1" \
+    "gh issue list" \
     "./scripts/stamp-gate.sh swarm-quota pause --workspace \"$repo\" --conversation-id \"conv-coord\" --wait-seconds 60" \
     "./scripts/stamp-gate.sh dispatch --workspace \"$repo\" --role explorer" \
     "./scripts/stamp-gate.sh select-model --workspace \"$repo\" --tier pro" \
@@ -1707,9 +1761,23 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "GIT_PAGER=evil git log" \
     "GIT_ASKPASS=/tmp/x git status" \
     "GIT_CONFIG_COUNT=1 git status" \
+    "GIT_SEQUENCE_EDITOR=evil git status" \
+    "GIT_CONFIG_SYSTEM=/tmp/x git status" \
+    "GIT_TEMPLATE_DIR=/tmp/x git status" \
+    "DYLD_LIBRARY_PATH=/tmp git status" \
+    "ENV=/tmp/x git status" \
+    "PAGER=evil git log" \
+    "VISUAL=vim git status" \
     "EDITOR=vim git status" \
     "CDPATH=/tmp git status" \
     "git branch --edit-description" \
+    "echo a# > README.md" \
+    'echo a#$(id)' \
+    "echo x >/dev/nullx" \
+    "env --split-string='rm -rf src' git status" \
+    "env --split-string 'rm -rf src' git status" \
+    "env -iS 'rm -rf src' git status" \
+    "env -vS 'rm -rf src' git status" \
     "sudo git status" \
     "/usr/bin/sudo git status" \
     "time sudo git status" \
@@ -1908,6 +1976,22 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     '{workspacePaths: [$ws], conversationId: "conv-worker", lastUserInput: "[SWARM_WORKER_CONTRACT] run tests", toolCall: {name: "run_command", args: {CommandLine: "git status && npm test"}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_worker" ".decision" "allow" "Swarm worker must be allowed to run tests and normal commands"
+
+  # I3: Trusted bin symlink escaping into /tmp must fail _is_trusted_coordinator_exe
+  PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import os
+import harness_core
+
+orig_lexists = os.path.lexists
+orig_realpath = os.path.realpath
+try:
+    os.path.lexists = lambda p: True if p == "/usr/local/bin/cat" else orig_lexists(p)
+    os.path.realpath = lambda p: "/tmp/evil/cat" if p == "/usr/local/bin/cat" else orig_realpath(p)
+    assert harness_core._is_trusted_coordinator_exe("/usr/local/bin/cat") is False
+finally:
+    os.path.lexists = orig_lexists
+    os.path.realpath = orig_realpath
+PYEOF
 }
 
 run_tests
