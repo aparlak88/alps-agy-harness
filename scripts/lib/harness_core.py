@@ -1055,12 +1055,11 @@ def _is_shell_builtin_cd(raw_words: list[tuple[str, bool, bool]]) -> tuple[bool,
         if not was_quoted and not saw_assignment and tok == "time":
             idx += 1
             while idx < len(raw_words) and raw_words[idx][0].startswith("-"):
+                portable_wrapper = False
                 ttok = raw_words[idx][0]
                 if ttok == "--":
                     idx += 1
                     break
-                if ttok != "-p":
-                    portable_wrapper = False
                 if ttok in _TIME_LONG_VAL or _short_flag_needs_next_arg(ttok, _TIME_SHORT_VAL):
                     idx += 2
                 else:
@@ -1069,6 +1068,7 @@ def _is_shell_builtin_cd(raw_words: list[tuple[str, bool, bool]]) -> tuple[bool,
         if tok == "builtin":
             idx += 1
             if idx < len(raw_words) and raw_words[idx][0] == "--":
+                portable_wrapper = False
                 idx += 1
             continue
         if tok == "command":

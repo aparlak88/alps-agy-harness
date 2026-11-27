@@ -454,6 +454,10 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "cd \"$repo\"; echo x | cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; true |& cd \"$wt_cd\" && git push" \
     "cd \"$wt_cd\"; time cd \"$repo\"; git push" \
+    "cd \"$repo\"; time -- cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; time \"-p\" cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; time -p cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; builtin -- cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; FOO=bar time cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; \"time\" cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; \\time cd \"$wt_cd\"; git push" \
