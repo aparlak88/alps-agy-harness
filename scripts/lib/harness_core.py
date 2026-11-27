@@ -611,8 +611,8 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
                 return pos == len(flag) - 1
         return False
 
-    SUDO_SHORT_VAL = "ughpD"
-    SUDO_LONG_VAL = ("--user", "--group", "--host", "--prompt", "--chdir")
+    SUDO_SHORT_VAL = "ughpDU"
+    SUDO_LONG_VAL = ("--user", "--group", "--host", "--prompt", "--chdir", "--other-user")
     ENV_SHORT_VAL = "uCP"
     ENV_LONG_VAL = ("--unset", "--chdir")
     TIME_SHORT_VAL = "of"
@@ -634,7 +634,7 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
                 if tokens[idx] == "--":
                     idx += 1
                     break
-                idx += 2 if tokens[idx] == "-a" else 1
+                idx += 2 if _short_flag_needs_next_arg(tokens[idx], "a") else 1
             continue
         base = os.path.basename(tok)
         if base == "sudo":
@@ -751,22 +751,28 @@ def _resolve_dir_arg(base: Path, raw_dir: str) -> Path:
         return Path(norm)
 
 
-def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path]:
-    """Compute next ``(current_cwd, prev_cwd)`` after a ``cd`` command segment."""
+def _apply_cd_segment_checked(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path, bool]:
+    """Compute ``(next_cwd, prev_cwd, valid)`` for a ``cd`` command segment."""
     idx = 1
     saw_double_dash = False
-    target = ""
+    pos_args: list[str] = []
     while idx < len(tokens):
         tok = tokens[idx]
         if not saw_double_dash and tok == "--":
             saw_double_dash = True
             idx += 1
             continue
-        if not saw_double_dash and tok in ("-P", "-L", "-e", "-@"):
-            idx += 1
-            continue
-        target = tok
-        break
+        if not saw_double_dash and tok.startswith("-") and tok != "-":
+            if tok in ("-P", "-L", "-e"):
+                idx += 1
+                continue
+            return current_cwd, prev_cwd, False
+        pos_args.append(tok)
+        idx += 1
+
+    if len(pos_args) > 1:
+        return current_cwd, prev_cwd, False
+    target = pos_args[0] if pos_args else ""
 
     if not target or target == "~":
         nxt = Path.home()
@@ -774,7 +780,27 @@ def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> t
         nxt = prev_cwd
     else:
         nxt = _resolve_dir_arg(current_cwd, target)
-    return nxt, current_cwd
+    return nxt, current_cwd, True
+
+
+def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path]:
+    """Compute next ``(current_cwd, prev_cwd)`` after a ``cd`` command segment."""
+    nxt, prev, _ = _apply_cd_segment_checked(tokens, current_cwd, prev_cwd)
+    return nxt, prev
+
+
+_CONTROL_KEYWORD_RE = re.compile(r"^\s*(?:if|then|else|elif|while|until|do|!|\{)\b")
+
+
+def _dedup_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in paths:
+        k = str(p)
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out
 
 
 def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tuple[list[str], Path]]:
@@ -798,6 +824,72 @@ def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tup
             cwd_stack.append((current_cwd, prev_cwd))
         elif delim == ")" and cwd_stack:
             current_cwd, prev_cwd = cwd_stack.pop()
+
+    return out
+
+
+def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -> list[tuple[list[str], list[Path]]]:
+    """Parse command segments returning conservative possible CWD branches across conditional/failing ``cd``."""
+    try:
+        init_real = Path(os.path.realpath(str(initial_cwd)))
+    except OSError:
+        init_real = initial_cwd
+    possible_states: list[tuple[Path, Path]] = [(init_real, init_real)]
+    pipeline_entry: list[tuple[Path, Path]] = list(possible_states)
+    pipeline_uncertain = False
+    cwd_stack: list[tuple[list[tuple[Path, Path]], list[tuple[Path, Path]], bool]] = []
+    prev_delim = ""
+    out: list[tuple[list[str], list[Path]]] = []
+
+    def _dedup_states(states: list[tuple[Path, Path]]) -> list[tuple[Path, Path]]:
+        seen: set[tuple[str, str]] = set()
+        res: list[tuple[Path, Path]] = []
+        for cw, pw in states:
+            key = (str(cw), str(pw))
+            if key not in seen:
+                seen.add(key)
+                res.append((cw, pw))
+        return res
+
+    for raw_seg, delim in _tokenize_raw_segments(cmd_line):
+        is_cond = bool(_CONTROL_KEYWORD_RE.match(raw_seg))
+        cleaned = _strip_segment_wrappers(raw_seg)
+        if prev_delim not in ("&&", "||"):
+            pipeline_entry = list(possible_states)
+            pipeline_uncertain = False
+
+        if cleaned:
+            out.append((cleaned, _dedup_paths([cw for cw, _ in possible_states])))
+            if cleaned[0] == "cd" and delim not in ("|", "&"):
+                valid_next: list[tuple[Path, Path]] = []
+                all_exist = True
+                for cw, pw in possible_states:
+                    nxt, new_prev, ok = _apply_cd_segment_checked(cleaned, cw, pw)
+                    if not ok:
+                        all_exist = False
+                    else:
+                        valid_next.append((nxt, new_prev))
+                        if not nxt.is_dir():
+                            all_exist = False
+                unconditional_exec = (prev_delim not in ("&&", "||")) and (not is_cond)
+                if not valid_next:
+                    pipeline_uncertain = True
+                elif delim == "&&" and unconditional_exec and all_exist:
+                    possible_states = _dedup_states(valid_next)
+                elif delim != "&&" and unconditional_exec and all_exist and not pipeline_uncertain:
+                    possible_states = _dedup_states(valid_next)
+                else:
+                    pipeline_uncertain = True
+                    possible_states = _dedup_states(possible_states + valid_next)
+
+        if delim not in ("&&", "||") and pipeline_uncertain:
+            possible_states = _dedup_states(possible_states + pipeline_entry)
+
+        if delim == "(":
+            cwd_stack.append((list(possible_states), list(pipeline_entry), pipeline_uncertain))
+        elif delim == ")" and cwd_stack:
+            possible_states, pipeline_entry, pipeline_uncertain = cwd_stack.pop()
+        prev_delim = delim
 
     return out
 
@@ -2022,7 +2114,8 @@ def evaluate_pre_command(
         return {"decision": "allow"}
 
     initial_cwd = _resolve_initial_cwd(workspace, hook_input)
-    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
+    segments_with_cwds = iter_command_segments_with_possible_cwds(cmd_line, initial_cwd)
+    segments_with_cwd = [(seg, seg_cwd) for seg, cwds in segments_with_cwds for seg_cwd in cwds]
 
     if is_active_swarm_coordinator(workspace, hook_input):
         raw_err = _check_coordinator_raw_segments(cmd_line)
@@ -2603,7 +2696,8 @@ def evaluate_post_command(
         return {}
 
     initial_cwd = _resolve_initial_cwd(workspace, hook_input)
-    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
+    segments_with_cwds = iter_command_segments_with_possible_cwds(cmd_line, initial_cwd)
+    segments_with_cwd = [(seg, seg_cwd) for seg, cwds in segments_with_cwds for seg_cwd in cwds]
     if not segments_with_cwd:
         return {}
 
@@ -2748,6 +2842,8 @@ COORDINATOR_DANGEROUS_ENV_VARS = frozenset(
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GH_PAGER",
+        "GH_BROWSER",
+        "BROWSER",
     )
 )
 
@@ -3467,6 +3563,9 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
                     )
                 idx += 1
                 continue
+            if tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
+                idx += 1
+                continue
             base_tok = os.path.basename(tok)
             if base_tok == "sudo":
                 return "Swarm Coordinator-Only guard: 'sudo' is blocked for the active Swarm Coordinator."
@@ -3696,7 +3795,7 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
                     break
                 if tok.startswith("--"):
                     opt_name = tok.split("=", 1)[0]
-                    if opt_name.startswith("--o") or opt_name.startswith("--comp"):
+                    if opt_name.startswith("--o") or opt_name.startswith("--co"):
                         return _deny_seg()
                 elif tok.startswith("-") and len(tok) > 1:
                     if "o" in tok[1:]:
@@ -3725,7 +3824,7 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
                 return _deny_seg()
         elif exe == "file":
             if any(
-                tok == "-C" or tok == "--compile" or (tok.startswith("-") and not tok.startswith("--") and "C" in tok[1:])
+                tok == "-C" or tok.startswith("--co") or (tok.startswith("-") and not tok.startswith("--") and "C" in tok[1:])
                 for tok in seg[1:]
             ):
                 return _deny_seg()
@@ -3793,7 +3892,11 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
             return _deny_seg()
         noun, verb = seg[1], seg[2]
         allowed_verbs = COORDINATOR_READ_ONLY_GH_VERBS.get(noun)
-        return ("allow", "") if (allowed_verbs and verb in allowed_verbs) else _deny_seg()
+        if not (allowed_verbs and verb in allowed_verbs):
+            return _deny_seg()
+        if any(tok == "-w" or tok.startswith("--w") or (tok.startswith("-") and not tok.startswith("--") and "w" in tok[1:]) for tok in seg[3:]):
+            return _deny_seg()
+        return "allow", ""
 
     return _deny_seg()
 

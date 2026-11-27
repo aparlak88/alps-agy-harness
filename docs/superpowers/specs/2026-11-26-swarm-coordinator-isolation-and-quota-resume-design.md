@@ -80,7 +80,7 @@ Bu tasarım ile:
   - `{status: "waiting|resuming|resumed|cleared", conversationId, model, window: "5h|weekly|unknown", reason, pausedMembers[], source, pausedAt, resumeAt, resumeAtEpoch, nextProbeEpoch, attemptCount, lastAttemptAt, lastAttemptError, resumedAt}`
 - CLI Alt Komutları (`scripts/stamp-gate.sh`):
   - `stamp-gate.sh swarm-coordinator on|off|status [--conversation-id <id>] [--title <title>] [--workspace <dir>]`
-  - `stamp-gate.sh swarm-quota pause|resume|status|clear [--resume-at <iso>] [--wait-seconds <sec>] [--buffer-seconds <sec>] [--window 5h|weekly|unknown] [--model <id>] [--reason <text>] [--member <name> ...] [--conversation-id <id>] [--workspace <dir>]`
+  - `stamp-gate.sh swarm-quota pause|resume|status|clear|attempt-resume [--resume-at <iso>] [--wait-seconds <sec>] [--buffer-seconds <sec>] [--window 5h|weekly|unknown] [--model <id>] [--reason <text>] [--member <name> ...] [--conversation-id <id>] [--workspace <dir>]`
 
 ---
 

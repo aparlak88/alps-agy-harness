@@ -10,7 +10,7 @@
 2. **5 Saatlik ve Haftalık Kota Kesintileri:** Uzun soluklu Swarm oturumlarında Antigravity'nin 5 saatlik kayan penceresi veya haftalık kotası dolduğunda işçileri öldürmeden ve model değiştirmeden kota yenilenene kadar bekleyip kaldığı yerden devam eden bir kurtarma hattı yoktu.
 
 ### Seçilen Mimari Yaklaşım ve Gerekçesi
-- **Dal-Bağımsız `swarm-coordinator.json` + Tam İzolasyon (`ADR-01`):** `.harness/state/swarm/swarm-coordinator.json` içinde `conversationId` anahtarlı koordinatör kaydı tutulur. Aktif koordinatör için `evaluate_pre_edit` tüm çalışma alanı yazmalarını reddeder (`.harness/` ve harici UI `plan.json` yolları hariç), `evaluate_pre_command` yalnızca salt-okunur inceleme ve `stamp-gate.sh`/`harness-doctor.sh` koordinasyon komutlarına izin verir (ve `$(...)`/backtick/dosyaya yönlendirme bypass'larını engeller), `evaluate_pre_subagent` ise `invoke_subagent` ve `run_workflow` çağrılarını reddeder. Birleştirme ve PR kapıları uzman `integrator` Swarm işçisine (`[SWARM_INTEGRATOR_CONTRACT]`) devredilir.
+- **Dal-Bağımsız `swarm-coordinator.json` + Tam İzolasyon (`ADR-01`):** `.harness/state/swarm/swarm-coordinator.json` içinde `conversationId` anahtarlı koordinatör kaydı tutulur. Aktif koordinatör için `evaluate_pre_edit` `.harness/state/swarm/*` ve çalışma alanı/kardeş worktree içindeki tüm yazmaları reddeder (yalnızca çalışma alanı/worktree dışındaki harici UI `plan.json` yolları muaf tutulur), `evaluate_pre_command` yalnızca salt-okunur inceleme ve `stamp-gate.sh`/`harness-doctor.sh` koordinasyon komutlarına izin verir (ve `$(...)`/backtick/genişletme/dosyaya yönlendirme bypass'larını engeller), `evaluate_pre_subagent` ise `invoke_subagent` ve `run_workflow` çağrılarını reddeder. Birleştirme ve PR kapıları uzman `integrator` Swarm işçisine (`[SWARM_INTEGRATOR_CONTRACT]`) devredilir.
 - **Saf Bekleme ve Çift Katmanlı Otomatik Devam (`ADR-02` & `ADR-03`):** Kota dolduğunda `swarm(action="model|kill")` çağrıları `force_ask` ile korunur. Katman 1'de koordinatör `swarm(action="models")` -> `stamp-gate.sh swarm-quota pause` -> `schedule` ile bekler. Katman 2'de koordinatörün kendisi `Stop(ERROR)` ile kotaya takılırsa `stop-gate.sh` anlık döngüye girmeden `{}` döner, `swarm-quota-wait.json` yazar ve `harness-daemon`'ı uyandırır. Daemon çalışma alanını TTL temizliğinden muaf tutar ve `nextProbeEpoch` zamanında `agy --conversation <id> --print=...` ile oturumu uyandırır; kota hâlâ doluysa yeni sıfırlama zamanını ayrıştırır veya sınırlı üstel geri çekilme uygular.
 
 ---
@@ -23,8 +23,8 @@ flowchart TD
     HookIn["HOOK_INPUT (conversationId, lastUserInput, toolCall)"] --> Check["is_active_swarm_coordinator()"]
     Check -->|"Worker prompt or different conversationId"| Normal["Normal Harness Rules"]
     Check -->|"Active Coordinator"| Tool{"Tool Name"}
-    Tool -->|"write_file / edit_file"| EditDeny["evaluate_pre_edit: deny workspace edits (.harness & external allowed)"]
-    Tool -->|"run_command"| CmdAllow{"_has_unsafe_shell_syntax + _is_allowed_coordinator_command_segment"}
+    Tool -->|"write_file / edit_file"| EditDeny["evaluate_pre_edit: deny workspace & .harness/* edits (external paths only)"]
+    Tool -->|"run_command"| CmdAllow{"_check_coordinator_raw_segments + _has_unsafe_shell_syntax_for_coordinator + _evaluate_coordinator_command_segment"}
     CmdAllow -->|"Read-only git/gh/ls or stamp-gate swarm-*/dispatch"| Allow["decision: allow"]
     CmdAllow -->|"Build, test, git commit/merge, gh pr create, >file, $()"| CmdDeny["decision: deny (delegate to workers)"]
     Tool -->|"invoke_subagent / run_workflow"| SubDeny["evaluate_pre_subagent: deny (delegate to planner/verifier/integrator)"]
@@ -51,7 +51,7 @@ sequenceDiagram
     Daemon->>Agy: agy --conversation <id> --print="[SWARM_QUOTA_AUTO_RESUME]..."
     alt Kota hala dolu (429 / quota error)
         Agy-->>Daemon: exit != 0 (quota exhausted)
-        Daemon->>State: capped exponential backoff -> status="waiting"
+        Daemon->>State: capped exponential backoff -> status="waiting", attemptCount++
     else Kota acildi
         Agy-->>Daemon: exit 0 -> Coordinator models + swarm-quota resume + @mention workers
         Daemon->>State: status="resumed", attemptCount++
@@ -75,8 +75,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** `always_on` kural dosyasında Antigravity'nin 8 KB sınırını aşmadan koordinatöre mutlak devretme kuralını, `integrator` rolünü ve Saf Bekleme kota kurtarma protokolünü zorunlu kılmak için güncellendi.
 
 ### `scripts/lib/harness_core.py` — [GÜNCELLENDİ] (`Paylaşımlı Çekirdek Kütüphane`)
-- **Ne Değişti / Ne Üretildi?:** Dal-bağımsız `get_swarm_state_dir()`, `register_swarm_coordinator()`, `is_active_swarm_coordinator()`, `_tokenize_raw_segments()`, `_strip_segment_wrappers()`, `_is_trusted_harness_script_path()` (yalnızca gerçek `PLUGIN_ROOT/scripts/*` veya `workspace/scripts/*` çözümlemesini kabul eden fail-closed güven denetimi), `_is_dangerous_coordinator_env_var()` (`GH_PAGER` ve `GIT_TRACE*` önekleri dahil), `_check_coordinator_raw_segments()`, `_evaluate_coordinator_command_segment()` (`printf`/`test`/`[` `-v`, `file -C`/`--compile` ve katı `git branch` salt-okunur izin listesi + `--git-dir`/`--work-tree`), `_has_unsafe_shell_syntax_for_coordinator()`, `extract_install_packages()`, `deny > force_ask` ve `attempt_swarm_quota_resume()` eklendi.
-- **Neden Değişti / Neden Üretildi?:** Başarısız `cd` sonrası sahte `./scripts/*` düşüşünü (`C1`), `GIT_TRACE*`/`GH_PAGER`/`file -C` açıklarını, `printf`/`test`/`[` `-v` dizi indisi çalıştırmasını, `git branch` kısaltılmış bayrak mutasyonunu, kabuk genişletmelerini ve erken `force_ask` öncelik açığını kapatmak için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** Ana kanca ve kota giriş noktaları (`evaluate_pre_edit()`, `evaluate_pre_command()`, `evaluate_pre_subagent()`, `evaluate_pre_swarm()`, `evaluate_stop_gate()`, `build_session_start_payload()`, `record_swarm_quota_pause()`, `parse_quota_reset_epoch()`, `attempt_swarm_quota_resume()`, `get_swarm_state_dir()`, `register_swarm_coordinator()`, `is_active_swarm_coordinator()`) ile ayrıştırma/güvenlik yardımcıları eklendi: `_apply_cd_segment_checked()` & `iter_command_segments_with_possible_cwds()` (koşullu `&&`/`||`/kontrol-akışı ve geçersiz `cd` dallarını muhafazakâr biçimde değerlendirme), `_strip_segment_wrappers()` (kabuk anahtar kelimeleri `{`/`!`/`then`/`do`/`else`/`elif`/`if`/`while`/`until`/`exec -ca`, `sudo -U`/`--other-user`, `env -S`/`--split-string`, `time -o`/`-f`), `_check_coordinator_raw_segments()` (`!` sonrası dahil sarmalayıcı/tehlikeli env denetimi), `_is_trusted_harness_script_path()` (fail-closed betik güveni), `_is_dangerous_coordinator_env_var()` (`GH_PAGER`, `GH_BROWSER`, `BROWSER`, `GIT_TRACE*`), `_evaluate_coordinator_command_segment()` (`printf`/`test`/`[` `-v`, `sort`/`file --co*`, `gh --web`/`-w` ve katı `git branch` izin listesi) & `_has_unsafe_shell_syntax_for_coordinator()`, `extract_install_packages()` ve `deny > force_ask`.
+- **Neden Değişti / Neden Üretildi?:** `!` önekiyle sarmalayıcı gizlemeyi, koşullu/hatalı `cd` (`true || cd`, `false && cd`, fazla argüman, `-@`) kaynaklı çalışma dizini kaymasını, `exec -ca`/`sudo -U` gerilemesini, `sort`/`file --co*` öneklerini ve `GH_BROWSER`/`gh --web` çıkış noktalarını kapatmak için güncellendi.
 
 ### `scripts/stamp-gate.sh` — [GÜNCELLENDİ] (`Damga ve Durum CLI`)
 - **Ne Değişti / Ne Üretildi?:** `usage()` ve hata mesajlarında `attempt-resume` belgelendi; `cmd_swarm_coordinator()` ve `cmd_swarm_quota()` alt komutları eklendi (`pause`, `resume`, `status`, `clear`, `attempt-resume`), yinelenen/çakışan `--action` bayraklarını (`--action` ve `--action=`) reddetme eklendi ve `pause` sonrası `--workspace` yolu `pwd -P` ile çözümlenerek `/event/swarm-quota-wait` bildirimi gönderildi.
@@ -95,7 +95,7 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Tam izolasyonlu Coordinator-Only modeliyle `pre-pr-readiness` iş akışının çelişmesini önlemek için güncellendi.
 
 ### `docs/superpowers/specs/2026-11-26-swarm-coordinator-isolation-and-quota-resume-design.md` — [ÜRETİLDİ] (`Tasarım Spesifikasyonu`)
-- **Ne Değişti / Ne Üretildi?:** Problem tanımı, hedefler, ADR-01/ADR-02/ADR-03 kararları (`jev_check`: `0.76`), durum dosyası şemaları ve CLI sözleşmelerini içeren tasarım dokümanı oluşturuldu.
+- **Ne Değişti / Ne Üretildi?:** Problem tanımı, hedefler, ADR-01/ADR-02/ADR-03 kararları (`jev_check`: `0.76`), durum dosyası şemaları ve `attempt-resume` dahil CLI sözleşmelerini içeren tasarım dokümanı oluşturuldu.
 - **Neden Değişti / Neden Üretildi?:** Uygulama öncesinde mimari kararları, güvenlik sınırlarını ve `53` dosya / `< 8192` bayt kısıtlarını kayıt altına almak için üretildi.
 
 ### `docs/superpowers/plans/2026-11-26-swarm-coordinator-isolation-and-quota-resume.md` — [ÜRETİLDİ] (`Uygulama Planı`)
@@ -103,8 +103,8 @@ sequenceDiagram
 - **Neden Değişti / Neden Üretildi?:** Çok adımlı geliştirme sırasında kapsam disiplinini ve doğrulama kriterlerini sabitlemek için üretildi.
 
 ### `tests/test-command-hooks.sh` — [GÜNCELLENDİ] (`Komut Kancası Testleri`)
-- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_command_allowlist_and_bypass_guards`, `test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists` ve `test_chained_package_install_requires_context7_stamp` (`HARNESS_DISABLE_DAEMON=1`) genişletildi (`cd <spoof>; cd /nonexistent; ./scripts/*` fail-closed testi ve geçerli depo `scripts/*` sembolik bağları, `GIT_TRACE`/`GIT_TRACE2_EVENT`/`GH_PAGER`/`file -C`, `printf -v`/`test -v`/`[ -v`, `if/then/{/!/exec`, `git branch --unset-up`/`--set-upstream-t=`/`--edit-desc` ve `--git-dir`/`--work-tree`, `./time`/`/tmp/x/nohup`, `env -vu`/`-S`/`--split-string`, `${Z:--delete}`/`$FLAG`/`{-delete,}`/`{ ...; }`, `cd &`/`cd |`/`cd -P/--/-/~/bare`, `_is_trusted_coordinator_exe` sembolik bağ kaçış testi ve bağlı worktree `$wt_pkg` testleri).
-- **Neden Değişti / Neden Üretildi?:** Başarısız `cd` sonrası sahte betik yürütmesini, `GIT_TRACE*`/`GH_PAGER`/`file -C` bypass'larını, koordinatör dışı kabuk anahtar kelime/`cd`/paket hedef dizini yollarını ve koordinatör içi genişletme engellerini mutasyonlara karşı kilitlemek için güncellendi.
+- **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_command_allowlist_and_bypass_guards`, `test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists` ve `test_chained_package_install_requires_context7_stamp` (`HARNESS_DISABLE_DAEMON=1`) genişletildi (`!` + `GIT_TRACE`/`GH_PAGER`/`PATH`/`sudo`/`exec`/`env -P`/`time`, koşullu `true || cd`/`false && cd`/`if false`/`cd ... bogus`/`cd -@`, `exec -ca`/`-la` & `sudo -U`/`--other-user`, `sort --co=`/`file --com`, `GH_BROWSER`/`BROWSER`/`gh --web`/`-w`, `cd <spoof>; cd /nonexistent; ./scripts/*` fail-closed testi, `printf -v`/`test -v`/`[ -v`, `git branch` kısaltmaları/`--git-dir`/`--work-tree`, `${...}`/`{-delete,}` ve bağlı worktree `$wt_pkg` testleri).
+- **Neden Değişti / Neden Üretildi?:** `!` sonrası sarmalayıcı atlamalarını, koşullu/hatalı `cd` CWD kaymasını, `exec -ca`/`sudo -U` ve `sort`/`file --co*`/`gh --web` bypass'larını mutasyonlara karşı kilitlemek için güncellendi.
 
 ### `tests/test-edit-and-session-hooks.sh` — [GÜNCELLENDİ] (`Dosya ve Oturum Testleri`)
 - **Ne Değişti / Ne Üretildi?:** `test_swarm_coordinator_only_pre_edit_and_session_start` testi genişletildi (`/swarming` alt dizesinde yanlış pozitif olmaması, kardeş worktree ve `.harness/state/swarm/*` hedeflerinin aktif koordinatöre kapatılması, harici UI `plan.json` izni, `__default__` anahtarı ve bozuk JSON dayanıklılığı).
@@ -158,7 +158,7 @@ sequenceDiagram
 ## 5. Somut Doğrulama Kanıtları
 
 1. **Tam Depo Test Paketi (`./scripts/run-quiet.sh full-tests -- ./tests/run-all.sh`):**
-   `✅ PASS [full-tests] (süre: 406.0s, warnings: 0 — log: .harness/logs/last.log)` — **9/9 paket, 108/108 test, 0 hata:**
+   `✅ PASS [full-tests] (süre: 390.7s, warnings: 0 — log: .harness/logs/last.log)` — **9/9 paket, 108/108 test, 0 hata:**
    - `tests/test-command-hooks.sh`: `14 passed, 0 failed`
    - `tests/test-edit-and-session-hooks.sh`: `14 passed, 0 failed`
    - `tests/test-manifest.sh`: `9 passed, 0 failed`

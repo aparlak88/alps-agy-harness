@@ -231,7 +231,8 @@ EOF
     "uv --directory app add requests|requests" \
     "cargo add --manifest-path app/Cargo.toml serde|serde" \
     "sudo -u root npm install left-pad|left-pad" \
-    "sudo -g wheel npm install left-pad|left-pad"
+    "sudo -g wheel npm install left-pad|left-pad" \
+    "exec -ca fake npm install left-pad|left-pad"
   do
     pkg_cmd="${pkg_case%%|*}"
     pkg_expected="${pkg_case#*|}"
@@ -293,6 +294,12 @@ PYEOF
     '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_wt" ".decision" "deny" "Unstamped package in linked worktree must still be denied"
+
+  # TDD C2: Conditional cd after true || must not move npm install target to stamped linked worktree
+  out_wt=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$repo\"; true || cd \"$wt_pkg\"; npm install axios" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_wt" ".decision" "deny" "Short-circuited cd into stamped worktree must not bypass Context7 on base repo"
 }
 
 test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
@@ -400,6 +407,10 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "! git push origin main" \
     "exec git push origin main" \
     "exec -a fake git push origin main" \
+    "exec -ca fake git push origin main" \
+    "exec -la fake git push origin main" \
+    "sudo -U root git push origin main" \
+    "sudo --other-user root git push origin main" \
     "for x in a; do git push origin main; done" \
     "if false; then echo x; else git push origin main; fi"
   do
@@ -423,6 +434,26 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_cd_pipe" ".decision" "deny" "cd before '|' must not move git push off main"
+
+  local cond_cd_cmd out_cond_cd
+  for cond_cd_cmd in \
+    "cd \"$repo\"; true || cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; false && cd \"$wt_cd\"; git push" \
+    "if false; then cd \"$wt_cd\"; fi; git push" \
+    "cd \"$repo\"; cd \"$wt_cd\" bogus; git push" \
+    "cd \"$repo\"; cd -@ \"$wt_cd\"; git push"
+  do
+    out_cond_cd=$(jq -nc --arg ws "$repo" --arg cmd "$cond_cd_cmd" \
+      '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_cond_cd" ".decision" "deny" "Conditional/invalid cd must not bypass main push gate: $cond_cd_cmd"
+  done
+
+  local out_valid_cd_push
+  out_valid_cd_push=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$wt_cd\" && git push origin feat/cd-bg" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_valid_cd_push" ".decision" "allow" "Valid unconditional cd <wt> && git push feature-branch must stay allowed"
 
   CD_BASE="$wt_cd_root" PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
 import os
@@ -1798,7 +1829,23 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "GIT_TRACE2_EVENT=/tmp/trace.log git status" \
     "env GIT_TRACE=/tmp/trace.log git status" \
     "GH_PAGER=evil gh pr list" \
+    "GH_BROWSER=/tmp/evil.sh gh pr view 1" \
+    "BROWSER=/tmp/evil.sh gh pr view 1" \
+    "gh pr view 1 --web" \
+    "gh pr view 1 -w" \
     "file -C README.md" \
+    "file --com README.md" \
+    "sort --com=/tmp/evil.sh README.md" \
+    "sort --co=/tmp/evil.sh README.md" \
+    "! GIT_TRACE=/tmp/trace.log git status" \
+    "! GH_PAGER=evil gh pr list" \
+    "! PATH=/tmp/evil git status" \
+    "! LD_PRELOAD=/tmp/evil.so git status" \
+    "! sudo ls" \
+    "! exec ls" \
+    "! env -P /tmp/evil ls" \
+    "! /tmp/evil/env ls" \
+    "! /usr/bin/time -o /tmp/t.out ls" \
     "GIT_SEQUENCE_EDITOR=evil git status" \
     "GIT_CONFIG_SYSTEM=/tmp/x git status" \
     "GIT_TEMPLATE_DIR=/tmp/x git status" \
@@ -1996,7 +2043,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "cd \"$spoof_dir\" && ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/harness-doctor.sh --json" \
-    "cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch"
+    "cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; false && cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; true || cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd \"$repo\" bogus; bash ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd -@ \"$repo\"; bash ./scripts/stamp-gate.sh dispatch"
   do
     local out_sp
     out_sp=$(jq -nc --arg ws "$repo" --arg cmd "$spoof_cmd" \
