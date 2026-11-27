@@ -37,6 +37,8 @@ Usage:
   stamp-gate.sh select-model --tier <tier> [--parent-model <modelName>] [--caller-model <tier>] [--effort LOW|MEDIUM|HIGH|XHIGH|MAX] [--workspace <dir>]
   stamp-gate.sh verify-pr-stamps [--workspace <dir>]
   stamp-gate.sh clear-pr-audit [--workspace <dir>]
+  stamp-gate.sh swarm-coordinator on|off|status [--conversation-id <id>] [--title <title>] [--workspace <dir>]
+  stamp-gate.sh swarm-quota pause|resume|status|clear|attempt-resume [--resume-at <iso>] [--wait-seconds <sec>] [--buffer-seconds <sec>] [--window 5h|weekly|unknown] [--model <id>] [--reason <text>] [--member <name> ...] [--conversation-id <id>] [--workspace <dir>]
 EOF
 }
 
@@ -785,6 +787,233 @@ cmd_clear_pr_audit() {
   python3 -B "$(harness_core_python)" clear-pr-audit --workspace "$WORKSPACE"
 }
 
+cmd_swarm_coordinator() {
+  local action=""
+  local conversation_id="${HARNESS_CONVERSATION_ID:-${ANTIGRAVITY_CONVERSATION_ID:-}}"
+  local title=""
+
+  if [ $# -gt 0 ]; then
+    case "$1" in
+      on|off|status)
+        action="$1"
+        shift
+        ;;
+    esac
+  fi
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --action)
+        [ $# -ge 2 ] || { echo "Error: --action requires on, off, or status" >&2; exit 1; }
+        [ -z "$action" ] || { echo "Error: duplicate or conflicting --action flag" >&2; exit 1; }
+        action="$2"
+        shift 2
+        ;;
+      --action=*)
+        [ -z "$action" ] || { echo "Error: duplicate or conflicting --action flag" >&2; exit 1; }
+        action="${1#--action=}"
+        shift
+        ;;
+      --conversation-id)
+        [ $# -ge 2 ] || { echo "Error: --conversation-id requires an id" >&2; exit 1; }
+        conversation_id="$2"
+        shift 2
+        ;;
+      --conversation-id=*)
+        conversation_id="${1#--conversation-id=}"
+        shift
+        ;;
+      --title)
+        [ $# -ge 2 ] || { echo "Error: --title requires a title string" >&2; exit 1; }
+        title="$2"
+        shift 2
+        ;;
+      --title=*)
+        title="${1#--title=}"
+        shift
+        ;;
+      *)
+        echo "Error: unknown argument for swarm-coordinator: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ "$action" != "on" ] && [ "$action" != "off" ] && [ "$action" != "status" ]; then
+    echo "Error: swarm-coordinator requires action: on, off, or status" >&2
+    exit 1
+  fi
+
+  python3 -B "$(harness_core_python)" swarm-coordinator \
+    --workspace "$WORKSPACE" \
+    --action "$action" \
+    --conversation-id="$conversation_id" \
+    --title="$title"
+}
+
+cmd_swarm_quota() {
+  local action=""
+  local conversation_id="${HARNESS_CONVERSATION_ID:-${ANTIGRAVITY_CONVERSATION_ID:-}}"
+  local resume_at=""
+  local wait_seconds=""
+  local buffer_seconds="60"
+  local window=""
+  local model=""
+  local reason=""
+  local members=()
+
+  if [ $# -gt 0 ]; then
+    case "$1" in
+      pause|resume|status|clear|attempt-resume)
+        action="$1"
+        shift
+        ;;
+    esac
+  fi
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --action)
+        [ $# -ge 2 ] || { echo "Error: --action requires pause, resume, status, clear, or attempt-resume" >&2; exit 1; }
+        [ -z "$action" ] || { echo "Error: duplicate or conflicting --action flag" >&2; exit 1; }
+        action="$2"
+        shift 2
+        ;;
+      --action=*)
+        [ -z "$action" ] || { echo "Error: duplicate or conflicting --action flag" >&2; exit 1; }
+        action="${1#--action=}"
+        shift
+        ;;
+      --conversation-id)
+        [ $# -ge 2 ] || { echo "Error: --conversation-id requires an id" >&2; exit 1; }
+        conversation_id="$2"
+        shift 2
+        ;;
+      --conversation-id=*)
+        conversation_id="${1#--conversation-id=}"
+        shift
+        ;;
+      --resume-at)
+        [ $# -ge 2 ] || { echo "Error: --resume-at requires an ISO-8601 timestamp" >&2; exit 1; }
+        resume_at="$2"
+        shift 2
+        ;;
+      --resume-at=*)
+        resume_at="${1#--resume-at=}"
+        shift
+        ;;
+      --wait-seconds)
+        [ $# -ge 2 ] || { echo "Error: --wait-seconds requires a non-negative number" >&2; exit 1; }
+        wait_seconds="$2"
+        shift 2
+        ;;
+      --wait-seconds=*)
+        wait_seconds="${1#--wait-seconds=}"
+        shift
+        ;;
+      --buffer-seconds)
+        [ $# -ge 2 ] || { echo "Error: --buffer-seconds requires a non-negative integer" >&2; exit 1; }
+        buffer_seconds="$2"
+        shift 2
+        ;;
+      --buffer-seconds=*)
+        buffer_seconds="${1#--buffer-seconds=}"
+        shift
+        ;;
+      --window)
+        [ $# -ge 2 ] || { echo "Error: --window requires 5h, weekly, or unknown" >&2; exit 1; }
+        window="$2"
+        shift 2
+        ;;
+      --window=*)
+        window="${1#--window=}"
+        shift
+        ;;
+      --model)
+        [ $# -ge 2 ] || { echo "Error: --model requires a model id" >&2; exit 1; }
+        model="$2"
+        shift 2
+        ;;
+      --model=*)
+        model="${1#--model=}"
+        shift
+        ;;
+      --reason)
+        [ $# -ge 2 ] || { echo "Error: --reason requires text" >&2; exit 1; }
+        reason="$2"
+        shift 2
+        ;;
+      --reason=*)
+        reason="${1#--reason=}"
+        shift
+        ;;
+      --member)
+        [ $# -ge 2 ] || { echo "Error: --member requires a worker name" >&2; exit 1; }
+        members+=("$2")
+        shift 2
+        ;;
+      --member=*)
+        members+=("${1#--member=}")
+        shift
+        ;;
+      *)
+        echo "Error: unknown argument for swarm-quota: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+
+  if [ "$action" != "pause" ] && [ "$action" != "resume" ] && [ "$action" != "status" ] && [ "$action" != "clear" ] && [ "$action" != "attempt-resume" ]; then
+    echo "Error: swarm-quota requires action: pause, resume, status, clear, or attempt-resume" >&2
+    exit 1
+  fi
+
+  if [ -n "$wait_seconds" ] && [[ ! "$wait_seconds" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    echo "Error: --wait-seconds must be a non-negative number (got '$wait_seconds')" >&2
+    exit 1
+  fi
+  if [[ ! "$buffer_seconds" =~ ^[0-9]+$ ]]; then
+    echo "Error: --buffer-seconds must be a non-negative integer (got '$buffer_seconds')" >&2
+    exit 1
+  fi
+  if [ -n "$window" ] && [ "$window" != "5h" ] && [ "$window" != "weekly" ] && [ "$window" != "unknown" ]; then
+    echo "Error: --window must be 5h, weekly, or unknown (got '$window')" >&2
+    exit 1
+  fi
+
+  local py_args=(
+    swarm-quota
+    --workspace "$WORKSPACE"
+    --action "$action"
+    --conversation-id="$conversation_id"
+    --resume-at="$resume_at"
+    --buffer-seconds="$buffer_seconds"
+    --window="$window"
+    --model="$model"
+    --reason="$reason"
+  )
+  if [ -n "$wait_seconds" ]; then
+    py_args+=(--wait-seconds="$wait_seconds")
+  fi
+  local m
+  for m in ${members[@]+"${members[@]}"}; do
+    py_args+=(--member="$m")
+  done
+
+  local out
+  out="$(python3 -B "$(harness_core_python)" "${py_args[@]}")"
+  printf '%s\n' "$out"
+
+  if [ "$action" = "pause" ]; then
+    local abs_ws evt_payload
+    abs_ws="$(cd "$WORKSPACE" && pwd -P)"
+    evt_payload="$(jq -nc --arg ws "$abs_ws" '{workspace: $ws}' 2>/dev/null || true)"
+    if [ -n "$evt_payload" ]; then
+      harness_daemon_call "/event/swarm-quota-wait" "$evt_payload" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
 case "$SUBCMD" in
   tree-sha)
     cmd_tree_sha ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
@@ -818,6 +1047,12 @@ case "$SUBCMD" in
     ;;
   clear-pr-audit)
     cmd_clear_pr_audit ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
+    ;;
+  swarm-coordinator)
+    cmd_swarm_coordinator ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
+    ;;
+  swarm-quota)
+    cmd_swarm_quota ${SUB_ARGS[@]+"${SUB_ARGS[@]}"}
     ;;
   -h|--help|help)
     usage

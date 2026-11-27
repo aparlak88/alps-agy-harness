@@ -1027,4 +1027,166 @@ test_session_start_model_deprecation_warnings() {
   done
 }
 
+test_swarm_coordinator_only_pre_edit_and_session_start() {
+  export HARNESS_DISABLE_DAEMON=1
+  local repo ext_dir
+  repo=$(make_temp_repo)
+  ext_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-ext.XXXXXX")
+  echo "$ext_dir" >> "$_HARNESS_TEMP_TRACKER"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/swarm-coord" --quiet
+
+  # 1. Non-swarm prompt mentioning "swarm" in prose must NOT trigger Coordinator-Only guard
+  local p_prose out_prose
+  p_prose=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-normal",
+    lastUserInput: "Explain how swarm architecture works in general.",
+    toolCall: {name: "write_file", args: {Path: "src/Normal.ts", Content: "export const ok = 1;"}}
+  }')
+  out_prose=$(printf '%s' "$p_prose" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_prose" ".decision" "allow" "Prose mentioning swarm without /swarm must NOT trigger Coordinator-Only"
+
+  local out_swarming
+  out_swarming=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-swarming",
+    lastUserInput: "/swarming should never trigger coordinator mode",
+    toolCall: {name: "write_file", args: {Path: "src/Swarming.ts", Content: "export const ok = 1;"}}
+  }' | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_swarming" ".decision" "allow" "/swarming substring must NOT trigger Coordinator-Only"
+
+  # 2. Turn-1 explicit /swarm slash command triggers Coordinator-Only guard immediately
+  local p_slash out_slash
+  p_slash=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-turn1",
+    lastUserInput: "/swarm refactor auth module",
+    toolCall: {name: "write_file", args: {Path: "src/Auth.ts", Content: "export const a = 1;"}}
+  }')
+  out_slash=$(printf '%s' "$p_slash" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_slash" ".decision" "deny" "Turn-1 /swarm coordinator must be denied write_file"
+  assert_contains "$(printf '%s' "$out_slash" | jq -r '.reason')" "Coordinator-Only"
+
+  # 3. Register coordinator via swarm(action="title") -> denies src, specs, walkthroughs, .superpowers, and .harness/state/swarm/*; allows external plan.json
+  local p_title
+  p_title=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "swarm", args: {action: "title", title: "Auth Swarm"}}
+  }')
+  printf '%s' "$p_title" | "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  local rel
+  for rel in "src/Auth.ts" "docs/superpowers/specs/2026-11-26-s.md" "docs/walkthroughs/2026-11-26-w.md" ".superpowers/tmp.md" ".harness/state/swarm/swarm-coordinator.json" ".harness/state/swarm/swarm-quota-wait.json" ".harness/state/swarm/note.json"; do
+    local p_den out_den
+    p_den=$(jq -nc --arg ws "$repo" --arg path "$rel" '{
+      workspacePaths: [$ws],
+      conversationId: "conv-coord",
+      toolCall: {name: "write_file", args: {Path: $path, Content: "x"}}
+    }')
+    out_den=$(printf '%s' "$p_den" | "$PRE_EDIT_GUARD")
+    assert_json_field "$out_den" ".decision" "deny" "Active coordinator must be denied write_file on $rel"
+  done
+
+  local p_edit_den out_edit_den
+  p_edit_den=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "edit_file", args: {Path: "README.md", Replacement: "edited"}}
+  }')
+  out_edit_den=$(printf '%s' "$p_edit_den" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_edit_den" ".decision" "deny" "Active coordinator must be denied edit_file on README.md"
+
+  local p_ext out_ext
+  p_ext=$(jq -nc --arg ws "$repo" --arg path "$ext_dir/plan.json" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "write_file", args: {Path: $path, Content: "{\"goal\":{}}"}}
+  }')
+  out_ext=$(printf '%s' "$p_ext" | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_ext" ".decision" "allow" "External Swarm UI plan.json path stays allowed"
+
+  # 4. Worker exemption markers ([SWARM_WORKER_CONTRACT], [SWARM_INTEGRATOR_CONTRACT], <swarm_worker>) isolate even on registered conv-coord ID
+  local wmarker out_wmarker
+  for wmarker in "[SWARM_WORKER_CONTRACT] task" "[SWARM_INTEGRATOR_CONTRACT] merge" "<swarm_worker>implement</swarm_worker>"; do
+    out_wmarker=$(jq -nc --arg ws "$repo" --arg lu "$wmarker" '{
+      workspacePaths: [$ws],
+      conversationId: "conv-coord",
+      lastUserInput: $lu,
+      toolCall: {name: "write_file", args: {Path: "src/WorkerOk.ts", Content: "export const w = 1;"}}
+    }' | "$PRE_EDIT_GUARD")
+    assert_json_field "$out_wmarker" ".decision" "allow" "Worker prompt marker ($wmarker) must bypass Coordinator-Only even on registered convId"
+  done
+
+  # 4b. Linked worktree cwd with /swarm must NOT trigger Coordinator-Only; __default__ key works when convId empty;
+  #     swarm-coordinator off unblocks edits and overrides /swarm; corrupt JSON fails safe without crash.
+  local wt_dir
+  wt_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-wt-edit.XXXXXX")
+  echo "$wt_dir" >> "$_HARNESS_TEMP_TRACKER"
+  git -C "$repo" worktree add "$wt_dir" -b "feat/wt-worker" --quiet
+  local out_sib_coord
+  out_sib_coord=$(jq -nc --arg ws "$repo" --arg path "$wt_dir/src/SibCoord.ts" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "write_file", args: {Path: $path, Content: "export const sc = 1;"}}
+  }' | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_sib_coord" ".decision" "deny" "Active Coordinator editing sibling worktree file must be denied"
+  local out_wt_slash
+  out_wt_slash=$(jq -nc --arg ws "$repo" --arg cwd "$wt_dir" '{
+    workspacePaths: [$ws],
+    cwd: $cwd,
+    conversationId: "conv-wt",
+    lastUserInput: "/swarm run in worktree",
+    toolCall: {name: "write_file", args: {Path: "src/Wt.ts", Content: "export const wt = 1;"}}
+  }' | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_wt_slash" ".decision" "allow" "Worker inside different linked worktree must not trigger Coordinator-Only on /swarm"
+
+  "$STAMP_GATE" swarm-coordinator off --workspace "$repo" --conversation-id "conv-coord" >/dev/null
+  local out_off_unblock
+  out_off_unblock=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    lastUserInput: "/swarm still in history",
+    toolCall: {name: "write_file", args: {Path: "src/Unblocked.ts", Content: "export const u = 1;"}}
+  }' | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_off_unblock" ".decision" "allow" "swarm-coordinator off must unblock writes and override /swarm"
+
+  "$STAMP_GATE" swarm-coordinator on --workspace "$repo" --title "Default Coord" >/dev/null
+  local out_def_deny
+  out_def_deny=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    toolCall: {name: "write_file", args: {Path: "src/Def.ts", Content: "export const d = 1;"}}
+  }' | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_def_deny" ".decision" "deny" "__default__ key must enforce Coordinator-Only when conversationId omitted"
+  "$STAMP_GATE" swarm-coordinator off --workspace "$repo" >/dev/null
+
+  # 5. SessionStart omits [SWARM COORDINATOR MODE] & [SWARM QUOTA WAIT ACTIVE] when inactive,
+  #    and surfaces both when active; corrupt swarm-coordinator.json fails safe.
+  local ss_inactive
+  ss_inactive=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-coord"}' | "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_not_contains "$ss_inactive" "[SWARM COORDINATOR MODE]"
+  assert_not_contains "$ss_inactive" "[SWARM QUOTA WAIT ACTIVE]"
+
+  "$STAMP_GATE" swarm-coordinator on --workspace "$repo" --conversation-id "conv-coord" --title "Active Again" >/dev/null
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 300 --buffer-seconds 0 --window 5h --member "auth-worker" --reason "5-hour quota reached" >/dev/null
+  local ss_msg
+  ss_msg=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-coord"}' | "$SESSION_START" | jq -r '.injectSteps[0].systemMessage.systemMessage')
+  assert_contains "$ss_msg" "[SWARM COORDINATOR MODE]"
+  assert_contains "$ss_msg" "[SWARM QUOTA WAIT ACTIVE]"
+  assert_contains "$ss_msg" "auth-worker"
+
+  printf '{corrupt json' > "$repo/.harness/state/swarm/swarm-coordinator.json"
+  local out_corrupt
+  out_corrupt=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-coord",
+    toolCall: {name: "write_file", args: {Path: "src/Safe.ts", Content: "export const s = 1;"}}
+  }' | "$PRE_EDIT_GUARD")
+  assert_json_field "$out_corrupt" ".decision" "allow" "Corrupt swarm-coordinator.json must fail safe without crashing"
+}
+
 run_tests "$@"

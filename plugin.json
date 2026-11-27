@@ -1,7 +1,7 @@
 {
   "name": "alps-agy-harness",
   "displayName": "Alps AGY Engineering Harness",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "description": "Engineering harness plugin for Google Antigravity: lifecycle hooks, background daemon sidecar, jev calibration, context7 version lock, triple-part canon, clean architecture rules, and mobile diagnostics.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

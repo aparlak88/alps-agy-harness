@@ -111,6 +111,7 @@ test_quoted_commit_message_does_not_trigger_gates() {
 
 test_chained_package_install_requires_context7_stamp() {
   [ -x "$PRE_COMMAND_GUARD" ] || { echo "pre-command-guard.sh missing or not executable: $PRE_COMMAND_GUARD" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
 
   local repo
   repo=$(make_temp_repo)
@@ -214,10 +215,96 @@ EOF
   out_dotnet_deny=$(printf '%s' "$p_dotnet_deny" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_dotnet_deny" ".decision" "deny" "Unverified dotnet package must be denied"
   assert_contains "$(printf '%s' "$out_dotnet_deny" | jq -r '.reason')" "Serilog.AspNetCore"
+
+  # 8. I1 & I2: Wrapper commands + yarn/uv/cargo + leading/directory package-manager flags must require Context7
+  local pkg_case pkg_cmd pkg_expected out_pkg_cmd
+  for pkg_case in \
+    "command npm install dayjs|dayjs" \
+    "yarn add lodash|lodash" \
+    "uv add requests|requests" \
+    "cargo add serde|serde" \
+    "npm --prefix app install axios|axios" \
+    "pnpm add -w dayjs|dayjs" \
+    "pnpm --dir app add dayjs|dayjs" \
+    "yarn --cwd app add lodash|lodash" \
+    "uv add --directory app requests|requests" \
+    "uv --directory app add requests|requests" \
+    "cargo add --manifest-path app/Cargo.toml serde|serde" \
+    "sudo -u root npm install left-pad|left-pad" \
+    "sudo -g wheel npm install left-pad|left-pad" \
+    "exec -ca fake npm install left-pad|left-pad"
+  do
+    pkg_cmd="${pkg_case%%|*}"
+    pkg_expected="${pkg_case#*|}"
+    out_pkg_cmd=$(jq -nc --arg ws "$repo" --arg cmd "$pkg_cmd" \
+      '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_pkg_cmd" ".decision" "deny" "Unverified package install must be denied: $pkg_cmd"
+    assert_contains "$(printf '%s' "$out_pkg_cmd" | jq -r '.reason')" "$pkg_expected"
+  done
+
+  PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import harness_core
+
+cases = [
+    (["npm", "--prefix", "app", "install", "axios"], ["axios"]),
+    (["pnpm", "add", "-w", "zod"], ["zod"]),
+    (["pnpm", "--dir", "app", "add", "zod"], ["zod"]),
+    (["yarn", "--cwd", "app", "add", "lodash"], ["lodash"]),
+    (["uv", "add", "--directory", "app", "requests"], ["requests"]),
+    (["uv", "--directory", "app", "add", "requests"], ["requests"]),
+    (["cargo", "add", "--manifest-path", "app/Cargo.toml", "serde"], ["serde"]),
+]
+for tokens, expected in cases:
+    got = harness_core.extract_install_packages(tokens)
+    assert got == expected, (tokens, got, expected)
+PYEOF
+
+  # 9. I1: Behavioural directory-flag resolution against linked worktree with distinct Context7 state
+  local wt_pkg_root wt_pkg pkg_name wt_cmd out_wt
+  wt_pkg_root=$(mktemp -d "${TMPDIR:-/tmp}/harness-pkg-wt.XXXXXX")
+  echo "$wt_pkg_root" >> "$_HARNESS_TEMP_TRACKER"
+  wt_pkg="$wt_pkg_root/wt"
+  git -C "$repo" worktree add "$wt_pkg" -b "feat/pkg-wt" --quiet
+  touch "$wt_pkg/Cargo.toml"
+  for pkg_name in axios dayjs lodash requests serde; do
+    "$STAMP_GATE" context7 --package "$pkg_name" --version 1.0.0 --source locked --workspace "$wt_pkg" >/dev/null
+  done
+  for wt_cmd in \
+    "npm --prefix \"$wt_pkg\" install axios" \
+    "npm --prefix=\"$wt_pkg\" install axios" \
+    "pnpm --dir \"$wt_pkg\" add dayjs" \
+    "pnpm --dir=\"$wt_pkg\" add dayjs" \
+    "pnpm -C \"$wt_pkg\" add dayjs" \
+    "yarn --cwd \"$wt_pkg\" add lodash" \
+    "yarn --cwd=\"$wt_pkg\" add lodash" \
+    "uv --directory \"$wt_pkg\" add requests" \
+    "uv --directory=\"$wt_pkg\" add requests" \
+    "uv add --project \"$wt_pkg\" requests" \
+    "uv add --project=\"$wt_pkg\" requests" \
+    "cargo add --manifest-path \"$wt_pkg/Cargo.toml\" serde" \
+    "cargo add --manifest-path=\"$wt_pkg/Cargo.toml\" serde"
+  do
+    out_wt=$(jq -nc --arg ws "$repo" --arg cmd "$wt_cmd" \
+      '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_wt" ".decision" "allow" "Directory-flagged install stamped in linked worktree must be allowed: $wt_cmd"
+  done
+  out_wt=$(jq -nc --arg ws "$repo" --arg cmd "npm --prefix \"$wt_pkg\" install left-pad" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_wt" ".decision" "deny" "Unstamped package in linked worktree must still be denied"
+
+  # TDD C2: Conditional cd after true || must not move npm install target to stamped linked worktree
+  out_wt=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$repo\"; true || cd \"$wt_pkg\"; npm install axios" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_wt" ".decision" "deny" "Short-circuited cd into stamped worktree must not bypass Context7 on base repo"
 }
 
 test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
   [ -x "$PRE_COMMAND_GUARD" ] || { echo "pre-command-guard.sh missing or not executable: $PRE_COMMAND_GUARD" >&2; return 1; }
+  export HARNESS_DISABLE_DAEMON=1
 
   local repo
   repo=$(make_temp_repo)
@@ -267,6 +354,172 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
   local out_merge_ff
   out_merge_ff=$(printf '%s' "$p_merge_ff" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_merge_ff" ".decision" "allow" "git merge --ff-only must be allowed"
+
+  # 5b. C1 & C2: Non-coordinator ANSI-C quote + command wrapper bypasses before git push origin main -> deny
+  local bypass_push_cmd out_bypass_push
+  for bypass_push_cmd in \
+    "echo \$'\\''; git push origin main" \
+    "sudo git push origin main" \
+    "nohup git push origin main" \
+    "time git push origin main" \
+    "builtin git push origin main" \
+    "time -p git push origin main" \
+    "command -p git push origin main" \
+    "/usr/bin/sudo git push origin main" \
+    "/usr/bin/env git push origin main" \
+    "sudo -u root git push origin main" \
+    "sudo -g wheel git push origin main" \
+    "sudo --user root git push origin main" \
+    "sudo --group wheel git push origin main" \
+    "sudo -h host1 git push origin main" \
+    "sudo -- git push origin main" \
+    "env -u HOME git push origin main" \
+    "env --unset HOME git push origin main" \
+    "env -C /tmp git push origin main" \
+    "env --chdir /tmp git push origin main" \
+    "env -P /usr/bin git push origin main" \
+    "env -- git push origin main" \
+    "time -- git push origin main" \
+    "command -- git push origin main" \
+    "nohup -- git push origin main" \
+    "builtin -- git push origin main" \
+    "sudo -nu root git push origin main" \
+    "sudo -p 'pw:' git push origin main" \
+    "sudo --prompt 'pw:' git push origin main" \
+    "sudo --host host1 git push origin main" \
+    "sudo -D /tmp git push origin main" \
+    "sudo --chdir /tmp git push origin main" \
+    'env -S "git push origin main"' \
+    'env --split-string "git push origin main"' \
+    'env --split-string="FOO=1 git push origin main"' \
+    'env -iS "git push origin main"' \
+    "env --ignore-signal git push origin main" \
+    "env --block-signal git push origin main" \
+    "env --default-signal git push origin main" \
+    "env -vu HOME git push origin main" \
+    "/usr/bin/time -o log git push origin main" \
+    "/usr/bin/time -ao log git push origin main" \
+    "/usr/bin/time --output log git push origin main" \
+    "/usr/bin/time -f fmt git push origin main" \
+    "/usr/bin/time --format fmt git push origin main" \
+    "if npm test; then git push origin main; fi" \
+    "{ git push origin main; }" \
+    "! git push origin main" \
+    "exec git push origin main" \
+    "exec -a fake git push origin main" \
+    "exec -ca fake git push origin main" \
+    "exec -la fake git push origin main" \
+    "sudo -U root git push origin main" \
+    "sudo --other-user root git push origin main" \
+    "for x in a; do git push origin main; done" \
+    "if false; then echo x; else git push origin main; fi"
+  do
+    out_bypass_push=$(jq -nc --arg ws "$repo" --arg cmd "$bypass_push_cmd" \
+      '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_bypass_push" ".decision" "deny" "Wrapper/ANSI-C push to main must be denied: $bypass_push_cmd"
+  done
+
+  # 5c. I2: cd before '&' or '|' must not shift git push cwd into feature branch, plus cd -P/--/-/~/bare unit checks
+  local wt_cd_root wt_cd out_cd_bg out_cd_pipe
+  wt_cd_root=$(mktemp -d "${TMPDIR:-/tmp}/harness-cd-wt.XXXXXX")
+  echo "$wt_cd_root" >> "$_HARNESS_TEMP_TRACKER"
+  wt_cd="$wt_cd_root/wt-cd"
+  git -C "$repo" worktree add "$wt_cd" -b "feat/cd-bg" --quiet
+  out_cd_bg=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$wt_cd\" & git push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_cd_bg" ".decision" "deny" "cd before '&' must not move git push off main"
+  out_cd_pipe=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$wt_cd\" | git push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_cd_pipe" ".decision" "deny" "cd before '|' must not move git push off main"
+
+  local cond_cd_cmd out_cond_cd
+  mkdir -p "$wt_cd/sub" "$repo/sub"
+  ln -s "$wt_cd/sub" "$repo/link_to_wt"
+  for cond_cd_cmd in \
+    "cd \"$repo\"; true || cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; false && cd \"$wt_cd\"; git push" \
+    "if false; then cd \"$wt_cd\"; fi; git push" \
+    "cd \"$repo\"; cd \"$wt_cd\" bogus; git push" \
+    "cd \"$repo\"; cd -@ \"$wt_cd\"; git push" \
+    "cd \"$repo\"; if false; then echo x; cd \"$wt_cd\"; fi; git push" \
+    "cd \"$repo\"; if false; then echo \"fi\"; cd \"$wt_cd\"; fi; git push" \
+    "cd \"$repo\"; while false; do echo \"done\"; cd \"$wt_cd\"; done; git push" \
+    "cd \"$repo\"; false && { echo \"}\"; cd \"$wt_cd\"; }; git push" \
+    "cd \"$repo\"; if false; then (case x in a) echo ok;; esac); cd \"$wt_cd\"; fi; git push" \
+    "$(printf 'cd "%s"; if false; then\ncd "%s"\nfi\ngit push' "$repo" "$wt_cd")" \
+    "cd \"$repo\"; false && { echo x; cd \"$wt_cd\"; }; git push" \
+    "cd \"$repo\"; echo x | cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; true |& cd \"$wt_cd\" && git push" \
+    "cd \"$wt_cd\"; time cd \"$repo\"; git push" \
+    "cd \"$repo\"; time -- cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; time \"-p\" cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; time -p cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; builtin -- cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; FOO=bar time cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; \"time\" cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; \\time cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; command -v cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; command -V cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; command -p cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; command cd \"$wt_cd\"; git push" \
+    "cd \"$wt_cd\"; command cd \"$repo\"; git push" \
+    "cd \"$repo\"; time if false; then echo ok; cd \"$wt_cd\"; fi; git push" \
+    "cd \"$wt_cd\"; ( cd \"$repo\"; case x in x) true ;& true) git push ;; esac )" \
+    "cd \"$wt_cd\"; ( cd \"$repo\"; case x in x) true ;;& true) git push ;; esac )" \
+    "$(printf 'echo ok\\\r\ngit push')" \
+    "cd \"$repo/link_to_wt\" && cd .. && git push" \
+    "cd \"$repo\" && cd -PL \"$repo/link_to_wt/..\" && git push" \
+    "cd \"$repo\"; cd -e \"$wt_cd\"; git push" \
+    "cd \"$repo\"; env cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; nohup cd \"$wt_cd\"; git push" \
+    "cd \"$wt_cd\"; cd -LP \"$repo\"; git push" \
+    "cd \"$wt_cd\"; cd -q \"$repo\"; git push" \
+    "cd \"$wt_cd\"; cd \"$repo\" bogus; git push"
+  do
+    out_cond_cd=$(jq -nc --arg ws "$repo" --arg cmd "$cond_cd_cmd" \
+      '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_cond_cd" ".decision" "deny" "Conditional/invalid cd must not bypass main push gate: $cond_cd_cmd"
+  done
+
+  local out_valid_cd_push out_phys_lp_push out_phys_p_push
+  out_valid_cd_push=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$wt_cd\" && git push origin feat/cd-bg" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_valid_cd_push" ".decision" "allow" "Valid unconditional cd <wt> && git push feature-branch must stay allowed"
+  out_phys_lp_push=$(jq -nc --arg ws "$repo" --arg cmd "cd -LP \"$repo/link_to_wt/..\" && git push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_phys_lp_push" ".decision" "allow" "cd -LP through symlink/.. resolves physically to feature worktree"
+  out_phys_p_push=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$repo/link_to_wt\" && cd -P .. && git push" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_phys_p_push" ".decision" "allow" "cd -P .. inside symlinked dir resolves physically to symlink target parent"
+
+  CD_BASE="$wt_cd_root" PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import os
+from pathlib import Path
+import harness_core
+
+base = Path(os.environ["CD_BASE"])
+sub1 = base / "sub1"
+sub2 = base / "sub2"
+sub1.mkdir(parents=True, exist_ok=True)
+sub2.mkdir(parents=True, exist_ok=True)
+real_base = Path(os.path.realpath(str(base)))
+real_sub1 = Path(os.path.realpath(str(sub1)))
+logical_sub2 = Path(os.path.normpath(str(sub2)))
+
+segs = harness_core.iter_command_segments_with_cwd(
+    f"cd -P {sub1} && cd -- {sub2} && cd - && cd ~ && cd && pwd",
+    base,
+)
+cwds = [cwd for _, cwd in segs]
+assert cwds == [real_base, real_sub1, logical_sub2, real_sub1, Path.home(), Path.home()], cwds
+PYEOF
 
   # 6. On feature branch, git push origin feature-x -> allow
   git -C "$repo" checkout -b "feature-x" --quiet
@@ -1488,6 +1741,463 @@ EOF
   local out_doc_pr
   out_doc_pr=$(printf '%s' "$p_pr" | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_doc_pr" ".decision" "allow" "Doc-only PR must allow without tdd-pass.json"
+}
+
+test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
+  export HARNESS_DISABLE_DAEMON=1
+  local PRE_SUBAGENT_GUARD="$REPO_ROOT/scripts/hooks/pre-subagent-guard.sh"
+  local repo
+  repo=$(make_temp_repo)
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/coord-cmd" --quiet
+  mkdir -p "$repo/scripts"
+  ln -s "$STAMP_GATE" "$repo/scripts/stamp-gate.sh"
+  ln -s "$REPO_ROOT/scripts/harness-doctor.sh" "$repo/scripts/harness-doctor.sh"
+
+  # Register conv-coord as active Coordinator via swarm(action="title")
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "swarm", args: {action: "title", title: "Cmd Guard"}}}')" \
+    | "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  # 1. Allowed read-only inspection and coordination CLI commands
+  local allowed_cmd
+  for allowed_cmd in \
+    "git status" \
+    "git branch --show-current" \
+    "git log -n 5" \
+    "git diff main..HEAD" \
+    "git worktree list" \
+    "git remote -v" \
+    "git tag -l" \
+    "ls -la && cat README.md" \
+    "sort README.md | uniq" \
+    "./scripts/stamp-gate.sh swarm-quota status --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-coordinator status --workspace \"$repo\"" \
+    "./scripts/harness-doctor.sh --json" \
+    "gh pr list" \
+    "find . -maxdepth 2 -name '*.md'" \
+    "grep '>' README.md" \
+    'echo '\''$(id)'\''' \
+    'echo '\''`id`'\''' \
+    "git -C \"$repo\" status" \
+    "git branch --contains HEAD" \
+    "git remote show" \
+    "env FOO=bar git status" \
+    "/usr/bin/cat README.md" \
+    "./scripts/stamp-gate.sh swarm-coordinator on --workspace \"$repo\" --conversation-id \"conv-coord\"" \
+    "bash ./scripts/stamp-gate.sh tree-sha --workspace \"$repo\"" \
+    "bash \"$REPO_ROOT/scripts/stamp-gate.sh\" tree-sha --workspace \"$repo\"" \
+    "uniq -f 1 README.md" \
+    "git status >>/dev/null" \
+    "git status >|/dev/null" \
+    "git status &>/dev/null" \
+    "git status ; # harmless comment" \
+    "ls # a > b" \
+    "gh pr view 1" \
+    "gh issue list" \
+    'echo '\''${Z:--delete}'\''' \
+    'echo '\''{-delete,}'\''' \
+    "printf 'ok\n'" \
+    "[ -f README.md ]" \
+    "./scripts/stamp-gate.sh swarm-quota pause --workspace \"$repo\" --conversation-id \"conv-coord\" --wait-seconds 60" \
+    "./scripts/stamp-gate.sh dispatch --workspace \"$repo\" --role explorer" \
+    "./scripts/stamp-gate.sh select-model --workspace \"$repo\" --tier pro" \
+    "./scripts/stamp-gate.sh tree-sha --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh verify-pr-stamps --workspace \"$repo\"" \
+    "git status >/dev/null 2>&1"
+  do
+    local out_ok
+    out_ok=$(jq -nc --arg ws "$repo" --arg cmd "$allowed_cmd" \
+      '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_ok" ".decision" "allow" "Coordinator must allow read-only/coordination command: $allowed_cmd"
+  done
+
+  # Clear any active pause written by the allowed swarm-quota pause command before resume tests
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+
+  # 2. Denied work, mutation, shell bypass, basename spoof, self-disable, --action override, and PR/stamp commands
+  local out_env_s
+  out_env_s=$(jq -nc --arg ws "$repo" --arg cmd 'env -S "rm -rf src"' \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_env_s" ".decision" "deny"
+  assert_contains "$(printf '%s' "$out_env_s" | jq -r '.reason')" "env -S/--split-string"
+
+  local denied_cmd
+  for denied_cmd in \
+    "npm test" \
+    "./scripts/run-quiet.sh tests -- ./tests/run-all.sh" \
+    "git checkout -b feat/new" \
+    "git commit -m 'msg'" \
+    "git merge feat/worker" \
+    "git push origin feat/coord-cmd" \
+    "git branch -D old-branch" \
+    "git branch -m old-branch new-branch" \
+    "git branch --set-upstream-to=origin/main" \
+    "git branch new-branch" \
+    "git -c core.fsmonitor=evil status" \
+    "git --config-env=core.fsmonitor=X status" \
+    "git --exec-path=/tmp/evil status" \
+    "GIT_EXTERNAL_DIFF=evil git diff" \
+    "GIT_CONFIG_PARAMETERS=evil git status" \
+    "GIT_CONFIG_GLOBAL=/tmp/g git status" \
+    "GIT_SSH=evil git status" \
+    "GIT_EDITOR=evil git status" \
+    "GIT_EXEC_PATH=/tmp/x git status" \
+    "LD_LIBRARY_PATH=/tmp/x git status" \
+    "IFS=: git status" \
+    "git tag -l -d v1.0" \
+    "git branch --unset-upstream" \
+    'echo \;#; rm -rf src' \
+    'echo \&#; rm -rf src' \
+    'echo \|#; rm -rf src' \
+    'echo a#; rm -rf src' \
+    "./scripts/stamp-gate.sh swarm-coordinator bogus --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota --workspace \"$repo\"" \
+    "RIPGREP_CONFIG_PATH=/tmp/rc rg pat" \
+    "HOME=/tmp/evil git status" \
+    "XDG_CONFIG_HOME=/tmp/evil git status" \
+    "GIT_DIR=/tmp/evil git status" \
+    "GIT_WORK_TREE=/tmp/evil git status" \
+    "FOO=bar && git status" \
+    "PATH=/tmp/evil git status" \
+    "DYLD_INSERT_LIBRARIES=/tmp/x.dylib git status" \
+    "BASH_ENV=/tmp/x git status" \
+    "PYTHONPATH=/tmp/x git status" \
+    "GIT_PAGER=evil git log" \
+    "GIT_ASKPASS=/tmp/x git status" \
+    "GIT_CONFIG_COUNT=1 git status" \
+    "GIT_TRACE=/tmp/trace.log git status" \
+    "GIT_TRACE2_EVENT=/tmp/trace.log git status" \
+    "env GIT_TRACE=/tmp/trace.log git status" \
+    "GH_PAGER=evil gh pr list" \
+    "GH_BROWSER=/tmp/evil.sh gh pr view 1" \
+    "BROWSER=/tmp/evil.sh gh pr view 1" \
+    "GH_CONFIG_DIR=/tmp/evil gh pr list" \
+    "HARNESS_GH_BIN=/tmp/evil ./scripts/harness-doctor.sh --json" \
+    "PYTHONUSERBASE=/tmp/evil ./scripts/harness-doctor.sh --json" \
+    "SHELLOPTS=xtrace PS4='\$(id)' ./scripts/harness-doctor.sh --json" \
+    "cat <<< 'hello'" \
+    "gh pr view 1 --web" \
+    "gh pr view 1 -w" \
+    "file -C README.md" \
+    "file --com README.md" \
+    "sort --com=/tmp/evil.sh README.md" \
+    "sort --co=/tmp/evil.sh README.md" \
+    "! GIT_TRACE=/tmp/trace.log git status" \
+    "! GH_PAGER=evil gh pr list" \
+    "! PATH=/tmp/evil git status" \
+    "! LD_PRELOAD=/tmp/evil.so git status" \
+    "! sudo ls" \
+    "! exec ls" \
+    "! env -P /tmp/evil ls" \
+    "! /tmp/evil/env ls" \
+    "! /usr/bin/time -o /tmp/t.out ls" \
+    "GIT_SEQUENCE_EDITOR=evil git status" \
+    "GIT_CONFIG_SYSTEM=/tmp/x git status" \
+    "GIT_TEMPLATE_DIR=/tmp/x git status" \
+    "DYLD_LIBRARY_PATH=/tmp git status" \
+    "ENV=/tmp/x git status" \
+    "PAGER=evil git log" \
+    "VISUAL=vim git status" \
+    "EDITOR=vim git status" \
+    "CDPATH=/tmp git status" \
+    "git branch --edit-description" \
+    "echo a# > README.md" \
+    'echo a#$(id)' \
+    "echo x >/dev/nullx" \
+    "env --split-string='rm -rf src' git status" \
+    "env --split-string 'rm -rf src' git status" \
+    "env -iS 'rm -rf src' git status" \
+    "env -vS 'rm -rf src' git status" \
+    "/usr/bin/time -o cat rm -rf src" \
+    "./time git status" \
+    "/tmp/x/nohup ls" \
+    "/tmp/x/env git status" \
+    "env -vu cat rm -rf src" \
+    'find . ${Z:--delete}' \
+    'find . $FLAG' \
+    'echo "$HOME"' \
+    'find . {-delete,}' \
+    '{ rm -rf src; }' \
+    'printf -v '\''a[$(rm -rf src)]'\'' x' \
+    'test -v '\''a[$(rm -rf src)]'\''' \
+    '[ -v '\''a[$(rm -rf src)]'\'' ]' \
+    "exec git status" \
+    "git branch --unset-up" \
+    "git branch --set-upstream-t=origin/main" \
+    "git branch --edit-desc" \
+    "git --git-dir=/tmp status" \
+    "git --work-tree=/tmp status" \
+    "sudo git status" \
+    "/usr/bin/sudo git status" \
+    "time sudo git status" \
+    "nohup sudo git status" \
+    "command sudo git status" \
+    "builtin sudo git status" \
+    "time PATH=/tmp/evil git status" \
+    "nohup LD_PRELOAD=/tmp/evil.so git status" \
+    "command GIT_SSH_COMMAND=evil git status" \
+    'time env -S "rm -rf src" && ls' \
+    'nohup env -S "rm -rf src" && git status' \
+    '/usr/bin/env -S "rm -rf src"' \
+    "env GIT_EXTERNAL_DIFF=evil git status" \
+    "env FOO=bar npm test" \
+    "git diff --output=out.txt" \
+    "git --upload-pack=evil status" \
+    "git --receive-pack=evil status" \
+    "git remote add origin https://example.com/r.git" \
+    "git tag v1.0" \
+    "git tag -d v1.0" \
+    "git worktree add /tmp/wt" \
+    "gh pr create --fill" \
+    "gh pr merge 1" \
+    "gh auth login" \
+    "gh issue create --title x" \
+    "gh repo delete foo" \
+    "bash -c 'echo hi'" \
+    "rm -rf src" \
+    "env -S \"rm -rf src\"" \
+    "sort -o README.md README.md" \
+    "sort -ro README.md README.md" \
+    "sort -uo README.md README.md" \
+    "sort --output=README.md README.md" \
+    "sort --out=README.md README.md" \
+    "sort --compress-program=sh README.md" \
+    "uniq README.md out.txt" \
+    "uniq - .harness/state/swarm/swarm-coordinator.json" \
+    "uniq -- README.md out.txt" \
+    "uniq -- -c out.txt" \
+    "uniq -- -f out.txt" \
+    "uniq README.md --" \
+    "uniq README.md -out.txt" \
+    "rg --pre evil pat" \
+    "rg --pre=evil pat" \
+    "rg --pre-glob='*.md' pat" \
+    "rg --hostname-bin=evil pat" \
+    "rg --hostname-bin evil pat" \
+    "/tmp/fake/stamp-gate.sh dispatch" \
+    "/usr/bin/../../tmp/x/cat README.md" \
+    "./cat README.md" \
+    "git status 'unterminated" \
+    "git status >&2file" \
+    "git status >&1out" \
+    "echo bad > README.md" \
+    "echo bad >| README.md" \
+    "echo bad >> README.md" \
+    "echo bad &> out.txt" \
+    'echo $(touch /tmp/pwned)' \
+    'echo "$(rm -rf src)"' \
+    'echo "`id`"' \
+    "git status && rm -rf src" \
+    "git status || rm -rf src" \
+    "git status ; rm -rf src" \
+    "git status | rm -rf src" \
+    "git status & rm -rf src" \
+    "echo \`id\`" \
+    "cat <(id)" \
+    "find . -name '*.tmp' -delete" \
+    "find . -exec rm {} \\;" \
+    "find . -execdir rm {} \\;" \
+    "find . -ok rm {} \\;" \
+    "find . -okdir rm {} \\;" \
+    "find . -fprint out.txt" \
+    "find . -fprint0 out.txt" \
+    "find . -fprintf out.txt '%p'" \
+    "find . -fls out.txt" \
+    "bash ./scripts/stamp-gate.sh canon --verdict PASS" \
+    "./scripts/stamp-gate.sh canon --verdict PASS" \
+    "./scripts/stamp-gate.sh security --verdict PASS --critical 0 --important 0" \
+    "./scripts/stamp-gate.sh tdd --verdict PASS" \
+    "./scripts/stamp-gate.sh review --kind tdd" \
+    "./scripts/stamp-gate.sh ui --verdict PASS" \
+    "./scripts/stamp-gate.sh context7 --lib react" \
+    "./scripts/stamp-gate.sh clear-pr-audit" \
+    "./scripts/stamp-gate.sh swarm-coordinator off --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-coordinator status --action off --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-coordinator status --action=off --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota clear --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota attempt-resume --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota status --action clear --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota status --action=clear --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota status --action resume --workspace \"$repo\"" \
+    "./scripts/stamp-gate.sh swarm-quota status --action=resume --workspace \"$repo\"" \
+    "./bash scripts/stamp-gate.sh tree-sha" \
+    "# comment only" \
+    "python3 -c 'print(1)'"
+  do
+    local out_bad
+    out_bad=$(jq -nc --arg ws "$repo" --arg cmd "$denied_cmd" \
+      '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_bad" ".decision" "deny" "Coordinator-Only guard must deny: $denied_cmd"
+    assert_contains "$(printf '%s' "$out_bad" | jq -r '.reason')" "Coordinator-Only"
+  done
+
+  # Newline delimiter (C2) and real spoofed harness scripts + symlink (I1) must be denied
+  local nl_cmd out_nl spoof_dir
+  nl_cmd=$(printf 'git status\nrm -rf src')
+  out_nl=$(jq -nc --arg ws "$repo" --arg cmd "$nl_cmd" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_nl" ".decision" "deny" "Coordinator guard must deny forbidden command after newline"
+
+  local cmt_cmd out_cmt ansic_cmd out_ansic
+  cmt_cmd=$(printf "ls # '\nrm -rf src\n# '")
+  out_cmt=$(jq -nc --arg ws "$repo" --arg cmd "$cmt_cmd" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_cmt" ".decision" "deny" "C1: Shell # comment containing unmatched quote must not hide rm -rf"
+
+  ansic_cmd="echo \$'\'' ; rm -rf src #'"
+  out_ansic=$(jq -nc --arg ws "$repo" --arg cmd "$ansic_cmd" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_ansic" ".decision" "deny" "C2: ANSI-C quoting \$'...' must fail closed"
+
+  # I2: Isolated syntax guards verified directly via exact reason strings on otherwise-allowed commands
+  local out_ansic_only out_locale_only out_procsub_only
+  out_ansic_only=$(jq -nc --arg ws "$repo" --arg cmd "echo \$'a'" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_ansic_only" ".decision" "deny"
+  assert_contains "$(printf '%s' "$out_ansic_only" | jq -r '.reason')" "ANSI-C"
+
+  out_locale_only=$(jq -nc --arg ws "$repo" --arg cmd 'echo $"a"' \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_locale_only" ".decision" "deny"
+  assert_contains "$(printf '%s' "$out_locale_only" | jq -r '.reason')" "locale"
+
+  out_procsub_only=$(jq -nc --arg ws "$repo" --arg cmd 'cat <(ls)' \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_procsub_only" ".decision" "deny"
+  assert_contains "$(printf '%s' "$out_procsub_only" | jq -r '.reason')" "process substitution"
+
+  local heredoc_cmd out_heredoc lc1_cmd out_lc1 lc2_cmd out_lc2 lc3_cmd out_lc3 lc_crlf_cmd
+  heredoc_cmd=$(printf "cat << true\necho '\$(rm -rf src)'\ntrue")
+  out_heredoc=$(jq -nc --arg ws "$repo" --arg cmd "$heredoc_cmd" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_heredoc" ".decision" "deny" "Unquoted here-doc with single-quoted cmd substitution must be denied"
+  assert_contains "$(printf '%s' "$out_heredoc" | jq -r '.reason')" "here-document"
+
+  lc1_cmd=$(printf 'echo "$\\\n(rm -rf src)"')
+  lc2_cmd=$(printf 'cat <\\\n<EOF\nhi\nEOF')
+  lc3_cmd=$(printf 'cat <\\\n(ls)')
+  lc_crlf_cmd=$(printf 'echo ok\\\r\nrm -rf src')
+  for out_lc1 in "$lc1_cmd" "$lc2_cmd" "$lc3_cmd" "$lc_crlf_cmd"; do
+    out_lc2=$(jq -nc --arg ws "$repo" --arg cmd "$out_lc1" \
+      '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_lc2" ".decision" "deny" "Line continuation bypass must be denied: $out_lc1"
+  done
+
+  out_lc3=$(jq -nc --arg ws "$repo" --arg cmd "uniq - && uniq -c README.md" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_lc3" ".decision" "allow" "Read-only uniq - and uniq -c README.md must stay allowed"
+
+  spoof_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-spoof.XXXXXX")
+  echo "$spoof_dir" >> "$_HARNESS_TEMP_TRACKER"
+  mkdir -p "$spoof_dir/sym" "$spoof_dir/scripts" "$repo/sub"
+  ln -s "$repo/sub" "$spoof_dir/sym_to_repo"
+  printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/stamp-gate.sh"
+  printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/harness-doctor.sh"
+  printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/scripts/stamp-gate.sh"
+  printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/scripts/harness-doctor.sh"
+  chmod +x "$spoof_dir/stamp-gate.sh" "$spoof_dir/harness-doctor.sh" "$spoof_dir/scripts/stamp-gate.sh" "$spoof_dir/scripts/harness-doctor.sh"
+  ln -s "$spoof_dir/stamp-gate.sh" "$spoof_dir/sym/stamp-gate.sh"
+  local spoof_cmd
+  for spoof_cmd in \
+    "$spoof_dir/stamp-gate.sh dispatch" \
+    "$spoof_dir/harness-doctor.sh --json" \
+    "$spoof_dir/sym/stamp-gate.sh dispatch" \
+    "bash \"$spoof_dir/stamp-gate.sh\" dispatch" \
+    "bash \"$spoof_dir/harness-doctor.sh\" --json" \
+    "cd \"$spoof_dir\" && ./stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\" && ./harness-doctor.sh --json" \
+    "cd \"$spoof_dir\" && ./scripts/stamp-gate.sh dispatch" \
+    "time cd \"$spoof_dir\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; FOO=bar time cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; \"time\" cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; \\time cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; command -v cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; command cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; echo x | cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir/sym_to_repo\"; cd ..; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/harness-doctor.sh --json" \
+    "cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; false && cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; true || cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd \"$repo\" bogus; bash ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd -@ \"$repo\"; bash ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd -e \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; env cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; nohup cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; if false; then echo x; cd \"$repo\"; fi; ./scripts/stamp-gate.sh dispatch"
+  do
+    local out_sp
+    out_sp=$(jq -nc --arg ws "$repo" --arg cmd "$spoof_cmd" \
+      '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_sp" ".decision" "deny" "Real spoofed/symlink script must be denied: $spoof_cmd"
+  done
+
+  # 2b. Premature stamp-gate.sh swarm-quota resume returns force_ask before reset, allow after reset;
+  #     C1: chained deny MUST override force_ask (never let force_ask hide rm -rf).
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 600 --buffer-seconds 0 --window 5h >/dev/null
+  local out_res_ask out_res_chained out_res_ok
+  out_res_ask=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\"" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_res_ask" ".decision" "force_ask" "Premature swarm-quota resume must trigger force_ask"
+
+  out_res_chained=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\" && rm -rf src" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_res_chained" ".decision" "deny" "Chained deny after premature resume must override force_ask"
+
+  jq '.status = "resuming"' "$repo/.harness/state/swarm/swarm-quota-wait.json" > "$repo/.harness/state/swarm/swarm-quota-wait.json.tmp" \
+    && mv "$repo/.harness/state/swarm/swarm-quota-wait.json.tmp" "$repo/.harness/state/swarm/swarm-quota-wait.json"
+  local out_resuming_ask
+  out_resuming_ask=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\"" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_resuming_ask" ".decision" "force_ask" "Premature swarm-quota resume while resuming must trigger force_ask"
+
+  "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-coord" --wait-seconds 0 --buffer-seconds 0 --window 5h >/dev/null
+  out_res_ok=$(jq -nc --arg ws "$repo" --arg cmd "./scripts/stamp-gate.sh swarm-quota resume --workspace \"$repo\"" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_res_ok" ".decision" "allow" "swarm-quota resume allowed once reset time has elapsed"
+
+  # 3. Worker (distinct conversationId) is NOT blocked from running tests or git commits
+  local out_worker
+  out_worker=$(jq -nc --arg ws "$repo" \
+    '{workspacePaths: [$ws], conversationId: "conv-worker", lastUserInput: "[SWARM_WORKER_CONTRACT] run tests", toolCall: {name: "run_command", args: {CommandLine: "git status && npm test"}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_worker" ".decision" "allow" "Swarm worker must be allowed to run tests and normal commands"
+
+  # I3: Trusted bin symlink escaping into /tmp must fail _is_trusted_coordinator_exe
+  PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import os
+import harness_core
+
+orig_lexists = os.path.lexists
+orig_realpath = os.path.realpath
+try:
+    os.path.lexists = lambda p: True if p == "/usr/local/bin/cat" else orig_lexists(p)
+    os.path.realpath = lambda p: "/tmp/evil/cat" if p == "/usr/local/bin/cat" else orig_realpath(p)
+    assert harness_core._is_trusted_coordinator_exe("/usr/local/bin/cat") is False
+finally:
+    os.path.lexists = orig_lexists
+    os.path.realpath = orig_realpath
+PYEOF
 }
 
 run_tests

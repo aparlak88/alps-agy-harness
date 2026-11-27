@@ -97,6 +97,11 @@ test_agents_md_no_frontmatter_and_under_8kb() {
   assert_contains "$content" "claude -p" "AGENTS.md must document claude -p primary reviewer"
   assert_contains "$content" "gemini-4-carbon-high" "AGENTS.md must document gemini-4-carbon-high timeout fallback"
   assert_contains "$content" "gemini-4-neon-medium" "AGENTS.md must document gemini-4-neon-medium timeout fallback"
+  assert_contains "$content" "Coordinator-Only" "AGENTS.md must enforce Swarm Coordinator-Only mode"
+  assert_contains "$content" "integrator" "AGENTS.md must document Swarm integrator worker delegation"
+  assert_contains "$content" "swarm-quota" "AGENTS.md must document stamp-gate.sh swarm-quota recovery"
+  assert_contains "$content" "quota_resets" "AGENTS.md must reference quota_resets from swarm models"
+  assert_contains "$content" "schedule" "AGENTS.md must reference native schedule wait for quota recovery"
 }
 
 assert_platform_rule_contract() {

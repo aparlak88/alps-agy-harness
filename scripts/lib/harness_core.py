@@ -438,6 +438,21 @@ def get_head_oid(workspace: Path) -> str:
     return oid or "UNBORN"
 
 
+# Pre-edit guard and Coordinator-Only check follow worktree/external path resolution.
+def get_swarm_state_dir(workspace: Path) -> Path:
+    """Ensure branch-independent ``.harness/state/swarm`` exists and is git-excluded."""
+    state_dir = workspace / ".harness" / "state" / "swarm"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    ensure_harness_git_exclude(workspace)
+    return state_dir
+
+
+def _existing_swarm_state_dir(workspace: Path) -> Optional[Path]:
+    """Return ``.harness/state/swarm`` only if it already exists on disk."""
+    state_dir = workspace / ".harness" / "state" / "swarm"
+    return state_dir if state_dir.is_dir() else None
+
+
 def get_state_dir(workspace: Path) -> Path:
     """Ensure ``.harness/state/<slug>`` exists and is excluded from git tracking."""
     slug = get_branch_slug(workspace)
@@ -482,16 +497,97 @@ def compute_code_tree_sha(workspace: Path, ref: str = "HEAD") -> str:
     return hash_res.stdout.strip() if hash_res.returncode == 0 else "UNBORN"
 
 
+def _strip_shell_line_continuations(cmd_line: str) -> str:
+    """Strip POSIX ``\\<newline>`` line continuations outside single quotes and ``$'...'``."""
+    if "\\" not in cmd_line:
+        return cmd_line
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    in_ansi_c = False
+    escape = False
+    at_token_start = True
+    i = 0
+    n = len(cmd_line)
+    while i < n:
+        c = cmd_line[i]
+        if escape:
+            out.append(c)
+            escape = False
+            at_token_start = False
+            i += 1
+            continue
+        if in_ansi_c:
+            out.append(c)
+            if c == "\\":
+                if i + 1 < n:
+                    out.append(cmd_line[i + 1])
+                    i += 2
+                    continue
+            elif c == "'":
+                in_ansi_c = False
+            i += 1
+            continue
+        if in_single:
+            out.append(c)
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if c == "\\":
+            if i + 1 < n and cmd_line[i + 1] == "\n":
+                i += 2
+                continue
+            escape = True
+            at_token_start = False
+            out.append(c)
+            i += 1
+            continue
+        if not in_double and c == "$" and i + 1 < n and cmd_line[i + 1] == "'":
+            in_ansi_c = True
+            at_token_start = False
+            out.append("$'")
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = True
+            at_token_start = False
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            in_double = not in_double
+            at_token_start = False
+            out.append(c)
+            i += 1
+            continue
+        if not in_double and c == "#" and at_token_start:
+            while i < n and cmd_line[i] != "\n":
+                out.append(cmd_line[i])
+                i += 1
+            continue
+        if not in_double and c in (" ", "\t", "\n", "\r", ";", "|", "&", "(", ")"):
+            at_token_start = True
+        else:
+            at_token_start = False
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
-    """Split a shell command into ``(segment_text, delimiter)`` pairs respecting quotes."""
+    """Split a shell command into ``(segment_text, delimiter)`` pairs respecting quotes and comments."""
     if not cmd_line:
         return []
+    cmd_line = _strip_shell_line_continuations(cmd_line)
 
     segments: list[tuple[str, str]] = []
     current: list[str] = []
     in_single = False
     in_double = False
+    in_ansi_c = False
     escape = False
+    at_token_start = True
     i = 0
     n = len(cmd_line)
 
@@ -500,37 +596,83 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
         if escape:
             current.append(c)
             escape = False
+            at_token_start = False
             i += 1
             continue
         if c == "\\" and not in_single:
             escape = True
+            at_token_start = False
             current.append(c)
             i += 1
+            continue
+        if not in_single and not in_double and not in_ansi_c and c == "$" and i + 1 < n and cmd_line[i + 1] == "'":
+            in_ansi_c = True
+            at_token_start = False
+            current.append("$'")
+            i += 2
             continue
         if c == "'" and not in_double:
-            in_single = not in_single
+            if in_ansi_c:
+                in_ansi_c = False
+            else:
+                in_single = not in_single
+            at_token_start = False
             current.append(c)
             i += 1
             continue
-        if c == '"' and not in_single:
+        if c == '"' and not in_single and not in_ansi_c:
             in_double = not in_double
+            at_token_start = False
             current.append(c)
             i += 1
             continue
 
-        if not in_single and not in_double:
-            if c in ("&", "|") and i + 1 < n and cmd_line[i + 1] == c:
+        if not in_single and not in_double and not in_ansi_c:
+            if c == "#" and at_token_start:
+                while i < n and cmd_line[i] != "\n":
+                    i += 1
+                continue
+            if c in (" ", "\t"):
+                at_token_start = True
+                current.append(c)
+                i += 1
+                continue
+            if c == ";" and i + 2 < n and cmd_line[i + 1] == ";" and cmd_line[i + 2] == "&":
                 seg = "".join(current).strip()
-                segments.append((seg, c + c))
+                segments.append((seg, ";;&"))
                 current = []
+                at_token_start = True
+                i += 3
+                continue
+            if (
+                (c in ("&", "|", ";") and i + 1 < n and cmd_line[i + 1] == c)
+                or (c in ("|", ";") and i + 1 < n and cmd_line[i + 1] == "&")
+            ):
+                delim = cmd_line[i : i + 2]
+                seg = "".join(current).strip()
+                segments.append((seg, delim))
+                current = []
+                at_token_start = True
                 i += 2
+                continue
+            if c == "&" and ((i > 0 and cmd_line[i - 1] in (">", "<")) or (i + 1 < n and cmd_line[i + 1] == ">")):
+                at_token_start = False
+                current.append(c)
+                i += 1
+                continue
+            if c == "|" and i > 0 and cmd_line[i - 1] == ">":
+                at_token_start = False
+                current.append(c)
+                i += 1
                 continue
             if c in (";", "\n", "|", "&", "(", ")"):
                 seg = "".join(current).strip()
                 segments.append((seg, c))
                 current = []
+                at_token_start = True
                 i += 1
                 continue
+        at_token_start = False
         current.append(c)
         i += 1
 
@@ -538,6 +680,20 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
     if tail:
         segments.append((tail, ""))
     return segments
+
+
+_TIME_SHORT_VAL = "of"
+_TIME_LONG_VAL = ("--output", "--format")
+
+
+def _short_flag_needs_next_arg(flag: str, val_chars: str) -> bool:
+    """Return True if short flag cluster ``flag`` ends with an option character consuming the next argv token."""
+    if not flag.startswith("-") or flag.startswith("--") or len(flag) < 2:
+        return False
+    for pos, ch in enumerate(flag[1:], start=1):
+        if ch in val_chars:
+            return pos == len(flag) - 1
+    return False
 
 
 def _strip_segment_wrappers(seg: str) -> list[str]:
@@ -551,35 +707,125 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
     if not tokens:
         return []
 
+    SUDO_SHORT_VAL = "ughpDU"
+    SUDO_LONG_VAL = ("--user", "--group", "--host", "--prompt", "--chdir", "--other-user")
+    ENV_SHORT_VAL = "uCP"
+    ENV_LONG_VAL = ("--unset", "--chdir")
+
+    splices = 0
     idx = 0
     while idx < len(tokens):
         tok = tokens[idx]
         if "=" in tok and tok.split("=", 1)[0].isidentifier():
             idx += 1
             continue
-        if tok == "sudo":
+        if tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
+            idx += 1
+            continue
+        if tok == "exec":
             idx += 1
             while idx < len(tokens) and tokens[idx].startswith("-"):
-                if tokens[idx] in ("-u", "-g", "-h", "-p", "-U"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                idx += 2 if _short_flag_needs_next_arg(tokens[idx], "a") else 1
+            continue
+        base = os.path.basename(tok)
+        if base == "sudo":
+            idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                if tokens[idx] in SUDO_LONG_VAL or _short_flag_needs_next_arg(tokens[idx], SUDO_SHORT_VAL):
                     idx += 2
                 else:
                     idx += 1
             continue
-        if tok == "env":
+        if base == "env":
             idx += 1
             while idx < len(tokens):
-                if tokens[idx].startswith("-"):
-                    if tokens[idx] in ("-u", "-C", "-S"):
-                        idx += 2
-                    else:
-                        idx += 1
-                elif "=" in tokens[idx] and tokens[idx].split("=", 1)[0].isidentifier():
+                etok = tokens[idx]
+                if etok == "--":
+                    idx += 1
+                    break
+                if etok == "--split-string" and idx + 1 < len(tokens) and splices < 4:
+                    try:
+                        expanded = shlex.split(tokens[idx + 1])
+                    except Exception:
+                        expanded = tokens[idx + 1].split()
+                    tokens[idx : idx + 2] = expanded
+                    splices += 1
+                    continue
+                if etok.startswith("--split-string=") and splices < 4:
+                    raw_val = etok[len("--split-string=") :]
+                    try:
+                        expanded = shlex.split(raw_val)
+                    except Exception:
+                        expanded = raw_val.split()
+                    tokens[idx : idx + 1] = expanded
+                    splices += 1
+                    continue
+                if etok.startswith("-") and not etok.startswith("--") and "S" in etok[1:] and splices < 4:
+                    s_pos = etok.index("S", 1)
+                    if s_pos == len(etok) - 1 and idx + 1 < len(tokens):
+                        raw_val = tokens[idx + 1]
+                        try:
+                            expanded = shlex.split(raw_val)
+                        except Exception:
+                            expanded = raw_val.split()
+                        tokens[idx : idx + 2] = expanded
+                        splices += 1
+                        continue
+                    if s_pos < len(etok) - 1:
+                        raw_val = etok[s_pos + 1 :]
+                        try:
+                            expanded = shlex.split(raw_val)
+                        except Exception:
+                            expanded = raw_val.split()
+                        tokens[idx : idx + 1] = expanded
+                        splices += 1
+                        continue
+                if etok in ENV_LONG_VAL or _short_flag_needs_next_arg(etok, ENV_SHORT_VAL):
+                    idx += 2
+                elif etok.startswith("-"):
+                    idx += 1
+                elif "=" in etok and etok.split("=", 1)[0].isidentifier():
                     idx += 1
                 else:
                     break
             continue
-        if tok in ("nohup", "time", "builtin", "command"):
+        if base == "time":
             idx += 1
+            while idx < len(tokens) and tokens[idx].startswith("-"):
+                if tokens[idx] == "--":
+                    idx += 1
+                    break
+                if tokens[idx] in _TIME_LONG_VAL or _short_flag_needs_next_arg(tokens[idx], _TIME_SHORT_VAL):
+                    idx += 2
+                else:
+                    idx += 1
+            continue
+        if base == "command":
+            probe_idx = idx + 1
+            is_query = False
+            while probe_idx < len(tokens) and tokens[probe_idx].startswith("-"):
+                ctok = tokens[probe_idx]
+                if ctok == "--":
+                    probe_idx += 1
+                    break
+                if not ctok.startswith("--") and ("v" in ctok[1:] or "V" in ctok[1:]):
+                    is_query = True
+                    break
+                probe_idx += 1
+            if is_query:
+                break
+            idx = probe_idx
+            continue
+        if base in ("nohup", "builtin"):
+            idx += 1
+            if idx < len(tokens) and tokens[idx] == "--":
+                idx += 1
             continue
         break
 
@@ -596,41 +842,175 @@ def parse_command_segments(cmd_line: str) -> list[list[str]]:
     return result
 
 
-def _resolve_dir_arg(base: Path, raw_dir: str) -> Path:
-    """Resolve a path argument relative to ``base`` normalizing ``..`` and symlinks."""
+def _resolve_dir_arg(base: Path, raw_dir: str, physical: bool = False) -> Path:
+    """Resolve a path argument relative to ``base``, honoring physical symlink resolution only when ``physical=True``."""
     expanded = os.path.expanduser(raw_dir)
+    if physical:
+        base_str = str(base)
+        if not os.path.isabs(expanded):
+            try:
+                base_str = os.path.realpath(base_str)
+            except OSError:
+                pass
+        joined = expanded if os.path.isabs(expanded) else os.path.join(base_str, expanded)
+        if os.path.exists(joined):
+            try:
+                return Path(os.path.realpath(joined))
+            except OSError:
+                pass
+        return Path(os.path.normpath(joined))
     joined = expanded if os.path.isabs(expanded) else os.path.join(str(base), expanded)
-    norm = os.path.normpath(joined)
-    try:
-        return Path(os.path.realpath(norm)) if os.path.exists(norm) else Path(norm)
-    except OSError:
-        return Path(norm)
+    return Path(os.path.normpath(joined))
 
 
-def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path]:
-    """Compute next ``(current_cwd, prev_cwd)`` after a ``cd`` command segment."""
+def _apply_cd_segment_checked(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path, bool]:
+    """Compute ``(next_cwd, prev_cwd, portable)`` for a ``cd`` segment conservatively across bash/zsh."""
     idx = 1
     saw_double_dash = False
-    target = ""
+    physical = False
+    portable = True
+    pos_args: list[str] = []
     while idx < len(tokens):
         tok = tokens[idx]
         if not saw_double_dash and tok == "--":
             saw_double_dash = True
             idx += 1
             continue
-        if not saw_double_dash and tok in ("-P", "-L", "-e", "-@"):
+        if not saw_double_dash and tok.startswith("-") and tok != "-":
+            if all(ch in "LP" for ch in tok[1:]):
+                physical = tok[-1] == "P"
+            else:
+                portable = False
             idx += 1
             continue
-        target = tok
-        break
+        pos_args.append(tok)
+        idx += 1
+
+    if len(pos_args) > 1:
+        portable = False
+    target = pos_args[0] if pos_args else ""
 
     if not target or target == "~":
         nxt = Path.home()
     elif target == "-":
         nxt = prev_cwd
     else:
-        nxt = _resolve_dir_arg(current_cwd, target)
-    return nxt, current_cwd
+        nxt = _resolve_dir_arg(current_cwd, target, physical=physical)
+    return nxt, current_cwd, portable
+
+
+def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path]:
+    """Compute next ``(current_cwd, prev_cwd)`` after a ``cd`` command segment."""
+    nxt, prev, _ = _apply_cd_segment_checked(tokens, current_cwd, prev_cwd)
+    return nxt, prev
+
+
+_CONTROL_KEYWORD_RE = re.compile(r"^\s*(?:(?:if|then|else|elif|while|until|do)\b|[!{](?:\s|$))")
+
+
+def _scan_leading_unquoted_words(raw_seg: str) -> list[tuple[str, bool, bool]]:
+    """Return whitespace-separated ``(word, was_quoted, lhs_quoted)`` tuples from ``raw_seg``."""
+    words: list[tuple[str, bool, bool]] = []
+    buf: list[str] = []
+    has_token = False
+    was_quoted = False
+    lhs_quoted = False
+    saw_eq = False
+    in_single = False
+    in_double = False
+    in_ansi_c = False
+    escape = False
+    i = 0
+    n = len(raw_seg)
+    while i < n:
+        c = raw_seg[i]
+        if escape:
+            buf.append(c)
+            escape = False
+            has_token = True
+            was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
+            i += 1
+            continue
+        if in_ansi_c:
+            has_token = True
+            was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
+            if c == "\\":
+                buf.append(c)
+                if i + 1 < n:
+                    buf.append(raw_seg[i + 1])
+                    i += 2
+                    continue
+            elif c == "'":
+                in_ansi_c = False
+            buf.append(c)
+            i += 1
+            continue
+        if c == "\\" and not in_single:
+            escape = True
+            has_token = True
+            was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
+            i += 1
+            continue
+        if not in_single and not in_double and c == "$" and i + 1 < n and raw_seg[i + 1] == "'":
+            in_ansi_c = True
+            has_token = True
+            was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
+            buf.append("$'")
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            has_token = True
+            was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            has_token = True
+            was_quoted = True
+            if not saw_eq:
+                lhs_quoted = True
+            i += 1
+            continue
+        if not in_single and not in_double and c in (" ", "\t", "\r", "\n"):
+            if has_token:
+                words.append(("".join(buf), was_quoted, lhs_quoted))
+                buf = []
+                has_token = False
+                was_quoted = False
+                lhs_quoted = False
+                saw_eq = False
+            i += 1
+            continue
+        if not in_single and not in_double and c == "=":
+            saw_eq = True
+        buf.append(c)
+        has_token = True
+        i += 1
+    if has_token:
+        words.append(("".join(buf), was_quoted, lhs_quoted))
+    return words
+
+
+def _dedup_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    out: list[Path] = []
+    for p in paths:
+        k = str(p)
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
+    return out
 
 
 def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tuple[list[str], Path]]:
@@ -647,13 +1027,173 @@ def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tup
         cleaned = _strip_segment_wrappers(raw_seg)
         if cleaned:
             out.append((cleaned, current_cwd))
-            if cleaned[0] == "cd" and delim not in ("|", "&"):
+            if cleaned[0] == "cd" and delim not in ("|", "|&", "&"):
                 current_cwd, prev_cwd = _apply_cd_segment(cleaned, current_cwd, prev_cwd)
 
         if delim == "(":
             cwd_stack.append((current_cwd, prev_cwd))
         elif delim == ")" and cwd_stack:
             current_cwd, prev_cwd = cwd_stack.pop()
+
+    return out
+
+
+def _is_shell_builtin_cd(raw_words: list[tuple[str, bool, bool]]) -> tuple[bool, bool]:
+    """Return ``(is_builtin_cd, portable_wrapper)`` for ``raw_words`` across bash/zsh."""
+    idx = 0
+    saw_assignment = False
+    portable_wrapper = True
+    while idx < len(raw_words):
+        tok, was_quoted, lhs_quoted = raw_words[idx]
+        if not lhs_quoted and "=" in tok and tok.split("=", 1)[0].isidentifier():
+            saw_assignment = True
+            idx += 1
+            continue
+        if not was_quoted and not saw_assignment and tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
+            idx += 1
+            continue
+        if not was_quoted and not saw_assignment and tok == "time":
+            idx += 1
+            while idx < len(raw_words) and raw_words[idx][0].startswith("-"):
+                portable_wrapper = False
+                ttok = raw_words[idx][0]
+                if ttok == "--":
+                    idx += 1
+                    break
+                if ttok in _TIME_LONG_VAL or _short_flag_needs_next_arg(ttok, _TIME_SHORT_VAL):
+                    idx += 2
+                else:
+                    idx += 1
+            continue
+        if tok == "builtin":
+            idx += 1
+            if idx < len(raw_words) and raw_words[idx][0] == "--":
+                portable_wrapper = False
+                idx += 1
+            continue
+        if tok == "command":
+            idx += 1
+            portable_wrapper = False
+            while idx < len(raw_words) and raw_words[idx][0].startswith("-"):
+                ctok = raw_words[idx][0]
+                if ctok == "--":
+                    idx += 1
+                    break
+                if not ctok.startswith("--") and ("v" in ctok[1:] or "V" in ctok[1:]):
+                    return False, True
+                idx += 1
+            continue
+        return tok == "cd", portable_wrapper
+    return False, portable_wrapper
+
+
+def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -> list[tuple[list[str], list[Path]]]:
+    """Parse command segments returning conservative possible CWD branches across conditional/failing ``cd``."""
+    try:
+        init_real = Path(os.path.realpath(str(initial_cwd)))
+    except OSError:
+        init_real = initial_cwd
+    possible_states: list[tuple[Path, Path]] = [(init_real, init_real)]
+    pipeline_entry: list[tuple[Path, Path]] = list(possible_states)
+    pipeline_uncertain = False
+    control_depth = 0
+    case_stack: list[bool] = []
+    cwd_stack: list[tuple[list[tuple[Path, Path]], list[tuple[Path, Path]], bool, int, list[bool]]] = []
+    prev_delim = ""
+    out: list[tuple[list[str], list[Path]]] = []
+
+    def _dedup_states(states: list[tuple[Path, Path]]) -> list[tuple[Path, Path]]:
+        seen: set[tuple[str, str]] = set()
+        res: list[tuple[Path, Path]] = []
+        for cw, pw in states:
+            key = (str(cw), str(pw))
+            if key not in seen:
+                seen.add(key)
+                res.append((cw, pw))
+        return res
+
+    for raw_seg, delim in _tokenize_raw_segments(cmd_line):
+        is_cond = bool(_CONTROL_KEYWORD_RE.match(raw_seg))
+        raw_words = _scan_leading_unquoted_words(raw_seg)
+        wi = 0
+        while wi < len(raw_words):
+            w, was_quoted, _ = raw_words[wi]
+            if was_quoted:
+                break
+            if w == "time":
+                wi += 1
+                while wi < len(raw_words) and raw_words[wi][0].startswith("-"):
+                    ttok = raw_words[wi][0]
+                    if ttok == "--":
+                        wi += 1
+                        break
+                    if ttok in _TIME_LONG_VAL or _short_flag_needs_next_arg(ttok, _TIME_SHORT_VAL):
+                        wi += 2
+                    else:
+                        wi += 1
+                continue
+            if w in ("if", "while", "until", "for", "select", "{"):
+                control_depth += 1
+                wi += 1
+            elif w == "case":
+                control_depth += 1
+                case_stack.append(True)
+                wi += 1
+            elif w in ("fi", "done", "}"):
+                control_depth = max(0, control_depth - 1)
+                wi += 1
+            elif w == "esac":
+                control_depth = max(0, control_depth - 1)
+                if case_stack:
+                    case_stack.pop()
+                wi += 1
+            elif w in ("then", "do", "else", "elif", "!"):
+                wi += 1
+            else:
+                break
+        is_shell_cd, cd_wrapper_portable = _is_shell_builtin_cd(raw_words)
+        cleaned = _strip_segment_wrappers(raw_seg)
+        if prev_delim not in ("&&", "||"):
+            pipeline_entry = list(possible_states)
+            pipeline_uncertain = False
+
+        if cleaned:
+            out.append((cleaned, _dedup_paths([cw for cw, _ in possible_states])))
+            if is_shell_cd and cleaned[0] == "cd" and delim not in ("|", "|&", "&"):
+                valid_next: list[tuple[Path, Path]] = []
+                all_guaranteed = cd_wrapper_portable
+                for cw, pw in possible_states:
+                    nxt, new_prev, portable = _apply_cd_segment_checked(cleaned, cw, pw)
+                    valid_next.append((nxt, new_prev))
+                    if not portable or not nxt.is_dir():
+                        all_guaranteed = False
+                if prev_delim in ("|", "|&"):
+                    pipeline_uncertain = True
+                    possible_states = _dedup_states(possible_states + valid_next)
+                else:
+                    unconditional_exec = (control_depth == 0) and (prev_delim not in ("&&", "||", "|", "|&")) and (not is_cond)
+                    if unconditional_exec and all_guaranteed and (delim == "&&" or not pipeline_uncertain):
+                        possible_states = _dedup_states(valid_next)
+                    else:
+                        pipeline_uncertain = True
+                        possible_states = _dedup_states(possible_states + valid_next)
+
+        if delim not in ("&&", "||") and pipeline_uncertain:
+            possible_states = _dedup_states(possible_states + pipeline_entry)
+
+        if delim in (";;", ";&", ";;&") and case_stack:
+            case_stack[-1] = True
+        elif delim == "(":
+            if not (case_stack and case_stack[-1]):
+                cwd_stack.append(
+                    (list(possible_states), list(pipeline_entry), pipeline_uncertain, control_depth, list(case_stack))
+                )
+        elif delim == ")":
+            if case_stack and case_stack[-1]:
+                case_stack[-1] = False
+            elif cwd_stack:
+                possible_states, pipeline_entry, pipeline_uncertain, control_depth, case_stack = cwd_stack.pop()
+        prev_delim = delim
 
     return out
 
@@ -666,32 +1206,60 @@ def extract_install_packages(tokens: list[str]) -> list[str]:
     exe = os.path.basename(tokens[0])
     pkgs: list[str] = []
 
-    if exe == "npm" and len(tokens) > 1 and tokens[1] in ("install", "i", "add"):
-        i = 2
+    def _scan_subcmd(verbs: tuple[str, ...], val_flags: tuple[str, ...]) -> Optional[int]:
+        i = 1
         while i < len(tokens):
             t = tokens[i]
-            if t in ("--prefix", "-w", "--workspace", "--registry", "--cache", "--tag"):
+            if t in verbs:
+                return i + 1
+            if t in val_flags:
+                i += 2
+            elif t.startswith("-"):
+                i += 1
+            else:
+                return None
+        return None
+
+    def _collect_pkgs(start_idx: Optional[int], val_flags: tuple[str, ...]) -> None:
+        if start_idx is None:
+            return
+        i = start_idx
+        while i < len(tokens):
+            t = tokens[i]
+            if t in val_flags:
                 i += 2
             elif t.startswith("-"):
                 i += 1
             else:
                 pkgs.append(t)
                 i += 1
-    elif exe == "pnpm" and len(tokens) > 1 and tokens[1] in ("add", "install", "i"):
-        i = 2
-        while i < len(tokens):
-            t = tokens[i]
-            if t in ("--dir", "-C", "-w", "--filter"):
-                i += 2
-            elif t.startswith("-"):
-                i += 1
-            else:
-                pkgs.append(t)
-                i += 1
-    elif exe == "yarn" and len(tokens) > 1 and tokens[1] == "add":
-        for t in tokens[2:]:
-            if not t.startswith("-"):
-                pkgs.append(t)
+
+    pkg_specs: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+        "npm": (
+            ("install", "i", "add"),
+            ("--prefix", "-w", "--workspace", "--registry", "--cache", "--tag"),
+        ),
+        "pnpm": (
+            ("add", "install", "i"),
+            ("--dir", "-C", "--filter"),
+        ),
+        "yarn": (
+            ("add",),
+            ("--cwd", "--modules-folder", "--cache-folder", "--registry"),
+        ),
+        "uv": (
+            ("add",),
+            ("--features", "-F", "-p", "--package", "--target", "--optional", "--python", "--directory", "--project", "--manifest-path"),
+        ),
+        "cargo": (
+            ("add",),
+            ("--features", "-F", "-p", "--package", "--target", "--optional", "--python", "--directory", "--project", "--manifest-path"),
+        ),
+    }
+
+    if exe in pkg_specs:
+        verbs, val_flags = pkg_specs[exe]
+        _collect_pkgs(_scan_subcmd(verbs, val_flags), val_flags)
     elif exe == "dotnet":
         start_idx: Optional[int] = None
         if len(tokens) > 2 and tokens[1] == "add" and "package" in tokens[2:]:
@@ -709,17 +1277,6 @@ def extract_install_packages(tokens: list[str]) -> list[str]:
                 else:
                     pkgs.append(t)
                     break
-    elif exe in ("uv", "cargo") and len(tokens) > 1 and tokens[1] == "add":
-        i = 2
-        while i < len(tokens):
-            t = tokens[i]
-            if t in ("--features", "-F", "-p", "--package", "--target", "--optional", "--python"):
-                i += 2
-            elif t.startswith("-"):
-                i += 1
-            else:
-                pkgs.append(t)
-                i += 1
 
     cleaned: list[str] = []
     for raw_pkg in pkgs:
@@ -1541,7 +2098,20 @@ def evaluate_pre_edit(
         if on_worktree_resolved is not None:
             on_worktree_resolved(effective_ws)
 
-    if rel_path == ".superpowers" or rel_path.startswith(".superpowers/") or rel_path == ".harness" or rel_path.startswith(".harness/"):
+    if is_active_swarm_coordinator(workspace, hook_input):
+        return {
+            "decision": "deny",
+            "reason": (
+                f"Swarm Coordinator-Only guard: active Swarm Coordinator cannot write or edit workspace file '{rel_path}' directly. "
+                "Delegate all file edits (specs, plans, code, tests, walkthroughs, and docs) to a Swarm worker via "
+                "swarm(action='add', workspace='share') or post_message."
+            ),
+        }
+
+    if rel_path == ".harness" or rel_path.startswith(".harness/"):
+        return {"decision": "allow"}
+
+    if rel_path == ".superpowers" or rel_path.startswith(".superpowers/"):
         return {"decision": "allow"}
 
     append_val = args.get("Append", False)
@@ -1615,22 +2185,22 @@ def _parse_git_invocation(seg: list[str], seg_cwd: Path) -> tuple[str, Path, int
         tok = seg[i]
         if tok == "-C":
             if i + 1 < n:
-                target = _resolve_dir_arg(target, seg[i + 1])
+                target = _resolve_dir_arg(target, seg[i + 1], physical=True)
                 i += 2
                 continue
             break
         if tok.startswith("-C") and len(tok) > 2:
-            target = _resolve_dir_arg(target, tok[2:])
+            target = _resolve_dir_arg(target, tok[2:], physical=True)
             i += 1
             continue
         if tok == "--work-tree":
             if i + 1 < n:
-                target = _resolve_dir_arg(target, seg[i + 1])
+                target = _resolve_dir_arg(target, seg[i + 1], physical=True)
                 i += 2
                 continue
             break
         if tok.startswith("--work-tree="):
-            target = _resolve_dir_arg(target, tok[len("--work-tree=") :])
+            target = _resolve_dir_arg(target, tok[len("--work-tree=") :], physical=True)
             i += 1
             continue
         if tok in ("-c", "--git-dir", "--namespace", "--super-prefix", "--config-env"):
@@ -1662,31 +2232,31 @@ def _extract_pkg_target_dir(seg: list[str], seg_cwd: Path) -> Path:
         tok = seg[i]
         if exe == "npm":
             if tok == "--prefix" and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True)
             if tok.startswith("--prefix="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--prefix=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--prefix=") :], physical=True)
         elif exe == "pnpm":
             if tok in ("--dir", "-C") and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True)
             if tok.startswith("--dir="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--dir=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--dir=") :], physical=True)
         elif exe == "yarn":
             if tok == "--cwd" and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True)
             if tok.startswith("--cwd="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--cwd=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--cwd=") :], physical=True)
         elif exe == "uv":
             if tok in ("--directory", "--project") and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True)
             if tok.startswith("--directory="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--directory=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--directory=") :], physical=True)
             if tok.startswith("--project="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--project=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--project=") :], physical=True)
         elif exe == "cargo":
             if tok == "--manifest-path" and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1]).parent
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True).parent
             if tok.startswith("--manifest-path="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--manifest-path=") :]).parent
+                return _resolve_dir_arg(seg_cwd, tok[len("--manifest-path=") :], physical=True).parent
         i += 1
     return seg_cwd
 
@@ -1848,7 +2418,42 @@ def evaluate_pre_command(
         return {"decision": "allow"}
 
     initial_cwd = _resolve_initial_cwd(workspace, hook_input)
-    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
+    segments_with_cwds = iter_command_segments_with_possible_cwds(cmd_line, initial_cwd)
+    segments_with_cwd = [(seg, seg_cwd) for seg, cwds in segments_with_cwds for seg_cwd in cwds]
+
+    if is_active_swarm_coordinator(workspace, hook_input):
+        raw_err = _check_coordinator_raw_segments(cmd_line)
+        if raw_err:
+            return {"decision": "deny", "reason": raw_err}
+        unsafe_syntax = _has_unsafe_shell_syntax_for_coordinator(cmd_line)
+        if unsafe_syntax:
+            return {
+                "decision": "deny",
+                "reason": (
+                    f"Swarm Coordinator-Only guard: shell syntax ({unsafe_syntax}) is blocked for the active Swarm Coordinator. "
+                    "Only read-only inspection and harness coordination commands are allowed; delegate work to Swarm workers."
+                ),
+            }
+        if cmd_line.strip() and not segments_with_cwd:
+            return {
+                "decision": "deny",
+                "reason": (
+                    "Swarm Coordinator-Only guard: command produced no executable segment (e.g. env -S or bare assignment) "
+                    "and is blocked for the active Swarm Coordinator."
+                ),
+            }
+        pending_ask_reason = ""
+        for seg, seg_cwd in segments_with_cwd:
+            if not seg:
+                continue
+            seg_decision, seg_reason = _evaluate_coordinator_command_segment(seg, seg_cwd, workspace)
+            if seg_decision == "deny":
+                return {"decision": "deny", "reason": seg_reason}
+            if seg_decision == "force_ask" and not pending_ask_reason:
+                pending_ask_reason = seg_reason
+        if pending_ask_reason:
+            return {"decision": "force_ask", "reason": pending_ask_reason}
+
     if not segments_with_cwd:
         return {"decision": "allow"}
 
@@ -2395,7 +3000,8 @@ def evaluate_post_command(
         return {}
 
     initial_cwd = _resolve_initial_cwd(workspace, hook_input)
-    segments_with_cwd = iter_command_segments_with_cwd(cmd_line, initial_cwd)
+    segments_with_cwds = iter_command_segments_with_possible_cwds(cmd_line, initial_cwd)
+    segments_with_cwd = [(seg, seg_cwd) for seg, cwds in segments_with_cwds for seg_cwd in cwds]
     if not segments_with_cwd:
         return {}
 
@@ -2469,11 +3075,154 @@ SWARM_WORKER_CONTRACT_HEADER = (
     "yeniden jev_classify, brainstorming, Spec, Walkthrough veya gh pr create çalıştırma; "
     "docs/parking-lot.md ve docs/canon/* önerilerini panoda @coordinator'a bildir.]"
 )
+SWARM_INTEGRATOR_ROLE_RE = re.compile(r"^(?:integrator|release|pr-shepherd)(?:-\d+)?$")
+SWARM_INTEGRATOR_CONTRACT_HEADER = (
+    "[SWARM_INTEGRATOR_CONTRACT — Tüm işçi dallarını tek feat/<konu> entegrasyon dalında birleştir; "
+    "pre-pr-readiness (Walkthrough, canon-auditor, security-reviewer, tdd-pass, koşullu ui-pass), "
+    "gh pr create ve review-pr (pr-auditor) kapılarını yürütüp sonucu @coordinator'a bildir.]"
+)
 SWARM_BRANCH_GUARD_HEADER = (
     "[SWARM_BRANCH_GUARD — Koda dokunmadan önce kendi özellik dalını aç "
     "(git checkout -b feat/<konu>-<ad>); detached HEAD veya main üzerinde kalma.]"
 )
 SWARM_SYSTEM_ROLE_RE = re.compile(r"^(?:monitor|narrator)(?:-\d+)?$")
+SWARM_SLASH_CMD_RE = re.compile(r"(?:^|\s)/swarm(?:\s|$)", re.IGNORECASE)
+SWARM_QUOTA_ERROR_RE = re.compile(
+    r"(?:"
+    r"quota\s*(?:exceeded|exhausted|limit|depleted|reached)"
+    r"|out\s+of\s+quota"
+    r"|insufficient\s+quota"
+    r"|resource[_\s-]*exhausted"
+    r"|rate[_\s-]*limit(?:ed|s)?"
+    r"|too\s+many\s+requests"
+    r"|\b429\b"
+    r"|usage\s+limit"
+    r"|(?:5[\s-]*hour|weekly|haftalık)\s*(?:quota|limit|cap|window)"
+    r"|capacity\s+exhausted"
+    r")",
+    re.IGNORECASE,
+)
+SWARM_QUOTA_STDOUT_ERROR_RE = re.compile(
+    r"(?im)^[ \t]*(?:error|fatal|exception|resource[_\s-]*exhausted|quota[_\s-]*(?:exceeded|exhausted)|rate[_\s-]*limit|http[ \t]*429)\b[^\n]*"
+    r"(?:quota|rate[_\s-]*limit|resource[_\s-]*exhausted|429|usage\s+limit|capacity)"
+)
+DEFAULT_SWARM_QUOTA_BUFFER_SEC = 60
+DEFAULT_SWARM_QUOTA_PROBE_SEC = 900.0
+DEFAULT_SWARM_QUOTA_MAX_BACKOFF_SEC = 3600.0
+DEFAULT_SWARM_RESUME_TIMEOUT_SEC = 120.0
+
+COORDINATOR_TRUSTED_BIN_PREFIXES = ("/bin/", "/usr/bin/", "/opt/homebrew/bin/", "/usr/local/bin/")
+COORDINATOR_DANGEROUS_ENV_VARS = frozenset(
+    (
+        "GIT_EXTERNAL_DIFF",
+        "GIT_SSH_COMMAND",
+        "GIT_SSH",
+        "GIT_ASKPASS",
+        "GIT_PAGER",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_TEMPLATE_DIR",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASH_ENV",
+        "ENV",
+        "CDPATH",
+        "IFS",
+        "PAGER",
+        "EDITOR",
+        "VISUAL",
+        "PATH",
+        "PYTHONPATH",
+        "RIPGREP_CONFIG_PATH",
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GH_PAGER",
+        "GH_BROWSER",
+        "BROWSER",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "PROMPT_COMMAND",
+        "ZDOTDIR",
+        "GH_CONFIG_DIR",
+    )
+)
+
+
+def _is_dangerous_coordinator_env_var(key: str) -> bool:
+    """Return True if ``key`` can redirect execution, git/gh hooks, or trace output to disk."""
+    return key in COORDINATOR_DANGEROUS_ENV_VARS or key.startswith(("GIT_TRACE", "HARNESS_", "PYTHON", "LD_", "DYLD_"))
+COORDINATOR_READ_ONLY_BINS = frozenset(
+    (
+        "cd",
+        "pwd",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "stat",
+        "file",
+        "which",
+        "date",
+        "uname",
+        "jq",
+        "sort",
+        "uniq",
+        "cut",
+        "tr",
+        "test",
+        "[",
+        "echo",
+        "printf",
+        "true",
+        "false",
+    )
+)
+COORDINATOR_FIND_FORBIDDEN_FLAGS = frozenset(
+    ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls")
+)
+COORDINATOR_STAMP_GATE_ALLOWED_SUBCMDS = frozenset(
+    ("swarm-coordinator", "swarm-quota", "dispatch", "select-model", "tree-sha", "verify-pr-stamps")
+)
+COORDINATOR_READ_ONLY_GIT_SUBCMDS = frozenset(
+    (
+        "status",
+        "log",
+        "diff",
+        "show",
+        "rev-parse",
+        "ls-files",
+        "ls-tree",
+        "merge-base",
+        "shortlog",
+        "describe",
+        "rev-list",
+        "check-ignore",
+    )
+)
+COORDINATOR_GIT_FORBIDDEN_GLOBAL_FLAGS = frozenset(
+    ("-c", "--config-env", "--exec-path", "--upload-pack", "--receive-pack", "--git-dir", "--work-tree")
+)
+COORDINATOR_READ_ONLY_GH_VERBS = {
+    "auth": frozenset(("status",)),
+    "pr": frozenset(("list", "view", "status", "checks", "diff")),
+    "issue": frozenset(("list", "view", "status")),
+    "repo": frozenset(("view",)),
+}
 TIER_DEFAULT_EFFORT = {
     "trivial_lookup": "LOW",
     "bounded_execution": "MEDIUM",
@@ -2865,8 +3614,997 @@ def _leading_bracket_header_block(text: str) -> str:
     return "\n".join(header_lines)
 
 
+def _is_worker_prompt_text(text: str) -> bool:
+    """Return True if prompt/user text carries Swarm worker contract or XML wrapper markers."""
+    if not text:
+        return False
+    return (
+        "[SWARM_WORKER_CONTRACT" in text
+        or "[SWARM_INTEGRATOR_CONTRACT" in text
+        or "<swarm_worker>" in text
+    )
+
+
+def _has_explicit_swarm_slash_command(last_user_input: str) -> bool:
+    """Return True strictly when user input explicitly invokes ``/swarm`` outside worker briefs."""
+    if not last_user_input or _is_worker_prompt_text(last_user_input):
+        return False
+    return bool(SWARM_SLASH_CMD_RE.search(last_user_input))
+
+
+def _is_in_different_linked_worktree(workspace: Path, target_dir: Path) -> bool:
+    """Return True when ``target_dir`` belongs to a different linked worktree of ``workspace``."""
+    try:
+        real_ws = Path(os.path.realpath(str(workspace)))
+    except OSError:
+        real_ws = workspace
+    linked = resolve_linked_worktree(workspace, target_dir)
+    return linked is not None and linked != real_ws
+
+
+def _read_swarm_coordinator_data(workspace: Path) -> dict[str, Any]:
+    """Read ``swarm-coordinator.json`` safely without creating directories."""
+    swarm_dir = _existing_swarm_state_dir(workspace)
+    if swarm_dir is None:
+        return {}
+    data = read_json_file(swarm_dir / "swarm-coordinator.json")
+    return data if isinstance(data, dict) else {}
+
+
+def register_swarm_coordinator(
+    workspace: Path,
+    conversation_id: str = "",
+    active: bool = True,
+    title: str = "",
+    source: str = "swarm-tool",
+    worker_name: str = "",
+    explicitly_disabled: bool = False,
+) -> dict[str, Any]:
+    """Atomically register or update a Swarm Coordinator state entry in ``swarm-coordinator.json``."""
+    state_dir = get_swarm_state_dir(workspace)
+    conv_key = conversation_id.strip() or "__default__"
+    now_iso = utc_now_iso()
+    clean_title = title.strip()
+    clean_worker = worker_name.strip()
+
+    with locked_state_file(state_dir, "swarm-coordinator"):
+        coord_path = state_dir / "swarm-coordinator.json"
+        data = read_json_file(coord_path)
+        if not isinstance(data, dict):
+            data = {}
+        raw_coords = data.get("coordinators")
+        coords: dict[str, Any] = dict(raw_coords) if isinstance(raw_coords, dict) else {}
+
+        existing = coords.get(conv_key)
+        entry: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+        workers_raw = entry.get("workers")
+        workers: list[str] = [str(w) for w in workers_raw if isinstance(w, str) and w.strip()] if isinstance(workers_raw, list) else []
+        if clean_worker and not SWARM_SYSTEM_ROLE_RE.match(clean_worker.lower()) and clean_worker not in workers:
+            workers.append(clean_worker)
+
+        entry["active"] = bool(active)
+        entry["explicitlyDisabled"] = bool(explicitly_disabled) if not active else False
+        entry["source"] = source
+        entry["workers"] = workers
+        if clean_title:
+            entry["title"] = clean_title
+        elif "title" not in entry:
+            entry["title"] = ""
+        if not entry.get("startedAt"):
+            entry["startedAt"] = now_iso
+        entry["updatedAt"] = now_iso
+
+        coords[conv_key] = entry
+        data["schemaVersion"] = CACHE_SCHEMA_VERSION
+        data["coordinators"] = coords
+        data["updatedAt"] = now_iso
+        atomic_write_json(state_dir, "swarm-coordinator.json", data)
+        return dict(entry)
+
+
+def get_swarm_coordinator_status(workspace: Path, conversation_id: str = "") -> dict[str, Any]:
+    """Return Swarm Coordinator registration summary for ``conversation_id`` or workspace."""
+    data = _read_swarm_coordinator_data(workspace)
+    raw_coords = data.get("coordinators")
+    coords: dict[str, Any] = dict(raw_coords) if isinstance(raw_coords, dict) else {}
+    conv_key = conversation_id.strip() or "__default__"
+    entry = coords.get(conv_key) if isinstance(coords.get(conv_key), dict) else {}
+    return {
+        "active": bool(entry.get("active", False)) and not bool(entry.get("explicitlyDisabled", False)),
+        "conversationId": conv_key,
+        "title": str(entry.get("title") or ""),
+        "workers": list(entry.get("workers") or []),
+        "coordinators": coords,
+    }
+
+
+def is_active_swarm_coordinator(workspace: Path, hook_input: dict[str, Any]) -> bool:
+    """Return True if the current caller is an active Swarm Coordinator (never a worker)."""
+    if not isinstance(hook_input, dict):
+        return False
+    last_input = str(hook_input.get("lastUserInput") or "")
+    if _is_worker_prompt_text(last_input):
+        return False
+
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
+    data = _read_swarm_coordinator_data(workspace)
+    coords = data.get("coordinators") if isinstance(data.get("coordinators"), dict) else {}
+
+    lookup_key = cur_conv if cur_conv else "__default__"
+    entry = coords.get(lookup_key)
+    if isinstance(entry, dict):
+        if entry.get("explicitlyDisabled") is True:
+            return False
+        if entry.get("active") is True:
+            return True
+
+    if _has_explicit_swarm_slash_command(last_input):
+        initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+        if not _is_in_different_linked_worktree(workspace, initial_cwd):
+            return True
+    return False
+
+
+def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
+    """Detect command substitutions, process substitutions, or file-writing redirections."""
+    cmd_line = _strip_shell_line_continuations(cmd_line)
+    in_single = False
+    in_double = False
+    escape = False
+    at_token_start = True
+    n = len(cmd_line)
+    i = 0
+
+    while i < n:
+        c = cmd_line[i]
+        if escape:
+            escape = False
+            at_token_start = False
+            i += 1
+            continue
+        if c == "\\" and not in_single:
+            escape = True
+            at_token_start = False
+            i += 1
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            at_token_start = False
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            at_token_start = False
+            i += 1
+            continue
+
+        if not in_single:
+            if c == "`":
+                return "backtick command substitution"
+            if c == "$" and i + 1 < n and cmd_line[i + 1] == "(":
+                return "$(...) command substitution"
+            if c == "$" and i + 1 < n and (
+                cmd_line[i + 1] == "{"
+                or cmd_line[i + 1].isalpha()
+                or cmd_line[i + 1] in ("_", "*", "@", "#", "?", "-", "$", "!")
+                or cmd_line[i + 1].isdigit()
+            ):
+                return "shell parameter expansion"
+
+        if not in_single and not in_double:
+            if c == "#" and at_token_start:
+                while i < n and cmd_line[i] != "\n":
+                    i += 1
+                continue
+            if c == "{":
+                return "brace expansion or command group"
+            if c == "$" and i + 1 < n and cmd_line[i + 1] == "'":
+                return "ANSI-C $'...' quoting"
+            if c == "$" and i + 1 < n and cmd_line[i + 1] == '"':
+                return 'locale $"..." quoting'
+            if c == "<" and i + 1 < n and cmd_line[i + 1] == "<":
+                return "here-document or here-string redirection"
+            if c in ("<", ">") and i + 1 < n and cmd_line[i + 1] == "(":
+                return "process substitution"
+            if c == ">" or (c == "&" and i + 1 < n and cmd_line[i + 1] == ">"):
+                # Inspect redirection starting at > (or &>)
+                gt_idx = i + 1 if c == "&" else i
+                rest = cmd_line[gt_idx:]
+                # Allow 2>&1, 1>&2, >&1, >&2 (fd duplication)
+                if re.match(r"^>&[12](?:\s|$|[;&|)])", rest):
+                    at_token_start = False
+                    i = gt_idx + 3
+                    continue
+                # Allow >/dev/null, >>/dev/null, >|/dev/null (and fd-prefixed 1>/dev/null, 2>/dev/null, &>/dev/null)
+                m_devnull = re.match(r"^>(?:>|\|)?\s*/dev/null(?:\s|$|[;&|)])", rest)
+                if m_devnull:
+                    at_token_start = False
+                    i = gt_idx + m_devnull.end() - 1
+                    continue
+                return "output redirection"
+            if c in (" ", "\t", "\n", ";", "&", "|", "(", ")"):
+                at_token_start = True
+                i += 1
+                continue
+        at_token_start = False
+        i += 1
+    return None
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Safely convert ``val`` to float, returning ``default`` on invalid/non-finite input."""
+    if val is None or isinstance(val, bool):
+        return default
+    try:
+        out = float(val)
+    except (TypeError, ValueError):
+        return default
+    return out if (out == out and abs(out) != float("inf")) else default
+
+
+def _resolve_swarm_resume_timeout_sec() -> float:
+    """Resolve ``agy --conversation`` resume subprocess timeout from env or default."""
+    raw_timeout = os.environ.get("HARNESS_SWARM_RESUME_TIMEOUT_SEC", str(DEFAULT_SWARM_RESUME_TIMEOUT_SEC)).strip()
+    return max(0.2, _safe_float(raw_timeout, DEFAULT_SWARM_RESUME_TIMEOUT_SEC))
+
+
+def _stale_resuming_threshold_sec(timeout_sec: Optional[float] = None) -> float:
+    """Return stale ``resuming`` takeover threshold in seconds (supports test and env overrides)."""
+    raw = os.environ.get("HARNESS_SWARM_STALE_RESUMING_SEC", "").strip()
+    if raw:
+        parsed = _safe_float(raw, -1.0)
+        if parsed > 0:
+            return max(0.2, parsed)
+    eff_timeout = _resolve_swarm_resume_timeout_sec() if timeout_sec is None else float(timeout_sec)
+    return max(30.0, eff_timeout + 30.0)
+
+
+def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
+    """Reject ``sudo``, ``env -S``, wrapper-prefixed bypasses, or dangerous env vars in raw segments."""
+    for raw_seg, _ in _tokenize_raw_segments(cmd_line):
+        if not raw_seg:
+            continue
+        try:
+            tokens = shlex.split(raw_seg)
+        except Exception:
+            return (
+                "Swarm Coordinator-Only guard: malformed shell quoting is blocked for the active Swarm Coordinator."
+            )
+        if not tokens:
+            continue
+        idx = 0
+        while idx < len(tokens):
+            tok = tokens[idx]
+            if "=" in tok and tok.split("=", 1)[0].isidentifier():
+                key = tok.split("=", 1)[0]
+                if _is_dangerous_coordinator_env_var(key):
+                    return (
+                        f"Swarm Coordinator-Only guard: setting execution env var '{key}' is blocked for the active Swarm Coordinator."
+                    )
+                idx += 1
+                continue
+            if tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
+                idx += 1
+                continue
+            base_tok = os.path.basename(tok)
+            if base_tok == "sudo":
+                return "Swarm Coordinator-Only guard: 'sudo' is blocked for the active Swarm Coordinator."
+            if base_tok == "exec":
+                return "Swarm Coordinator-Only guard: 'exec' is blocked for the active Swarm Coordinator."
+            if base_tok in ("nohup", "time", "builtin", "command", "env") and not _is_trusted_coordinator_exe(tok):
+                return f"Swarm Coordinator-Only guard: untrusted wrapper path '{tok}' is blocked for the active Swarm Coordinator."
+            if base_tok in ("time", "nohup"):
+                idx += 1
+                if idx < len(tokens) and tokens[idx].startswith("-"):
+                    return f"Swarm Coordinator-Only guard: options on '{base_tok}' are blocked for the active Swarm Coordinator."
+                continue
+            if base_tok in ("builtin", "command"):
+                idx += 1
+                while idx < len(tokens) and tokens[idx].startswith("-"):
+                    if tokens[idx] == "--":
+                        idx += 1
+                        break
+                    idx += 1
+                continue
+            if base_tok == "env":
+                idx += 1
+                while idx < len(tokens):
+                    etok = tokens[idx]
+                    if etok == "-S" or etok.startswith(("--split-string", "-S")) or (
+                        etok.startswith("-") and not etok.startswith("--") and "S" in etok[1:]
+                    ):
+                        return "Swarm Coordinator-Only guard: 'env -S/--split-string' is blocked for the active Swarm Coordinator."
+                    if etok.startswith("-"):
+                        return "Swarm Coordinator-Only guard: options on 'env' are blocked for the active Swarm Coordinator."
+                    elif "=" in etok and etok.split("=", 1)[0].isidentifier():
+                        key = etok.split("=", 1)[0]
+                        if _is_dangerous_coordinator_env_var(key):
+                            return (
+                                f"Swarm Coordinator-Only guard: setting execution env var '{key}' via env is blocked for the active Swarm Coordinator."
+                            )
+                        idx += 1
+                    else:
+                        break
+                continue
+            break
+        if idx >= len(tokens):
+            return (
+                "Swarm Coordinator-Only guard: bare assignment or wrapper-only segment is blocked for the active Swarm Coordinator."
+            )
+    return None
+
+
+def _is_trusted_coordinator_exe(raw_exe: str) -> bool:
+    """Return True if ``raw_exe`` is a bare command name or normalized trusted system bin path."""
+    if not raw_exe:
+        return False
+    if "/" not in raw_exe and "\\" not in raw_exe:
+        return True
+    if "\\" in raw_exe or ".." in raw_exe.split("/"):
+        return False
+    norm = os.path.normpath(raw_exe)
+    if not any(norm.startswith(pref) for pref in COORDINATOR_TRUSTED_BIN_PREFIXES):
+        return False
+    if os.path.lexists(norm):
+        try:
+            real = os.path.realpath(norm)
+        except OSError:
+            return False
+        trusted_real = COORDINATOR_TRUSTED_BIN_PREFIXES + ("/opt/homebrew/Cellar/", "/usr/local/Cellar/", "/System/")
+        if not any(real.startswith(pref) for pref in trusted_real):
+            return False
+    return True
+
+
+def _is_trusted_harness_script_path(raw_script: str, seg_cwd: Path, workspace: Path, expected_name: str) -> bool:
+    """Verify script path resolves to ``PLUGIN_ROOT/scripts/<name>`` or ``workspace/scripts/<name>``."""
+    if not raw_script or os.path.basename(raw_script) != expected_name:
+        return False
+    plugin_script = Path(os.path.realpath(str(PLUGIN_ROOT / "scripts" / expected_name)))
+    expanded = os.path.expanduser(raw_script)
+    joined = expanded if os.path.isabs(expanded) else os.path.join(str(seg_cwd), expanded)
+    try:
+        real_script = Path(os.path.realpath(joined))
+    except OSError:
+        return False
+    if not real_script.is_file():
+        return False
+    allowed_targets = [plugin_script, workspace / "scripts" / expected_name]
+    for cand in allowed_targets:
+        try:
+            if real_script == Path(os.path.realpath(str(cand))):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _extract_stamp_gate_subcmd_and_actions(args: list[str]) -> tuple[str, list[str]]:
+    """Return ``(subcommand, all_actions)`` skipping known value flags so overrides cannot hide."""
+    i = 0
+    n = len(args)
+    subcmd = ""
+    actions: list[str] = []
+    while i < n:
+        tok = args[i]
+        if tok == "--workspace":
+            i += 2
+            continue
+        if tok.startswith("--workspace="):
+            i += 1
+            continue
+        if not subcmd:
+            if tok.startswith("-"):
+                i += 1
+                continue
+            subcmd = tok
+            i += 1
+            continue
+        if tok == "--action":
+            if i + 1 < n:
+                actions.append(args[i + 1])
+                i += 2
+            else:
+                actions.append("")
+                i += 1
+            continue
+        if tok.startswith("--action="):
+            actions.append(tok[len("--action=") :])
+            i += 1
+            continue
+        if tok.startswith("-"):
+            if tok in ("--conversation-id", "--title", "--resume-at", "--wait-seconds", "--buffer-seconds", "--window", "--model", "--reason", "--member", "--role", "--type", "--tier", "--parent-model", "--effort"):
+                i += 2
+            else:
+                i += 1
+            continue
+        actions.append(tok)
+        i += 1
+    return subcmd, actions
+
+
+def _evaluate_coordinator_stamp_gate(args: list[str], workspace: Path) -> tuple[str, str]:
+    """Evaluate ``stamp-gate.sh`` invocation for an active Swarm Coordinator."""
+    subcmd, actions = _extract_stamp_gate_subcmd_and_actions(args)
+    if subcmd not in COORDINATOR_STAMP_GATE_ALLOWED_SUBCMDS:
+        return (
+            "deny",
+            f"Swarm Coordinator-Only guard: 'stamp-gate.sh {subcmd or '(missing)'}' is restricted to Swarm workers/integrator.",
+        )
+    if subcmd in ("swarm-coordinator", "swarm-quota") and len(actions) > 1:
+        return (
+            "deny",
+            "Swarm Coordinator-Only guard: multiple or conflicting --action arguments in stamp-gate.sh are forbidden.",
+        )
+    sub_action = actions[0] if actions else ""
+    if subcmd == "swarm-coordinator":
+        if sub_action == "off":
+            return (
+                "deny",
+                "Swarm Coordinator-Only guard: active Swarm Coordinator cannot disable its own guard via 'stamp-gate.sh swarm-coordinator off'.",
+            )
+        if sub_action not in ("status", "on"):
+            return (
+                "deny",
+                f"Swarm Coordinator-Only guard: unsupported swarm-coordinator action '{sub_action}'.",
+            )
+    elif subcmd == "swarm-quota":
+        if sub_action == "clear":
+            return (
+                "deny",
+                "Swarm Coordinator-Only guard: active Swarm Coordinator cannot clear quota wait via 'stamp-gate.sh swarm-quota clear'.",
+            )
+        if sub_action == "resume":
+            q_state = get_swarm_quota_state(workspace)
+            q_status = str(q_state.get("status") or "")
+            next_probe = _safe_float(q_state.get("nextProbeEpoch"), 0.0)
+            if q_status in ("waiting", "resuming") and next_probe > time.time():
+                return (
+                    "force_ask",
+                    f"Swarm Pure-Wait Quota Policy: reset time ({q_state.get('resumeAt')}) has not elapsed yet. Confirm only if user explicitly overrides waiting.",
+                )
+        elif sub_action not in ("status", "pause"):
+            return (
+                "deny",
+                f"Swarm Coordinator-Only guard: 'stamp-gate.sh swarm-quota {sub_action}' is blocked for active Coordinator.",
+            )
+    return "allow", ""
+
+
+def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspace: Path) -> tuple[str, str]:
+    """Return ``(decision, reason)`` for a single command segment run by an active Coordinator."""
+    if not seg:
+        return "allow", ""
+    raw_exe = seg[0]
+    exe = os.path.basename(raw_exe)
+
+    def _deny_seg() -> tuple[str, str]:
+        return (
+            "deny",
+            f"Swarm Coordinator-Only guard: command '{' '.join(seg[:3])}' ({exe}) is blocked for the active Swarm Coordinator. "
+            "Delegate builds, tests, git mutations, Walkthroughs, and PR operations to Swarm workers (e.g. implementer, verifier, integrator).",
+        )
+
+    if exe in ("bash", "sh"):
+        if not _is_trusted_coordinator_exe(raw_exe) or len(seg) < 2 or seg[1].startswith("-"):
+            return _deny_seg()
+        target_base = os.path.basename(seg[1])
+        if target_base == "harness-doctor.sh" and _is_trusted_harness_script_path(seg[1], seg_cwd, workspace, "harness-doctor.sh"):
+            return "allow", ""
+        if target_base == "stamp-gate.sh" and _is_trusted_harness_script_path(seg[1], seg_cwd, workspace, "stamp-gate.sh"):
+            return _evaluate_coordinator_stamp_gate(seg[2:], workspace)
+        return _deny_seg()
+
+    if exe == "harness-doctor.sh":
+        if _is_trusted_harness_script_path(raw_exe, seg_cwd, workspace, "harness-doctor.sh"):
+            return "allow", ""
+        return _deny_seg()
+
+    if exe == "stamp-gate.sh":
+        if _is_trusted_harness_script_path(raw_exe, seg_cwd, workspace, "stamp-gate.sh"):
+            return _evaluate_coordinator_stamp_gate(seg[1:], workspace)
+        return _deny_seg()
+
+    if not _is_trusted_coordinator_exe(raw_exe):
+        return _deny_seg()
+
+    if exe in COORDINATOR_READ_ONLY_BINS:
+        if exe == "sort":
+            for tok in seg[1:]:
+                if tok == "--":
+                    break
+                if tok.startswith("--"):
+                    opt_name = tok.split("=", 1)[0]
+                    if opt_name.startswith("--o") or opt_name.startswith("--co"):
+                        return _deny_seg()
+                elif tok.startswith("-") and len(tok) > 1:
+                    if "o" in tok[1:]:
+                        return _deny_seg()
+        elif exe == "uniq":
+            pos_args: list[str] = []
+            idx = 1
+            after_dd = False
+            while idx < len(seg):
+                tok = seg[idx]
+                if not after_dd and not pos_args and tok == "--":
+                    after_dd = True
+                    idx += 1
+                    continue
+                if not after_dd and not pos_args and tok in ("-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"):
+                    idx += 2
+                    continue
+                if not after_dd and not pos_args and tok.startswith("-") and tok != "-":
+                    idx += 1
+                    continue
+                pos_args.append(tok)
+                idx += 1
+            if len(pos_args) >= 2:
+                return _deny_seg()
+        elif exe == "rg":
+            for tok in seg[1:]:
+                if tok in ("--pre", "--pre-glob", "--hostname-bin") or tok.startswith(("--pre=", "--pre-glob=", "--hostname-bin=")):
+                    return _deny_seg()
+        elif exe in ("printf", "test", "["):
+            if any(tok == "-v" or (exe == "printf" and tok.startswith("-v")) for tok in seg[1:]):
+                return _deny_seg()
+        elif exe == "file":
+            if any(
+                tok == "-C" or tok.startswith("--co") or (tok.startswith("-") and not tok.startswith("--") and "C" in tok[1:])
+                for tok in seg[1:]
+            ):
+                return _deny_seg()
+        return "allow", ""
+
+    if exe == "find":
+        if any(tok in COORDINATOR_FIND_FORBIDDEN_FLAGS for tok in seg[1:]):
+            return _deny_seg()
+        return "allow", ""
+
+    if exe == "git":
+        if any(tok == "--output" or tok.startswith("--output=") for tok in seg[1:]):
+            return _deny_seg()
+        git_subcmd, _, subcmd_idx = _parse_git_invocation(seg, Path.cwd())
+        if not git_subcmd:
+            return _deny_seg()
+        global_opts = seg[1:subcmd_idx] if subcmd_idx >= 1 else seg[1:]
+        for gtok in global_opts:
+            if (
+                gtok in COORDINATOR_GIT_FORBIDDEN_GLOBAL_FLAGS
+                or gtok.startswith(("-c", "--config-env=", "--exec-path=", "--upload-pack=", "--receive-pack=", "--git-dir=", "--work-tree="))
+            ):
+                return _deny_seg()
+
+        if git_subcmd in COORDINATOR_READ_ONLY_GIT_SUBCMDS:
+            return "allow", ""
+        rest = seg[subcmd_idx + 1 :] if subcmd_idx >= 0 else []
+        if git_subcmd == "branch":
+            value_flags = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format"}
+            value_eq_prefixes = tuple(f"{f}=" for f in value_flags)
+            bool_flags = {
+                "-a", "--all", "-r", "--remotes", "-l", "--list",
+                "-v", "-vv", "--verbose", "--show-current",
+                "-i", "--ignore-case", "--no-color", "--color",
+                "--abbrev", "--no-abbrev", "--column", "--no-column",
+                "-q", "--quiet",
+            }
+            idx = 0
+            while idx < len(rest):
+                tok = rest[idx]
+                if tok in value_flags:
+                    if idx + 1 >= len(rest):
+                        return _deny_seg()
+                    idx += 2
+                    continue
+                if tok in bool_flags or tok.startswith(value_eq_prefixes + ("--color=", "--abbrev=", "--column=")):
+                    idx += 1
+                    continue
+                return _deny_seg()
+            return "allow", ""
+        if git_subcmd == "worktree":
+            return ("allow", "") if (len(rest) >= 1 and rest[0] == "list") else _deny_seg()
+        if git_subcmd == "remote":
+            pos = [t for t in rest if not t.startswith("-")]
+            return ("allow", "") if (len(pos) == 0 or pos[0] == "show") else _deny_seg()
+        if git_subcmd == "tag":
+            if any(t in ("-a", "-s", "-d", "-f", "-m", "--annotate", "--sign", "--delete", "--force") for t in rest):
+                return _deny_seg()
+            pos = [t for t in rest if not t.startswith("-")]
+            return ("allow", "") if (len(pos) == 0 or ("-l" in rest or "--list" in rest)) else _deny_seg()
+        return _deny_seg()
+
+    if exe == "gh":
+        if len(seg) < 3:
+            return _deny_seg()
+        noun, verb = seg[1], seg[2]
+        allowed_verbs = COORDINATOR_READ_ONLY_GH_VERBS.get(noun)
+        if not (allowed_verbs and verb in allowed_verbs):
+            return _deny_seg()
+        if any(tok == "-w" or tok.startswith("--w") or (tok.startswith("-") and not tok.startswith("--") and "w" in tok[1:]) for tok in seg[3:]):
+            return _deny_seg()
+        return "allow", ""
+
+    return _deny_seg()
+
+
+def is_quota_exhausted_error(error_text: str) -> bool:
+    """Return True if ``error_text`` indicates quota, capacity, or rate-limit exhaustion."""
+    return bool(error_text and SWARM_QUOTA_ERROR_RE.search(error_text))
+
+
+def classify_quota_window(error_text: str = "", wait_seconds: Optional[float] = None) -> str:
+    """Classify quota pause window into ``5h``, ``weekly``, or ``unknown``."""
+    low = (error_text or "").lower()
+    if any(tok in low for tok in ("weekly", "haftalık", "7-day", "7 day", "7d")):
+        return "weekly"
+    if any(tok in low for tok in ("5-hour", "5 hour", "5h", "5 saat", "rolling")):
+        return "5h"
+    if wait_seconds is not None:
+        if wait_seconds > 6 * 3600:
+            return "weekly"
+        if wait_seconds > 0:
+            return "5h"
+    return "unknown"
+
+
+def _parse_iso_timestamp_epoch(raw_ts: str) -> Optional[float]:
+    """Parse an ISO-8601 timestamp string into a UTC epoch float."""
+    cleaned = raw_ts.strip()
+    if not cleaned:
+        return None
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    elif re.search(r"[+-]\d{4}$", cleaned):
+        cleaned = cleaned[:-2] + ":" + cleaned[-2:]
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _default_quota_probe_seconds() -> float:
+    raw = os.environ.get("HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC", "").strip()
+    if raw:
+        try:
+            return max(0.1, float(raw))
+        except ValueError:
+            pass
+    return DEFAULT_SWARM_QUOTA_PROBE_SEC
+
+
+def _max_quota_backoff_seconds() -> float:
+    raw = os.environ.get("HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC", "").strip()
+    if raw:
+        try:
+            return max(0.2, float(raw))
+        except ValueError:
+            pass
+    return DEFAULT_SWARM_QUOTA_MAX_BACKOFF_SEC
+
+
+def parse_quota_reset_epoch(
+    error_text: str,
+    now_epoch: Optional[float] = None,
+    buffer_sec: int = DEFAULT_SWARM_QUOTA_BUFFER_SEC,
+    default_probe_sec: Optional[float] = None,
+) -> tuple[float, bool]:
+    """Extract reset time (ISO-8601 or relative duration) from ``error_text`` with buffer.
+
+    Returns ``(target_epoch, parsed_explicitly)``.
+    """
+    now = time.time() if now_epoch is None else float(now_epoch)
+    buf = max(0, int(buffer_sec))
+    probe = _default_quota_probe_seconds() if default_probe_sec is None else max(0.1, float(default_probe_sec))
+
+    text = re.sub(r"\btimed\s+out\s+after\s+\d+(?:\.\d+)?\s*[a-z]+", "", error_text or "", flags=re.IGNORECASE)
+    iso_m = re.search(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)", text)
+    if iso_m:
+        parsed_ep = _parse_iso_timestamp_epoch(iso_m.group(1))
+        if parsed_ep is not None and parsed_ep > now:
+            return parsed_ep + buf, True
+
+    # Prefer clause after resets/retry/wait/after if present
+    clause_m = re.search(
+        r"(?:resets?|retry|try\s+again|available|wait)(?:[ \t]+(?:in|after))?[ \t]*[: ][ \t]*([^\n.;]+)",
+        text,
+        re.IGNORECASE,
+    )
+    dur_target = clause_m.group(1) if clause_m else text
+    unit_pat = r"(?:days?|gün|hours?|hrs?|saat|minutes?|mins?|dakika|seconds?|secs?|saniye|d|h|m|s)"
+    term_pat = rf"\d+(?:\.\d+)?\s*{unit_pat}"
+    sep_pat = r"(?:\s*,\s*|\s+(?:and|ve)\s+|\s*)"
+    dur_seq_re = re.compile(
+        rf"(?<![A-Za-z0-9-])({term_pat}(?:{sep_pat}{term_pat})*)"
+        r"(?![A-Za-z0-9-])(?!\s*[-–]?\s*(?:quota|limit|cap|window|kota))",
+        re.IGNORECASE,
+    )
+    dur_part_re = re.compile(rf"(\d+(?:\.\d+)?)\s*({unit_pat})(?![A-Za-z])", re.IGNORECASE)
+    total_sec = 0.0
+    matched_any = False
+    for seq_m in dur_seq_re.finditer(dur_target):
+        for m in dur_part_re.finditer(seq_m.group(1)):
+            val = float(m.group(1))
+            unit = m.group(2).lower()
+            matched_any = True
+            if unit in ("d", "day", "days", "gün"):
+                total_sec += val * 86400.0
+            elif unit in ("h", "hr", "hrs", "hour", "hours", "saat"):
+                total_sec += val * 3600.0
+            elif unit in ("m", "min", "mins", "minute", "minutes", "dakika"):
+                total_sec += val * 60.0
+            else:
+                total_sec += val
+
+    if matched_any and total_sec > 0:
+        return now + total_sec + buf, True
+
+    return now + probe, False
+
+
+def _epoch_to_iso_utc(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_swarm_quota_state(workspace: Path) -> dict[str, Any]:
+    """Read ``.harness/state/swarm/swarm-quota-wait.json`` safely without side effects."""
+    swarm_dir = _existing_swarm_state_dir(workspace)
+    if swarm_dir is None:
+        return {}
+    data = read_json_file(swarm_dir / "swarm-quota-wait.json")
+    return data if isinstance(data, dict) else {}
+
+
+def has_active_swarm_quota_wait(workspace: Path) -> bool:
+    """Return True if workspace has an active ``waiting`` or ``resuming`` quota wait."""
+    state = get_swarm_quota_state(workspace)
+    return str(state.get("status") or "") in ("waiting", "resuming")
+
+
+def record_swarm_quota_pause(
+    workspace: Path,
+    *,
+    conversation_id: str = "",
+    model: str = "",
+    reason: str = "",
+    resume_at: str = "",
+    wait_seconds: Optional[float] = None,
+    buffer_seconds: int = DEFAULT_SWARM_QUOTA_BUFFER_SEC,
+    window: str = "",
+    paused_members: Optional[list[str]] = None,
+    source: str = "manual",
+    now_epoch: Optional[float] = None,
+) -> dict[str, Any]:
+    """Persist ``swarm-quota-wait.json`` for Pure-Wait quota recovery across 5h/weekly windows."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    buf = max(0, int(buffer_seconds))
+    state_dir = get_swarm_state_dir(workspace)
+
+    target_epoch: Optional[float] = None
+    if resume_at.strip():
+        parsed = _parse_iso_timestamp_epoch(resume_at)
+        if parsed is None:
+            raise ValueError(f"Invalid --resume-at ISO-8601 timestamp: {resume_at}")
+        target_epoch = parsed + buf
+    elif wait_seconds is not None:
+        if wait_seconds < 0:
+            raise ValueError("--wait-seconds must be non-negative")
+        target_epoch = now + float(wait_seconds) + buf
+    else:
+        target_epoch, _ = parse_quota_reset_epoch(reason, now_epoch=now, buffer_sec=buf)
+
+    inferred_window = window.strip().lower() if window.strip() else ""
+    if inferred_window not in ("5h", "weekly", "unknown"):
+        inferred_window = classify_quota_window(reason, wait_seconds=(target_epoch - now))
+
+    clean_conv = conversation_id.strip()
+    coord_data = _read_swarm_coordinator_data(workspace)
+    coords = coord_data.get("coordinators") if isinstance(coord_data.get("coordinators"), dict) else {}
+    coord_entry = coords.get(clean_conv or "__default__") if isinstance(coords, dict) else None
+    coord_workers = list(coord_entry.get("workers") or []) if isinstance(coord_entry, dict) else []
+
+    with locked_state_file(state_dir, "swarm-quota-wait"):
+        quota_path = state_dir / "swarm-quota-wait.json"
+        existing = read_json_file(quota_path) or {}
+        is_active_wait = existing.get("status") in ("waiting", "resuming")
+        if not clean_conv and is_active_wait:
+            clean_conv = str(existing.get("conversationId") or "").strip()
+
+        merged_members: list[str] = []
+        prior_members = existing.get("pausedMembers") if is_active_wait else []
+        for src_list in (prior_members or [], coord_workers, paused_members or []):
+            if not isinstance(src_list, list):
+                continue
+            for m in src_list:
+                ms = str(m).strip()
+                if ms and ms not in merged_members:
+                    merged_members.append(ms)
+
+        delta_sec = max(0.0, target_epoch - now)
+        rec_sched = max(1, int(round(delta_sec)))
+        payload: dict[str, Any] = {
+            "schemaVersion": CACHE_SCHEMA_VERSION,
+            "status": "waiting",
+            "conversationId": clean_conv,
+            "model": model.strip() or (str(existing.get("model") or "") if is_active_wait else ""),
+            "window": inferred_window,
+            "reason": SECRET_REDACT_RE.sub("[REDACTED]", (reason or "").strip())[:500],
+            "pausedMembers": merged_members,
+            "source": source,
+            "pausedAt": existing.get("pausedAt") if is_active_wait and existing.get("pausedAt") else _epoch_to_iso_utc(now),
+            "resumeAt": _epoch_to_iso_utc(target_epoch),
+            "resumeAtEpoch": int(round(target_epoch)),
+            "nextProbeEpoch": round(target_epoch, 3),
+            "resumingToken": "",
+            "resumingStartedAtEpoch": 0,
+            "attemptCount": int(existing.get("attemptCount", 0)) if is_active_wait else 0,
+            "lastAttemptAt": existing.get("lastAttemptAt", "") if is_active_wait else "",
+            "lastAttemptError": existing.get("lastAttemptError", "") if is_active_wait else "",
+            "recommendedScheduleSeconds": rec_sched,
+            "chunkedScheduleSeconds": min(rec_sched, 21600),
+            "updatedAt": _epoch_to_iso_utc(now),
+        }
+        atomic_write_json(state_dir, "swarm-quota-wait.json", payload)
+        return payload
+
+
+def resume_swarm_quota_wait(workspace: Path) -> dict[str, Any]:
+    """Transition ``swarm-quota-wait.json`` to ``resumed`` under lock."""
+    state_dir = get_swarm_state_dir(workspace)
+    now_iso = utc_now_iso()
+    with locked_state_file(state_dir, "swarm-quota-wait"):
+        quota_path = state_dir / "swarm-quota-wait.json"
+        existing = read_json_file(quota_path) or {}
+        existing["schemaVersion"] = CACHE_SCHEMA_VERSION
+        existing["status"] = "resumed"
+        existing["resumingToken"] = ""
+        existing["resumingStartedAtEpoch"] = 0
+        existing["resumedAt"] = now_iso
+        existing["updatedAt"] = now_iso
+        atomic_write_json(state_dir, "swarm-quota-wait.json", existing)
+        return existing
+
+
+def clear_swarm_quota_wait(workspace: Path) -> dict[str, Any]:
+    """Clear ``swarm-quota-wait.json`` state under lock."""
+    swarm_dir = _existing_swarm_state_dir(workspace)
+    if swarm_dir is None:
+        return {"cleared": True}
+    quota_path = swarm_dir / "swarm-quota-wait.json"
+    with locked_state_file(swarm_dir, "swarm-quota-wait"):
+        if quota_path.is_file():
+            quota_path.unlink()
+    return {"cleared": True}
+
+
+def attempt_swarm_quota_resume(workspace: Path, now_epoch: Optional[float] = None) -> dict[str, Any]:
+    """Probe and resume a paused Swarm Coordinator via ``agy --conversation`` when due."""
+    now = time.time() if now_epoch is None else float(now_epoch)
+    swarm_dir = _existing_swarm_state_dir(workspace)
+    if swarm_dir is None:
+        return {"status": "idle", "reason": "no swarm state directory"}
+    quota_path = swarm_dir / "swarm-quota-wait.json"
+
+    timeout_sec = _resolve_swarm_resume_timeout_sec()
+    stale_threshold = _stale_resuming_threshold_sec(timeout_sec)
+
+    with locked_state_file(swarm_dir, "swarm-quota-wait"):
+        state = read_json_file(quota_path)
+        if not isinstance(state, dict):
+            return {"status": "idle"}
+        cur_status = str(state.get("status") or "")
+        if cur_status not in ("waiting", "resuming"):
+            return {"status": cur_status or "idle"}
+        if cur_status == "resuming":
+            started_ep = _safe_float(state.get("resumingStartedAtEpoch"), 0.0)
+            if started_ep > 0 and (now - started_ep) < stale_threshold:
+                return dict(state)
+        else:
+            next_probe = _safe_float(state.get("nextProbeEpoch"), 0.0)
+            if next_probe > now:
+                return {"status": "waiting", "nextProbeEpoch": next_probe}
+
+        conv_id = str(state.get("conversationId") or "").strip()
+        if not conv_id or conv_id.startswith("-"):
+            state["status"] = "waiting"
+            state["resumingToken"] = ""
+            state["resumingStartedAtEpoch"] = 0
+            state["lastAttemptAt"] = _epoch_to_iso_utc(now)
+            state["lastAttemptError"] = "missing or invalid conversationId for agy --conversation resume"
+            state["nextProbeEpoch"] = round(now + _default_quota_probe_seconds(), 3)
+            state["resumeAt"] = _epoch_to_iso_utc(state["nextProbeEpoch"])
+            state["updatedAt"] = _epoch_to_iso_utc(now)
+            atomic_write_json(swarm_dir, "swarm-quota-wait.json", state)
+            return dict(state)
+
+        resume_token = f"{os.getpid()}-{threading.get_ident()}-{int(now * 1_000_000)}"
+        state["status"] = "resuming"
+        state["resumingToken"] = resume_token
+        state["resumingStartedAtEpoch"] = round(now, 3)
+        state["lastAttemptAt"] = _epoch_to_iso_utc(now)
+        state["updatedAt"] = _epoch_to_iso_utc(now)
+        atomic_write_json(swarm_dir, "swarm-quota-wait.json", state)
+        paused_members = [str(m) for m in (state.get("pausedMembers") or []) if str(m).strip()]
+        model_hint = str(state.get("model") or "").strip()
+        attempt_num = int(_safe_float(state.get("attemptCount"), 0.0)) + 1
+
+    agy_bin = _resolve_cli_binary("HARNESS_AGY_BIN", "agy")
+    members_str = ", ".join(f"@{m}" for m in paused_members) if paused_members else "all paused workers"
+    resume_prompt = (
+        "[SWARM_QUOTA_AUTO_RESUME] Quota wait window elapsed. Follow Pure-Wait Quota Policy strictly: "
+        "do NOT kill workers and do NOT switch models unless the user asked. "
+        "1) Call swarm(action='models') and check quota_remaining for your current model"
+        + (f" ({model_hint})" if model_hint else "")
+        + ". 2) If quota is still exhausted, run `./scripts/stamp-gate.sh swarm-quota pause` with the new reset time and set `schedule`. "
+        "3) If quota is restored, run `./scripts/stamp-gate.sh swarm-quota resume`, call `read_board`, and post to resume "
+        f"{members_str} from where they left off."
+    )
+
+    err_msg = ""
+    succeeded = False
+    if not agy_bin:
+        err_msg = "agy CLI binary not found in PATH"
+    else:
+        clean_env = {k: v for k, v in os.environ.items() if k not in REVIEW_SCRUB_ENV_KEYS}
+        cmd = [agy_bin, "--conversation", conv_id, f"--print={resume_prompt}"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(workspace),
+                env=clean_env,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+            )
+            out_txt = proc.stdout or ""
+            err_txt = proc.stderr or ""
+            if proc.returncode == 0 and not is_quota_exhausted_error(err_txt) and not SWARM_QUOTA_STDOUT_ERROR_RE.search(out_txt):
+                succeeded = True
+            else:
+                err_msg = _summarize_cli_failure(proc.returncode, err_txt, out_txt)
+        except subprocess.TimeoutExpired:
+            err_msg = f"agy --conversation timed out after {timeout_sec}s"
+        except OSError as exc:
+            err_msg = f"Failed to execute agy CLI: {exc}"
+
+    done_now = time.time() if now_epoch is None else max(now, float(now_epoch))
+    with locked_state_file(swarm_dir, "swarm-quota-wait"):
+        cur = read_json_file(quota_path)
+        if not isinstance(cur, dict):
+            return {"status": "cleared"}
+        if cur.get("status") != "resuming" or cur.get("resumingToken") != resume_token:
+            return dict(cur)
+
+        cur["attemptCount"] = attempt_num
+        cur["lastAttemptAt"] = _epoch_to_iso_utc(done_now)
+        cur["updatedAt"] = _epoch_to_iso_utc(done_now)
+        cur["resumingToken"] = ""
+        cur["resumingStartedAtEpoch"] = 0
+        if succeeded:
+            cur["status"] = "resumed"
+            cur["resumedAt"] = _epoch_to_iso_utc(done_now)
+            cur["lastAttemptError"] = ""
+        else:
+            parsed_next, explicit_reset = parse_quota_reset_epoch(err_msg, now_epoch=done_now)
+            if explicit_reset:
+                next_probe = parsed_next
+            else:
+                base_probe = _default_quota_probe_seconds()
+                max_backoff = _max_quota_backoff_seconds()
+                delay = min(max_backoff, base_probe * (2 ** min(attempt_num - 1, 3)))
+                next_probe = done_now + delay
+            cur["status"] = "waiting"
+            cur["lastAttemptError"] = SECRET_REDACT_RE.sub("[REDACTED]", err_msg)[:400]
+            cur["nextProbeEpoch"] = round(next_probe, 3)
+            cur["resumeAtEpoch"] = int(round(next_probe))
+            cur["resumeAt"] = _epoch_to_iso_utc(next_probe)
+        atomic_write_json(swarm_dir, "swarm-quota-wait.json", cur)
+        return dict(cur)
+
+
 def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate ``swarm`` PreToolUse guard with non-blocking brief enrichment."""
+    """Evaluate ``swarm`` PreToolUse guard with Coordinator tracking, Pure-Wait protection, and brief enrichment."""
     if is_harness_ignored(workspace):
         return {"decision": "allow"}
     if not isinstance(hook_input, dict):
@@ -2882,11 +4620,68 @@ def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str,
         return {"decision": "allow"}
 
     action = str(args.get("action") or "").strip().lower()
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
+    last_input = str(hook_input.get("lastUserInput") or "")
+
+    if action == "title":
+        if cur_conv and not _is_worker_prompt_text(last_input):
+            register_swarm_coordinator(
+                workspace,
+                conversation_id=cur_conv,
+                active=True,
+                title=str(args.get("title") or "").strip(),
+                source="swarm-tool",
+            )
+        return {"decision": "allow"}
+
+    if action in ("model", "kill"):
+        q_state = get_swarm_quota_state(workspace)
+        q_status = str(q_state.get("status") or "")
+        q_conv = str(q_state.get("conversationId") or "").strip()
+        if q_status in ("waiting", "resuming") and (not cur_conv or not q_conv or cur_conv == q_conv):
+            resume_at = str(q_state.get("resumeAt") or "quota reset")
+            return {
+                "decision": "force_ask",
+                "reason": (
+                    f"Swarm Pure-Wait Quota Policy active (status: {q_status}, resumeAt: {resume_at}). "
+                    f"Confirm only if you explicitly want to execute swarm(action='{action}') instead of waiting for quota reset on the current model."
+                ),
+            }
+        return {"decision": "allow"}
+
     if action != "add":
         return {"decision": "allow"}
 
     worker_name = str(args.get("name") or "").strip()
-    if worker_name and SWARM_SYSTEM_ROLE_RE.match(worker_name.lower()):
+    is_system_role = bool(worker_name and SWARM_SYSTEM_ROLE_RE.match(worker_name.lower()))
+
+    if cur_conv and not _is_worker_prompt_text(last_input):
+        coord_data = _read_swarm_coordinator_data(workspace)
+        coords = coord_data.get("coordinators") if isinstance(coord_data.get("coordinators"), dict) else {}
+        existing_entry = coords.get(cur_conv)
+        other_active = any(
+            k != cur_conv and isinstance(v, dict) and v.get("active") is True and v.get("explicitlyDisabled") is not True
+            for k, v in coords.items()
+        )
+        initial_cwd = _resolve_initial_cwd(workspace, hook_input)
+        in_other_wt = _is_in_different_linked_worktree(workspace, initial_cwd)
+
+        should_register = False
+        if isinstance(existing_entry, dict):
+            should_register = existing_entry.get("active") is True and existing_entry.get("explicitlyDisabled") is not True
+        elif _has_explicit_swarm_slash_command(last_input) or (not other_active and not in_other_wt):
+            should_register = True
+
+        if should_register:
+            register_swarm_coordinator(
+                workspace,
+                conversation_id=cur_conv,
+                active=True,
+                source="swarm-tool",
+                worker_name="" if is_system_role else worker_name,
+            )
+
+    if is_system_role:
         return {"decision": "allow"}
 
     brief = str(args.get("brief") or "")
@@ -2898,7 +4693,6 @@ def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str,
     effort = "MEDIUM"
     if worker_name:
         candidates = _ordered_candidate_worktrees(workspace, brief)
-        cur_conv = str(hook_input.get("conversationId") or "").strip()
         entry, _ = _try_consume_optional_dispatch(
             candidates,
             worker_name,
@@ -2910,11 +4704,15 @@ def evaluate_pre_swarm(workspace: Path, hook_input: dict[str, Any]) -> dict[str,
             if is_valid_effort_profile(reg_effort):
                 effort = reg_effort
 
+    is_integrator = bool(worker_name and SWARM_INTEGRATOR_ROLE_RE.match(worker_name.lower()))
     leading_headers = _leading_bracket_header_block(brief)
     headers: list[str] = []
     if "[EFFORT_PROFILE:" not in leading_headers:
         headers.append(EFFORT_PROFILE_HEADERS[effort])
-    if "[SWARM_WORKER_CONTRACT" not in leading_headers:
+    if is_integrator:
+        if "[SWARM_INTEGRATOR_CONTRACT" not in leading_headers:
+            headers.append(SWARM_INTEGRATOR_CONTRACT_HEADER)
+    elif "[SWARM_WORKER_CONTRACT" not in leading_headers:
         headers.append(SWARM_WORKER_CONTRACT_HEADER)
     if ws_mode in ("share", "branch") and "[SWARM_BRANCH_GUARD" not in leading_headers:
         headers.append(SWARM_BRANCH_GUARD_HEADER)
@@ -2950,7 +4748,7 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
 
     initial_cwd = _resolve_initial_cwd(workspace, hook_input)
     raw_cwd = args.get("Cwd")
-    wf_cwd = _resolve_dir_arg(initial_cwd, raw_cwd.strip()) if isinstance(raw_cwd, str) and raw_cwd.strip() else initial_cwd
+    wf_cwd = _resolve_dir_arg(initial_cwd, raw_cwd.strip(), physical=True) if isinstance(raw_cwd, str) and raw_cwd.strip() else initial_cwd
     linked_wt = resolve_linked_worktree(workspace, wf_cwd)
     if linked_wt is not None and is_harness_ignored(linked_wt):
         return {"decision": "allow"}
@@ -2962,7 +4760,7 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
 
     script_path_raw = str(args.get("ScriptPath") or "").strip()
     if script_path_raw:
-        sp = _resolve_dir_arg(wf_cwd, script_path_raw)
+        sp = _resolve_dir_arg(wf_cwd, script_path_raw, physical=True)
         _, is_ext = _resolve_rel_path(workspace, str(sp))
         if is_ext:
             wt_root = resolve_linked_worktree(workspace, sp)
@@ -3137,6 +4935,15 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     tool_name = str(tool_call.get("name") or "")
     if tool_name == "swarm":
         return evaluate_pre_swarm(workspace, hook_input)
+    if tool_name in ("invoke_subagent", "run_workflow") and is_active_swarm_coordinator(workspace, hook_input):
+        return {
+            "decision": "deny",
+            "reason": (
+                f"Swarm Coordinator-Only guard: active Swarm Coordinator cannot invoke '{tool_name}' directly. "
+                "Delegate research, implementation, verification, and integration/audit tasks to Swarm workers "
+                "(e.g. planner, implementer, verifier, integrator) via swarm(action='add') or post_message."
+            ),
+        }
     if tool_name == "run_workflow":
         return evaluate_pre_workflow(workspace, hook_input)
     if tool_name and tool_name != "invoke_subagent":
@@ -3265,16 +5072,37 @@ def evaluate_pre_subagent(workspace: Path, hook_input: dict[str, Any]) -> dict[s
     return _build_subagent_overwrite(model, effort, orig_prompt)
 
 
-def evaluate_stop_gate(workspace: Path, hook_input: dict[str, Any]) -> dict[str, Any]:
-    """Evaluate Stop hook gate scoped by worktree and optional ``conversationId``."""
+def evaluate_stop_gate(
+    workspace: Path,
+    hook_input: dict[str, Any],
+    on_swarm_quota_wait: Optional[Callable[[Path], None]] = None,
+) -> dict[str, Any]:
+    """Evaluate Stop hook gate scoped by worktree, ``conversationId``, and Swarm quota ERROR recovery."""
     if is_harness_ignored(workspace):
         return {}
     if not isinstance(hook_input, dict):
         return {}
-    if str(hook_input.get("terminationReason") or "") != "NO_TOOL_CALL":
+
+    term_reason = str(hook_input.get("terminationReason") or "")
+    cur_conv = str(hook_input.get("conversationId") or "").strip()
+
+    if term_reason == "ERROR":
+        err_text = str(hook_input.get("error") or "")
+        if is_quota_exhausted_error(err_text) and is_active_swarm_coordinator(workspace, hook_input):
+            record_swarm_quota_pause(
+                workspace,
+                conversation_id=cur_conv,
+                model=str(hook_input.get("modelName") or ""),
+                reason=err_text,
+                source="stop-error",
+            )
+            if on_swarm_quota_wait is not None:
+                on_swarm_quota_wait(workspace)
         return {}
 
-    cur_conv = str(hook_input.get("conversationId") or "").strip()
+    if term_reason != "NO_TOOL_CALL":
+        return {}
+
     candidates = _ordered_candidate_worktrees(workspace)
     passes = (True, False) if cur_conv else (False,)
     saw_exact_match = False
@@ -3768,7 +5596,7 @@ REVIEW_SCRUB_ENV_KEYS = frozenset(
     )
 )
 SECRET_REDACT_RE = re.compile(
-    r"(?:ts_live_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{12,}|AIza[0-9A-Za-z_-]{16,}|Bearer\s+[A-Za-z0-9._-]{8,})",
+    r"(?:ts_live_[A-Za-z0-9_-]{8,}|(?:sk|rk)(?:_live)?-[A-Za-z0-9_-]{8,}|(?:sk|rk)_live_[A-Za-z0-9_-]{8,}|gh[pors]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{12,}|AIza[0-9A-Za-z_-]{16,}|Bearer\s+[A-Za-z0-9._+/=-]{8,})",
     re.IGNORECASE,
 )
 
@@ -5439,6 +7267,24 @@ def build_session_start_payload(
         except Exception:
             pass
 
+    if is_active_swarm_coordinator(workspace, hook_input):
+        lines.append(
+            "[SWARM COORDINATOR MODE] Active Swarm Coordinator-Only guard is enabled: "
+            "delegate all file edits, builds/tests, git mutations, Walkthroughs, and PR gates to Swarm workers "
+            "(planner, implementer, verifier, integrator)."
+        )
+
+    q_state = get_swarm_quota_state(workspace)
+    if str(q_state.get("status") or "") in ("waiting", "resuming"):
+        q_members = ", ".join(str(m) for m in (q_state.get("pausedMembers") or []) if str(m).strip()) or "none"
+        lines.append(
+            f"[SWARM QUOTA WAIT ACTIVE] Window: {q_state.get('window') or 'unknown'}, "
+            f"resumeAt: {q_state.get('resumeAt') or 'unknown'}, pausedMembers: {q_members}. "
+            "Pure-Wait Quota Policy: do NOT kill workers or switch models unless the user asked; "
+            "check swarm(action='models') and either resume paused workers (stamp-gate.sh swarm-quota resume + @mention) "
+            "or re-arm schedule(DurationSeconds=...)."
+        )
+
     return {"injectSteps": [{"systemMessage": {"systemMessage": "\n".join(lines)}}]}
 
 
@@ -5545,6 +7391,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_ios = sub.add_parser("parse-ios-crash")
     p_ios.add_argument("--diag-dir", required=True)
     p_ios.add_argument("--bundle-id", default="")
+
+    p_sw_coord = sub.add_parser("swarm-coordinator")
+    p_sw_coord.add_argument("--workspace", default=".")
+    p_sw_coord.add_argument("--action", required=True, choices=["on", "off", "status"])
+    p_sw_coord.add_argument("--conversation-id", default="")
+    p_sw_coord.add_argument("--title", default="")
+
+    p_sw_quota = sub.add_parser("swarm-quota")
+    p_sw_quota.add_argument("--workspace", default=".")
+    p_sw_quota.add_argument("--action", required=True, choices=["pause", "resume", "status", "clear", "attempt-resume"])
+    p_sw_quota.add_argument("--conversation-id", default="")
+    p_sw_quota.add_argument("--resume-at", default="")
+    p_sw_quota.add_argument("--wait-seconds", type=float, default=None)
+    p_sw_quota.add_argument("--buffer-seconds", type=int, default=DEFAULT_SWARM_QUOTA_BUFFER_SEC)
+    p_sw_quota.add_argument("--window", default="")
+    p_sw_quota.add_argument("--model", default="")
+    p_sw_quota.add_argument("--reason", default="")
+    p_sw_quota.add_argument("--member", action="append", default=[])
 
     args = parser.parse_args(argv)
 
@@ -5686,6 +7550,65 @@ def main(argv: Optional[list[str]] = None) -> int:
         res = parse_ios_crash_report(Path(args.diag_dir), bundle_id=args.bundle_id, allow_unmatched_fallback=True)
         for line in res.get("lines", []):
             print(line)
+        return 0
+
+    if args.subcommand == "swarm-coordinator":
+        ws = Path(args.workspace)
+        if args.action == "on":
+            res = register_swarm_coordinator(
+                ws,
+                conversation_id=args.conversation_id,
+                active=True,
+                title=args.title,
+                source="cli",
+            )
+            print(json.dumps(res, ensure_ascii=False))
+            return 0
+        if args.action == "off":
+            res = register_swarm_coordinator(
+                ws,
+                conversation_id=args.conversation_id,
+                active=False,
+                source="cli",
+                explicitly_disabled=True,
+            )
+            print(json.dumps(res, ensure_ascii=False))
+            return 0
+        res = get_swarm_coordinator_status(ws, conversation_id=args.conversation_id)
+        print(json.dumps(res, ensure_ascii=False))
+        return 0
+
+    if args.subcommand == "swarm-quota":
+        ws = Path(args.workspace)
+        if args.action == "pause":
+            try:
+                res = record_swarm_quota_pause(
+                    ws,
+                    conversation_id=args.conversation_id,
+                    model=args.model,
+                    reason=args.reason,
+                    resume_at=args.resume_at,
+                    wait_seconds=args.wait_seconds,
+                    buffer_seconds=args.buffer_seconds,
+                    window=args.window,
+                    paused_members=args.member or None,
+                    source="cli",
+                )
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+            print(json.dumps(res, ensure_ascii=False))
+            return 0
+        if args.action == "resume":
+            print(json.dumps(resume_swarm_quota_wait(ws), ensure_ascii=False))
+            return 0
+        if args.action == "clear":
+            print(json.dumps(clear_swarm_quota_wait(ws), ensure_ascii=False))
+            return 0
+        if args.action == "attempt-resume":
+            print(json.dumps(attempt_swarm_quota_resume(ws), ensure_ascii=False))
+            return 0
+        print(json.dumps(get_swarm_quota_state(ws), ensure_ascii=False))
         return 0
 
     return 1

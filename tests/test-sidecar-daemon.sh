@@ -90,6 +90,7 @@ test_daemon_lifecycle_health_permissions_and_standby() {
   _TD_DIRS+=("$sock_dir" "$data_dir")
   sock_path="$sock_dir/d.sock"
 
+  chmod 0755 "$sock_dir"
   touch "$sock_path"
 
   HARNESS_DAEMON_SOCK="$sock_path" \
@@ -105,13 +106,69 @@ test_daemon_lifecycle_health_permissions_and_standby() {
   local dir_perm sock_perm
   dir_perm=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$sock_dir")
   sock_perm=$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$sock_path")
-  assert_eq "0o700" "$dir_perm" "Socket dir must have 0700 permissions"
+  assert_eq "0o700" "$dir_perm" "Daemon must harden 0755 socket dir to 0700"
   assert_eq "0o600" "$sock_perm" "Socket file must have 0600 permissions"
 
-  local health_json
+  local health_json http_404 http_400
   health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
   assert_json_field "$health_json" ".status" "ok"
   assert_json_field "$health_json" ".pid" "$dpid1"
+  http_404=$(curl -s -o /dev/null -w "%{http_code}" --unix-socket "$sock_path" "http://localhost/unknown")
+  assert_eq "404" "$http_404" "Unknown GET route must return 404"
+  http_400=$(curl -s -o /dev/null -w "%{http_code}" --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST -d '{bad' "http://localhost/event/swarm-quota-wait")
+  assert_eq "400" "$http_400" "Malformed JSON POST must return 400"
+
+  # I4: HTTP 413 oversized request, 400 non-numeric Content-Length, 400 non-object JSON body, and 404 unknown POST route
+  DAEMON_SOCK_CHECK="$sock_path" python3 - << 'PYEOF'
+import os, socket
+
+sock_path = os.environ["DAEMON_SOCK_CHECK"]
+
+def send_raw(req_bytes: bytes) -> tuple[int, str]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(5.0)
+        s.connect(sock_path)
+        s.sendall(req_bytes)
+        chunks = []
+        while True:
+            data = s.recv(4096)
+            if not data:
+                break
+            chunks.append(data)
+    resp = b"".join(chunks).decode("utf-8", errors="replace")
+    status = int(resp.split(" ", 2)[1])
+    return status, resp
+
+st_413, _ = send_raw(
+    b"POST /hook/pre-command HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2097153\r\nConnection: close\r\n\r\n"
+)
+assert st_413 == 413, f"Expected 413 for > MAX_REQUEST_BYTES, got {st_413}"
+
+st_nan, _ = send_raw(
+    b"POST /hook/pre-command HTTP/1.1\r\nHost: localhost\r\nContent-Length: notanumber\r\nConnection: close\r\n\r\n"
+)
+assert st_nan == 400, f"Expected 400 for non-numeric Content-Length, got {st_nan}"
+
+st_arr, _ = send_raw(
+    b"POST /hook/pre-command HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 5\r\nConnection: close\r\n\r\n[1,2]"
+)
+assert st_arr == 400, f"Expected 400 for non-object JSON array, got {st_arr}"
+
+st_404, resp_404 = send_raw(
+    b'POST /unknown-post-route HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{"workspace":"/tmp"}'
+)
+assert st_404 == 404 and "not_found" in resp_404, (st_404, resp_404)
+PYEOF
+
+  # I5: Already-served socket under separate data_dir must be refused cleanly
+  local alt_data_dir
+  alt_data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-d1-alt.XXXXXX")
+  _TD_DIRS+=("$alt_data_dir")
+  if HARNESS_DAEMON_SOCK="$sock_path" HARNESS_DAEMON_DATA_DIR="$alt_data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
+    echo "Daemon must refuse starting when socket is already served by a live instance" >&2
+    return 1
+  fi
 
   HARNESS_DAEMON_SOCK="$sock_path" \
   HARNESS_DAEMON_DATA_DIR="$data_dir" \
@@ -121,20 +178,192 @@ test_daemon_lifecycle_health_permissions_and_standby() {
   dpid2=$!
   _TD_PIDS+=("$dpid2")
 
-  sleep 0.5
+  # I6: Wait until dpid2 enters passive standby, kill PRIMARY first, and assert real failover to dpid2
+  local sb_tries=0
+  while [ "$sb_tries" -lt 40 ]; do
+    if grep -q "waiting in passive standby" "$data_dir/daemon.log" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+    sb_tries=$((sb_tries + 1))
+  done
+  grep -q "waiting in passive standby" "$data_dir/daemon.log" 2>/dev/null \
+    || { echo "Secondary daemon did not enter passive standby" >&2; return 1; }
   kill -0 "$dpid2" 2>/dev/null || { echo "Secondary daemon must stay alive in passive standby" >&2; return 1; }
-
-  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
-  assert_json_field "$health_json" ".pid" "$dpid1"
-
-  kill -TERM "$dpid2" 2>/dev/null || true
-  wait "$dpid2" 2>/dev/null || true
 
   kill -TERM "$dpid1" 2>/dev/null || true
   wait "$dpid1" 2>/dev/null || true
 
+  local fo_tries=0 fo_pid=""
+  while [ "$fo_tries" -lt 40 ]; do
+    fo_pid=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" 2>/dev/null | jq -r '.pid // empty' || true)
+    if [ "$fo_pid" = "$dpid2" ]; then
+      break
+    fi
+    sleep 0.1
+    fo_tries=$((fo_tries + 1))
+  done
+  assert_eq "$dpid2" "$fo_pid" "Standby daemon dpid2 must take over /health after primary dpid1 terminates"
+
+  kill -TERM "$dpid2" 2>/dev/null || true
+  wait "$dpid2" 2>/dev/null || true
+
   [ ! -S "$sock_path" ] || { echo "Socket file should be unlinked on graceful SIGTERM" >&2; return 1; }
   [ ! -f "$sock_dir/d.pid" ] || { echo "PID file should be removed on graceful SIGTERM" >&2; return 1; }
+
+  # I5: Startup security refusals (symlink dir, symlink socket, over-long sun_path, foreign UID owner)
+  local sec_base sym_dir_target sym_dir sym_sock_dir sym_sock_target long_dir
+  sec_base=$(mktemp -d "/tmp/hd-sec.XXXXXX")
+  _TD_DIRS+=("$sec_base")
+  sym_dir_target="$sec_base/real_dir"
+  mkdir -p "$sym_dir_target"
+  sym_dir="$sec_base/sym_dir"
+  ln -s "$sym_dir_target" "$sym_dir"
+  if HARNESS_DAEMON_SOCK="$sym_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
+    echo "Daemon must refuse symlinked socket directory" >&2
+    return 1
+  fi
+
+  sym_sock_dir="$sec_base/real_sock_dir"
+  mkdir -p "$sym_sock_dir" && chmod 0700 "$sym_sock_dir"
+  sym_sock_target="$sec_base/evil.target"
+  touch "$sym_sock_target"
+  ln -s "$sym_sock_target" "$sym_sock_dir/d.sock"
+  if HARNESS_DAEMON_SOCK="$sym_sock_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
+    echo "Daemon must refuse symlinked socket file" >&2
+    return 1
+  fi
+
+  long_dir="/tmp/hd-long-$(python3 -c 'print("x"*105)')"
+  local long_err
+  long_err=$(HARNESS_DAEMON_SOCK="$long_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" 2>&1 || true)
+  assert_contains "$long_err" "sun_path limit" "Over-long socket path must fail with explicit sun_path limit guard"
+  if HARNESS_DAEMON_SOCK="$long_dir/d.sock" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+    python3 -B "$DAEMON_PY" >/dev/null 2>&1; then
+    echo "Daemon must refuse over-long Unix socket path on macOS" >&2
+    return 1
+  fi
+
+  SEC_DIR="$sym_sock_dir" PYTHONPATH="$REPO_ROOT/sidecars/harness-daemon" python3 - << 'PYEOF'
+import os, pathlib, types
+import daemon
+
+orig_lstat = pathlib.Path.lstat
+def fake_lstat(self):
+    res = orig_lstat(self)
+    return types.SimpleNamespace(st_mode=res.st_mode, st_uid=os.getuid() + 1)
+
+pathlib.Path.lstat = fake_lstat
+try:
+    try:
+        daemon.validate_and_prepare_socket_dir(pathlib.Path(os.environ["SEC_DIR"]) / "d.sock")
+        raise AssertionError("Expected PermissionError for foreign UID socket dir")
+    except PermissionError:
+        pass
+finally:
+    pathlib.Path.lstat = orig_lstat
+PYEOF
+
+  # I2: Stale-socket recovery on startup + foreign-UID socket file, lstat OSError, and unlink OSError
+  local stale_sdir stale_ddir stale_sock spid
+  stale_sdir=$(mktemp -d "/tmp/hd-stale.XXXXXX")
+  stale_ddir=$(mktemp -d "${TMPDIR:-/tmp}/hd-stale-d.XXXXXX")
+  _TD_DIRS+=("$stale_sdir" "$stale_ddir")
+  stale_sock="$stale_sdir/d.sock"
+  chmod 0700 "$stale_sdir"
+  STALE_SOCK="$stale_sock" python3 - << 'PYEOF'
+import os, socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(os.environ["STALE_SOCK"])
+s.close()
+PYEOF
+  [ -S "$stale_sock" ] || { echo "Expected leftover stale socket before daemon start" >&2; return 1; }
+
+  HARNESS_DAEMON_SOCK="$stale_sock" \
+  HARNESS_DAEMON_DATA_DIR="$stale_ddir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.2" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  spid=$!
+  _TD_PIDS+=("$spid")
+  _wait_for_socket_health "$stale_sock" 50 || { echo "Daemon did not recover from stale socket" >&2; return 1; }
+  grep -q "Removed stale Unix socket" "$stale_ddir/daemon.log" || {
+    echo "Expected 'Removed stale Unix socket' log entry" >&2
+    return 1
+  }
+  kill -TERM "$spid" 2>/dev/null || true
+  wait "$spid" 2>/dev/null || true
+
+  STALE_BASE="$stale_sdir" STALE_DD="$stale_ddir" PYTHONPATH="$REPO_ROOT/sidecars/harness-daemon" python3 - << 'PYEOF'
+import os, pathlib, socket, types
+import daemon
+
+sdir = pathlib.Path(os.environ["STALE_BASE"])
+ddir = pathlib.Path(os.environ["STALE_DD"])
+
+def make_dead_sock(name: str) -> pathlib.Path:
+    sp = sdir / name
+    if sp.exists() or sp.is_symlink():
+        sp.unlink()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(sp))
+    s.close()
+    return sp
+
+sp1 = make_dead_sock("foreign.sock")
+sp2 = make_dead_sock("stat-err.sock")
+sp3 = make_dead_sock("unlink-err.sock")
+
+orig_env = {k: os.environ.get(k) for k in ("HARNESS_DAEMON_SOCK", "HARNESS_DAEMON_DATA_DIR", "HARNESS_SKIP_SHELL_PATH_SYNC")}
+orig_lstat = pathlib.Path.lstat
+orig_unlink = pathlib.Path.unlink
+try:
+    os.environ["HARNESS_DAEMON_DATA_DIR"] = str(ddir)
+    os.environ["HARNESS_SKIP_SHELL_PATH_SYNC"] = "1"
+
+    # 1. Foreign-UID socket file -> exit 1 + log
+    os.environ["HARNESS_DAEMON_SOCK"] = str(sp1)
+    def fake_lstat_uid(self):
+        res = orig_lstat(self)
+        if self == sp1:
+            return types.SimpleNamespace(st_mode=res.st_mode, st_uid=os.getuid() + 1)
+        return res
+    pathlib.Path.lstat = fake_lstat_uid
+    assert daemon.run_daemon() == 1
+    assert "Refusing socket not owned by UID" in (ddir / "daemon.log").read_text(encoding="utf-8")
+
+    # 2. Socket lstat OSError -> exit 1 + log
+    os.environ["HARNESS_DAEMON_SOCK"] = str(sp2)
+    def fake_lstat_err(self):
+        if self == sp2:
+            raise OSError("mock socket stat failure")
+        return orig_lstat(self)
+    pathlib.Path.lstat = fake_lstat_err
+    assert daemon.run_daemon() == 1
+    assert "Cannot stat socket" in (ddir / "daemon.log").read_text(encoding="utf-8")
+    pathlib.Path.lstat = orig_lstat
+
+    # 3. Socket unlink OSError -> exit 1 + log
+    os.environ["HARNESS_DAEMON_SOCK"] = str(sp3)
+    def fake_unlink_err(self, missing_ok=False):
+        if self == sp3:
+            raise PermissionError("mock socket unlink failure")
+        return orig_unlink(self, missing_ok=missing_ok)
+    pathlib.Path.unlink = fake_unlink_err
+    assert daemon.run_daemon() == 1
+    assert "Cannot unlink stale socket" in (ddir / "daemon.log").read_text(encoding="utf-8")
+finally:
+    pathlib.Path.lstat = orig_lstat
+    pathlib.Path.unlink = orig_unlink
+    for k, v in orig_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+PYEOF
 }
 
 test_daemon_on_vs_off_hook_parity() {
@@ -273,13 +502,36 @@ test_async_graphify_queue_and_coalescing() {
   git -C "$repo" commit -m "chore: init" --quiet
   mkdir -p "$repo/graphify-out"
 
-  local call_log="$repo/.mock-graphify-calls.log"
-  local mock_graphify="$repo/mock-graphify.sh"
+  local call_log started1 release1 active_flag count_file mock_graphify
+  call_log="$repo/.mock-graphify-calls.log"
+  started1="$repo/.mock-graphify.started1"
+  release1="$repo/.mock-graphify.release1"
+  active_flag="$repo/.mock-graphify.active"
+  count_file="$repo/.mock-graphify.count"
+  mock_graphify="$repo/mock-graphify.sh"
   cat << EOF > "$mock_graphify"
 #!/usr/bin/env bash
-echo "START:\$(date +%s)" >> "$call_log"
-sleep 0.6
-echo "END:\$*" >> "$call_log"
+if [ -f "$active_flag" ]; then
+  echo "OVERLAP" >> "$call_log"
+fi
+touch "$active_flag"
+n=0
+if [ -f "$count_file" ]; then
+  n=\$(cat "$count_file")
+fi
+n=\$((n + 1))
+echo "\$n" > "$count_file"
+echo "START:\$n" >> "$call_log"
+if [ "\$n" -eq 1 ]; then
+  touch "$started1"
+  tries=0
+  while [ ! -f "$release1" ] && [ "\$tries" -lt 80 ]; do
+    sleep 0.05
+    tries=\$((tries + 1))
+  done
+fi
+rm -f "$active_flag"
+echo "END:\$n" >> "$call_log"
 EOF
   chmod +x "$mock_graphify"
 
@@ -312,6 +564,15 @@ print(dt)
     return 1
   fi
 
+  # Wait until run 1 is actively running behind release1
+  local tries_s=0
+  while [ ! -f "$started1" ] && [ "$tries_s" -lt 50 ]; do
+    sleep 0.05
+    tries_s=$((tries_s + 1))
+  done
+  [ -f "$started1" ] || { echo "Graphify run 1 did not start behind barrier" >&2; return 1; }
+
+  # Send two bursts while run 1 is still executing
   curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST \
     --data-binary "$(jq -nc --arg ws "$repo" '{workspace: $ws, reason: "burst1"}')" \
     "http://localhost/event/graphify" >/dev/null
@@ -319,17 +580,84 @@ print(dt)
     --data-binary "$(jq -nc --arg ws "$repo" '{workspace: $ws, reason: "burst2"}')" \
     "http://localhost/event/graphify" >/dev/null
 
+  # Wait for >= 3 watcherCycles while run 1 holds release1 -> single-flight must keep START == 1
+  local c0 cur_cyc w_steps=0
+  c0=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.watcherCycles // 0')
+  while [ "$w_steps" -lt 40 ]; do
+    sleep 0.1
+    w_steps=$((w_steps + 1))
+    cur_cyc=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.watcherCycles // 0')
+    [ "$cur_cyc" -ge $((c0 + 3)) ] && break
+  done
+  [ "$cur_cyc" -ge $((c0 + 3)) ] || { echo "Expected >= 3 watcherCycles during graphify barrier" >&2; return 1; }
+  assert_eq "1" "$(grep -c '^START:' "$call_log" || true)" "Single-flight must not start a concurrent graphify run while run 1 is active"
+
+  # Release run 1 -> bursts must coalesce into exactly 1 rerun (total START == 2, END == 2, OVERLAP == 0)
+  touch "$release1"
   _wait_for_file_jq "$repo/.harness/cache/graphify-status.json" '.state == "succeeded"' 60 || {
     echo "graphify-status.json did not reach succeeded" >&2
     return 1
   }
+  local e_tries=0
+  while [ "$(grep -c '^END:' "$call_log" || true)" -lt 2 ] && [ "$e_tries" -lt 40 ]; do
+    sleep 0.05
+    e_tries=$((e_tries + 1))
+  done
 
-  local start_count
-  start_count=$(grep -c '^START:' "$call_log" || true)
-  if [ "$start_count" -lt 1 ] || [ "$start_count" -gt 2 ]; then
-    echo "Expected 1 or 2 coalesced graphify runs, got $start_count" >&2
+  assert_eq "2" "$(grep -c '^START:' "$call_log" || true)" "Expected 1 initial run + 1 coalesced rerun"
+  assert_eq "2" "$(grep -c '^END:' "$call_log" || true)" "Expected 2 completed runs"
+  assert_eq "0" "$(grep -c '^OVERLAP' "$call_log" || true)" "Single-flight runs must never overlap"
+
+  # I5: Non-zero exit and non-executable binary failure paths for graphify + exception cleanup of _quota_resume_inflight
+  cat << 'EOF' > "$mock_graphify"
+#!/usr/bin/env bash
+echo "boom-42" >&2
+exit 42
+EOF
+  chmod +x "$mock_graphify"
+  curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST \
+    --data-binary "$(jq -nc --arg ws "$repo" '{workspace: $ws, reason: "fail-rc"}')" \
+    "http://localhost/event/graphify" >/dev/null
+  _wait_for_file_jq "$repo/.harness/cache/graphify-status.json" '.reason == "fail-rc" and .state == "failed" and .exitCode == 42' 60 || {
+    echo "Expected failed state with exitCode 42 on non-zero graphify mock" >&2
     return 1
-  fi
+  }
+  grep -q "boom-42" "$repo/.harness/logs/graphify-hook.log" || {
+    echo "Expected boom-42 output in graphify-hook.log" >&2
+    return 1
+  }
+
+  chmod 0644 "$mock_graphify"
+  curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST \
+    --data-binary "$(jq -nc --arg ws "$repo" '{workspace: $ws, reason: "fail-exec"}')" \
+    "http://localhost/event/graphify" >/dev/null
+  _wait_for_file_jq "$repo/.harness/cache/graphify-status.json" '.reason == "fail-exec" and .state == "failed" and .exitCode == 1' 60 || {
+    echo "Expected failed state with exitCode 1 on non-executable graphify mock" >&2
+    return 1
+  }
+  grep -q "graphify invocation failed:" "$repo/.harness/logs/graphify-hook.log" || {
+    echo "Expected graphify invocation failed error in graphify-hook.log" >&2
+    return 1
+  }
+
+  PYTHONPATH="$REPO_ROOT/sidecars/harness-daemon:$REPO_ROOT/scripts/lib" DAEMON_DATA="$data_dir" python3 - << 'PYEOF'
+import os, pathlib
+import daemon, harness_core
+
+ddir = pathlib.Path(os.environ["DAEMON_DATA"])
+st = daemon.HarnessDaemonState(ddir, daemon.DaemonLogger(ddir / "exc-test.log"), False)
+ws_key = "/tmp/exc-ws"
+st._quota_resume_inflight.add(ws_key)
+orig_attempt = harness_core.attempt_swarm_quota_resume
+def boom(_ws):
+    raise RuntimeError("injected resume boom")
+harness_core.attempt_swarm_quota_resume = boom
+try:
+    st._run_swarm_quota_resume(ws_key)
+finally:
+    harness_core.attempt_swarm_quota_resume = orig_attempt
+assert ws_key not in st._quota_resume_inflight, "Exception in _run_swarm_quota_resume must clear _quota_resume_inflight"
+PYEOF
 }
 
 test_tree_state_and_stale_stamp_safety() {
@@ -943,6 +1271,14 @@ print(dt)
   health_after=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
   assert_json_field "$health_after" ".pid" "$dpid" "Singleton daemon PID must remain unchanged across concurrent calls"
 
+  # I4: Starting daemon directly with HARNESS_DAEMON_EXIT_ON_LOCK_BUSY=1 while lock is held exits 0 and logs clean exit
+  HARNESS_DAEMON_SOCK="$sock_path" HARNESS_DAEMON_DATA_DIR="$data_dir" HARNESS_DAEMON_EXIT_ON_LOCK_BUSY=1 \
+    python3 -B "$DAEMON_PY" || { echo "Expected exit 0 when HARNESS_DAEMON_EXIT_ON_LOCK_BUSY=1 encounters busy lock" >&2; return 1; }
+  grep -q "auto-start helper exiting cleanly" "$data_dir/daemon.log" || {
+    echo "Expected busy-lock exit log line in $data_dir/daemon.log" >&2
+    return 1
+  }
+
   # HARNESS_DISABLE_DAEMON=1 must never auto-start even when HARNESS_AUTO_START_DAEMON=1
   local sock_disabled="$sock_dir/disabled.sock"
   local out_disabled
@@ -1342,6 +1678,316 @@ test_daemon_run_workflow_and_deprecation_parity() {
   off_wf_allow=$(printf '%s' "$p_wf_allow" | HARNESS_DISABLE_DAEMON=1 "$pre_subagent_guard")
   assert_json_field "$on_wf_allow" ".decision" "allow" "Daemon allows valid run_workflow"
   assert_json_field "$off_wf_allow" ".decision" "allow" "Fallback allows valid run_workflow"
+}
+
+test_daemon_swarm_coordinator_parity_and_quota_auto_resume_watchdog() {
+  trap _td_cleanup EXIT INT TERM
+  local PRE_SUBAGENT_GUARD="$REPO_ROOT/scripts/hooks/pre-subagent-guard.sh"
+  local STOP_GATE="$REPO_ROOT/scripts/hooks/stop-gate.sh"
+  local STAMP_GATE="$REPO_ROOT/scripts/stamp-gate.sh"
+  local repo sock_dir data_dir sock_path dpid mock_dir mock_agy calls_log attempt_file
+  repo=$(make_temp_repo)
+  sock_dir=$(mktemp -d "/tmp/hd-swq.XXXXXX")
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-swq-d.XXXXXX")
+  mock_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-swq-m.XXXXXX")
+  _TD_DIRS+=("$sock_dir" "$data_dir" "$mock_dir")
+  sock_path="$sock_dir/d.sock"
+  mock_agy="$mock_dir/mock-agy"
+  calls_log="$mock_dir/agy-calls.log"
+  attempt_file="$mock_dir/attempt.count"
+
+  echo "init" > "$repo/README.md"
+  git -C "$repo" add README.md
+  git -C "$repo" commit -m "chore: init" --quiet
+  git -C "$repo" checkout -b "feat/daemon-quota" --quiet
+
+  local started_flag release_flag
+  started_flag="$mock_dir/agy.started"
+  release_flag="$mock_dir/agy.release"
+
+  cat << EOF > "$mock_agy"
+#!/usr/bin/env bash
+count=0
+if [ -f "$attempt_file" ]; then
+  count=\$(cat "$attempt_file")
+fi
+count=\$((count + 1))
+echo "\$count" > "$attempt_file"
+printf 'ATTEMPT=%s TYPESAFE=%s ARGS=%s\n' "\$count" "\${TYPESAFE_API_KEY:-}" "\$*" >> "$calls_log"
+if [ "\$count" -eq 1 ]; then
+  touch "$started_flag"
+  tries=0
+  while [ ! -f "$release_flag" ] && [ "\$tries" -lt 80 ]; do
+    sleep 0.05
+    tries=\$((tries + 1))
+  done
+  echo "429 RESOURCE_EXHAUSTED: quota still exhausted" >&2
+  exit 1
+fi
+echo "Resumed coordinator successfully."
+exit 0
+EOF
+  chmod +x "$mock_agy"
+
+  TYPESAFE_API_KEY="ts_live_must_be_scrubbed" \
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  HARNESS_DAEMON_WORKSPACE_TTL_SEC="0.4" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
+  HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="0.4" \
+  HARNESS_SWARM_STALE_RESUMING_SEC="0.3" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not start" >&2; return 1; }
+
+  # Restart daemon with HARNESS_AGY_BIN exported cleanly for all child tests:
+  kill -TERM "$dpid" 2>/dev/null || true
+  wait "$dpid" 2>/dev/null || true
+  TYPESAFE_API_KEY="ts_live_must_be_scrubbed" \
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  HARNESS_DAEMON_WORKSPACE_TTL_SEC="0.4" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
+  HARNESS_SWARM_QUOTA_MAX_BACKOFF_SEC="0.4" \
+  HARNESS_SWARM_STALE_RESUMING_SEC="0.3" \
+  HARNESS_AGY_BIN="$mock_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon did not restart" >&2; return 1; }
+
+  # 1. Parity: Coordinator-Only pre-edit, pre-command, and pre-subagent under daemon ON vs cold OFF (full JSON equality)
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "swarm", args: {action: "title", title: "Quota Swarm"}}}')" \
+    | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  local p_ed p_cmd p_sub on_ed off_ed on_cmd off_cmd on_sub off_sub
+  p_ed=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "write_file", args: {Path: "src/X.ts", Content: "export const x=1;"}}}')
+  p_cmd=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "run_command", args: {CommandLine: "npm test"}}}')
+  p_sub=$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "invoke_subagent", args: {TypeName: "research", Role: "R", Prompt: "Scan"}}}')
+
+  on_ed=$(printf '%s' "$p_ed" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_EDIT_GUARD" | jq -c .)
+  off_ed=$(printf '%s' "$p_ed" | HARNESS_DISABLE_DAEMON="1" "$PRE_EDIT_GUARD" | jq -c .)
+  assert_json_field "$on_ed" ".decision" "deny"
+  assert_eq "$off_ed" "$on_ed" "pre-edit Coordinator-Only parity"
+
+  on_cmd=$(printf '%s' "$p_cmd" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_COMMAND_GUARD" | jq -c .)
+  off_cmd=$(printf '%s' "$p_cmd" | HARNESS_DISABLE_DAEMON="1" "$PRE_COMMAND_GUARD" | jq -c .)
+  assert_json_field "$on_cmd" ".decision" "deny"
+  assert_eq "$off_cmd" "$on_cmd" "pre-command Coordinator-Only parity"
+
+  on_sub=$(printf '%s' "$p_sub" | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" | jq -c .)
+  off_sub=$(printf '%s' "$p_sub" | HARNESS_DISABLE_DAEMON="1" "$PRE_SUBAGENT_GUARD" | jq -c .)
+  assert_json_field "$on_sub" ".decision" "deny"
+  assert_eq "$off_sub" "$on_sub" "pre-subagent Coordinator-Only parity"
+
+  # 2. stamp-gate.sh swarm-quota pause from relative --workspace . arms daemon automatically,
+  #    in-flight deduplication holds attempt count at 1 behind barrier past stale threshold, and attempt 2 resumes.
+  printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-dq", toolCall: {name: "swarm", args: {action: "add", name: "worker-1", workspace: "share", brief: "Work."}}}')" \
+    | HARNESS_DAEMON_SOCK="$sock_path" "$PRE_SUBAGENT_GUARD" >/dev/null
+
+  (cd "$repo" && HARNESS_DAEMON_SOCK="$sock_path" "$STAMP_GATE" swarm-quota pause --workspace "." --conversation-id "conv-dq" --wait-seconds 0 --buffer-seconds 0 --window 5h --model "gemini-4-neon-high" --reason "5-hour quota" >/dev/null)
+
+  local tries_b=0
+  while [ ! -f "$started_flag" ] && [ "$tries_b" -lt 60 ]; do
+    sleep 0.05
+    tries_b=$((tries_b + 1))
+  done
+  [ -f "$started_flag" ] || { echo "stamp-gate.sh pause --workspace . did not trigger daemon auto-resume" >&2; return 1; }
+
+  # I6: Wait deterministically for >=4 completed watcherCycles AND >=0.35s (past 0.3s stale threshold) behind barrier
+  local c0 now_c cur_cyc waited_steps
+  c0=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.watcherCycles // 0')
+  waited_steps=0
+  while [ "$waited_steps" -lt 40 ]; do
+    sleep 0.1
+    waited_steps=$((waited_steps + 1))
+    cur_cyc=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health" | jq -r '.watcherCycles // 0')
+    if [ "$cur_cyc" -ge $((c0 + 4)) ] && [ "$waited_steps" -ge 4 ]; then
+      break
+    fi
+  done
+  [ "$cur_cyc" -ge $((c0 + 4)) ] || { echo "Expected >= 4 watcherCycles past stale threshold (c0=$c0, cur=$cur_cyc)" >&2; return 1; }
+  local health_json
+  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
+  assert_json_field "$health_json" ".quotaWaits" "1"
+  assert_eq "1" "$(cat "$attempt_file")" "In-flight deduplication must hold attempt count at 1 past stale threshold while barrier is held"
+
+  # Release barrier -> attempt 1 fails with 429 -> backoff -> attempt 2 succeeds -> status == resumed
+  touch "$release_flag"
+  local quota_file="$repo/.harness/state/swarm/swarm-quota-wait.json"
+  _wait_for_file_jq "$quota_file" '.status == "resumed" and .attemptCount == 2' 60 \
+    || { echo "Daemon quota watchdog failed to auto-resume on attempt 2: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
+
+  local agy_log
+  agy_log=$(cat "$calls_log")
+  assert_contains "$agy_log" "--conversation conv-dq"
+  assert_contains "$agy_log" "--print=[SWARM_QUOTA_AUTO_RESUME]"
+  assert_contains "$agy_log" "@worker-1"
+  assert_not_contains "$agy_log" "ts_live_must_be_scrubbed" "Daemon must scrub TYPESAFE_API_KEY before invoking agy"
+
+  # 3. Registry reload across daemon restart retains workspace past expired TTL when quota wait is active (I7 isolated)
+  HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-quota pause --workspace "$repo" --conversation-id "conv-dq" --resume-at "2031-01-01T00:00:00Z" --buffer-seconds 0 --window weekly >/dev/null
+  kill -TERM "$dpid" 2>/dev/null || true
+  wait "$dpid" 2>/dev/null || true
+  local real_repo
+  real_repo=$(cd "$repo" && pwd -P)
+  jq --arg ws "$real_repo" '.workspaces[$ws].lastSeenAt = 1' "$data_dir/workspaces.json" > "$data_dir/workspaces.json.tmp" && mv "$data_dir/workspaces.json.tmp" "$data_dir/workspaces.json"
+
+  HARNESS_DAEMON_SOCK="$sock_path" \
+  HARNESS_DAEMON_DATA_DIR="$data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="0.1" \
+  HARNESS_DAEMON_WORKSPACE_TTL_SEC="2.0" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
+  HARNESS_SWARM_STALE_RESUMING_SEC="0.3" \
+  HARNESS_AGY_BIN="$mock_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  dpid=$!
+  _TD_PIDS+=("$dpid")
+  _wait_for_socket_health "$sock_path" 50 || { echo "Daemon failed restart" >&2; return 1; }
+  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
+  assert_json_field "$health_json" ".activeWorkspaces" "1" "Registry reload must keep workspace with active quota wait even when TTL expired"
+  assert_json_field "$health_json" ".quotaWaits" "1"
+
+  # 4. Stale 'resuming' state recovery & I5 lastSeenAt retention refresh + malformed nextProbeEpoch resilience
+  jq '.status = "resuming" | .resumingStartedAtEpoch = 1 | .resumingToken = "stale-tok"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
+    || { echo "Daemon failed to recover stale resuming state: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
+  _wait_for_file_jq "$data_dir/workspaces.json" ".workspaces[\"$real_repo\"].lastSeenAt > 1000000000" 30 \
+    || { echo "Daemon must refresh & persist lastSeenAt after resume: $(cat "$data_dir/workspaces.json" 2>/dev/null || true)" >&2; return 1; }
+
+  jq '.status = "waiting" | .nextProbeEpoch = "not-a-number"' "$quota_file" > "$quota_file.tmp" && mv "$quota_file.tmp" "$quota_file"
+  _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
+    || { echo "Malformed nextProbeEpoch broke watcher_loop" >&2; return 1; }
+  health_json=$(curl -fsS --unix-socket "$sock_path" "http://localhost/health")
+  assert_json_field "$health_json" ".status" "ok"
+
+  # 5. /event/swarm-quota-wait edge responses: invalid workspace (400) & .harness-ignore (ignored: true)
+  local bad_status ign_repo ign_resp
+  bad_status=$(curl -s -o /dev/null -w "%{http_code}" --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST -d '{"workspace":""}' "http://localhost/event/swarm-quota-wait")
+  assert_eq "400" "$bad_status"
+  ign_repo=$(make_temp_repo)
+  touch "$ign_repo/.harness-ignore"
+  ign_resp=$(jq -nc --arg ws "$ign_repo" '{workspace: $ws}' | curl -fsS --unix-socket "$sock_path" -H "Content-Type: application/json" -X POST --data-binary @- "http://localhost/event/swarm-quota-wait")
+  assert_json_field "$ign_resp" ".ignored" "true"
+  assert_json_field "$ign_resp" ".armed" "false"
+
+  # 6. Verify Stop hook over daemon /hook/stop-gate also arms quota wait cleanly
+  "$STAMP_GATE" swarm-quota clear --workspace "$repo" >/dev/null
+  local stop_out
+  stop_out=$(jq -nc --arg ws "$repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-dq",
+    modelName: "gemini-4-neon-high",
+    terminationReason: "ERROR",
+    error: "RESOURCE_EXHAUSTED: 5-hour quota exceeded"
+  }' | HARNESS_DAEMON_SOCK="$sock_path" "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$stop_out"
+  assert_json_field "$quota_file" ".source" "stop-error"
+  _wait_for_file_jq "$quota_file" '.status == "resumed"' 50 \
+    || { echo "Daemon did not auto-resume Stop(ERROR) quota wait: $(cat "$quota_file" 2>/dev/null || true)" >&2; return 1; }
+
+  # 7. I8: Isolated /event/swarm-quota-wait arming on unregistered workspaces under 30s poll interval
+  local long_sock_dir long_data_dir long_sock long_dpid always_ok_agy
+  long_sock_dir=$(mktemp -d "/tmp/hd-swq-ev.XXXXXX")
+  long_data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-swq-evd.XXXXXX")
+  _TD_DIRS+=("$long_sock_dir" "$long_data_dir")
+  long_sock="$long_sock_dir/d.sock"
+  always_ok_agy="$mock_dir/always-ok-agy"
+  cat << 'EOF' > "$always_ok_agy"
+#!/usr/bin/env bash
+echo "Quota restored."
+exit 0
+EOF
+  chmod +x "$always_ok_agy"
+
+  HARNESS_DAEMON_SOCK="$long_sock" \
+  HARNESS_DAEMON_DATA_DIR="$long_data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="30" \
+  HARNESS_SWARM_QUOTA_DEFAULT_PROBE_SEC="0.2" \
+  HARNESS_AGY_BIN="$always_ok_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  long_dpid=$!
+  _TD_PIDS+=("$long_dpid")
+  _wait_for_socket_health "$long_sock" 50 || { echo "Long-poll daemon failed to start" >&2; return 1; }
+
+  local unreg_a unreg_b ev_raw ev_code ev_body
+  unreg_a=$(make_temp_repo)
+  HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-quota pause --workspace "$unreg_a" --conversation-id "conv-eva" --wait-seconds 600 --buffer-seconds 0 >/dev/null
+  ev_raw=$(jq -nc --arg ws "$unreg_a" '{workspace: $ws}' | curl -s -w '\n%{http_code}' --unix-socket "$long_sock" -H "Content-Type: application/json" -X POST --data-binary @- "http://localhost/event/swarm-quota-wait")
+  ev_code=$(printf '%s\n' "$ev_raw" | tail -n 1)
+  ev_body=$(printf '%s\n' "$ev_raw" | sed '$d')
+  assert_eq "202" "$ev_code" "POST /event/swarm-quota-wait must return 202 for valid active workspace"
+  assert_json_field "$ev_body" ".armed" "true"
+
+  unreg_b=$(make_temp_repo)
+  (cd "$unreg_b" && HARNESS_DAEMON_SOCK="$long_sock" "$STAMP_GATE" swarm-quota pause --workspace "." --conversation-id "conv-evb" --wait-seconds 0 --buffer-seconds 0 >/dev/null)
+  _wait_for_file_jq "$unreg_b/.harness/state/swarm/swarm-quota-wait.json" '.status == "resumed"' 40 \
+    || { echo "stamp-gate pause must immediately wake daemon via /event/swarm-quota-wait even under 30s poll" >&2; return 1; }
+
+  # I3: /hook/stop-gate on_swarm_quota_wait immediately wakes 30s-poll daemon and auto-resumes within 4s
+  local unreg_c stop_c_out
+  unreg_c=$(make_temp_repo)
+  HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-coordinator on --workspace "$unreg_c" --conversation-id "conv-evc" --title "Stop Callback" >/dev/null
+  stop_c_out=$(jq -nc --arg ws "$unreg_c" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-evc",
+    terminationReason: "ERROR",
+    error: "RESOURCE_EXHAUSTED: 5-hour quota exceeded"
+  }' | HARNESS_DAEMON_SOCK="$long_sock" "$STOP_GATE" | jq -c .)
+  assert_eq "{}" "$stop_c_out"
+  _wait_for_file_jq "$unreg_c/.harness/state/swarm/swarm-quota-wait.json" '.status == "resumed"' 40 \
+    || { echo "/hook/stop-gate callback did not wake 30s-poll daemon to auto-resume within 4s: $(cat "$unreg_c/.harness/state/swarm/swarm-quota-wait.json" 2>/dev/null || true)" >&2; return 1; }
+
+  # 8. HARNESS_SWARM_RESUME_TIMEOUT_SEC threshold parity & non-stale resuming non-spin check
+  PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import os
+import harness_core
+
+os.environ.pop("HARNESS_SWARM_STALE_RESUMING_SEC", None)
+os.environ["HARNESS_SWARM_RESUME_TIMEOUT_SEC"] = "300"
+assert harness_core._stale_resuming_threshold_sec() == 330.0, harness_core._stale_resuming_threshold_sec()
+os.environ["HARNESS_SWARM_RESUME_TIMEOUT_SEC"] = "10"
+assert harness_core._stale_resuming_threshold_sec() == 40.0, harness_core._stale_resuming_threshold_sec()
+PYEOF
+
+  local parity_sock_dir parity_data_dir parity_sock parity_dpid parity_repo parity_qfile started_200 c_before c_after cyc_delta
+  parity_sock_dir=$(mktemp -d "/tmp/hd-swq-par.XXXXXX")
+  parity_data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-swq-pard.XXXXXX")
+  _TD_DIRS+=("$parity_sock_dir" "$parity_data_dir")
+  parity_sock="$parity_sock_dir/d.sock"
+
+  HARNESS_DAEMON_SOCK="$parity_sock" \
+  HARNESS_DAEMON_DATA_DIR="$parity_data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="30" \
+  HARNESS_SWARM_RESUME_TIMEOUT_SEC="300" \
+  HARNESS_AGY_BIN="$always_ok_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  parity_dpid=$!
+  _TD_PIDS+=("$parity_dpid")
+  _wait_for_socket_health "$parity_sock" 50 || { echo "Parity daemon failed to start" >&2; return 1; }
+
+  parity_repo=$(make_temp_repo)
+  HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-quota pause --workspace "$parity_repo" --conversation-id "conv-par" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  parity_qfile="$parity_repo/.harness/state/swarm/swarm-quota-wait.json"
+  started_200=$(python3 -c 'import time; print(round(time.time() - 200, 3))')
+  jq --argjson ep "$started_200" '.status = "resuming" | .resumingStartedAtEpoch = $ep | .resumingToken = "in-flight-200s" | .attemptCount = 0' "$parity_qfile" > "$parity_qfile.tmp" && mv "$parity_qfile.tmp" "$parity_qfile"
+
+  c_before=$(curl -fsS --unix-socket "$parity_sock" "http://localhost/health" | jq -r '.watcherCycles // 0')
+  jq -nc --arg ws "$parity_repo" '{workspace: $ws}' | curl -fsS --unix-socket "$parity_sock" -H "Content-Type: application/json" -X POST --data-binary @- "http://localhost/event/swarm-quota-wait" >/dev/null
+  sleep 0.5
+  c_after=$(curl -fsS --unix-socket "$parity_sock" "http://localhost/health" | jq -r '.watcherCycles // 0')
+  cyc_delta=$((c_after - c_before))
+  [ "$cyc_delta" -lt 5 ] || { echo "Expected non-stale resuming under HARNESS_SWARM_RESUME_TIMEOUT_SEC=300 not to spin watcher_loop (cyc_delta=$cyc_delta)" >&2; return 1; }
+  assert_json_field "$parity_qfile" ".status" "resuming" "Non-stale resuming (200s < 330s) must not trigger premature takeover"
+  assert_json_field "$parity_qfile" ".attemptCount" "0" "Non-stale resuming (200s < 330s) must not increment attemptCount"
 }
 
 run_tests "$@"
