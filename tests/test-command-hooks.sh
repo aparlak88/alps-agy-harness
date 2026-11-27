@@ -436,6 +436,8 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
   assert_json_field "$out_cd_pipe" ".decision" "deny" "cd before '|' must not move git push off main"
 
   local cond_cd_cmd out_cond_cd
+  mkdir -p "$wt_cd/sub" "$repo/sub"
+  ln -s "$wt_cd/sub" "$repo/link_to_wt"
   for cond_cd_cmd in \
     "cd \"$repo\"; true || cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; false && cd \"$wt_cd\"; git push" \
@@ -443,9 +445,20 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "cd \"$repo\"; cd \"$wt_cd\" bogus; git push" \
     "cd \"$repo\"; cd -@ \"$wt_cd\"; git push" \
     "cd \"$repo\"; if false; then echo x; cd \"$wt_cd\"; fi; git push" \
+    "cd \"$repo\"; if false; then echo \"fi\"; cd \"$wt_cd\"; fi; git push" \
+    "cd \"$repo\"; while false; do echo \"done\"; cd \"$wt_cd\"; done; git push" \
+    "cd \"$repo\"; false && { echo \"}\"; cd \"$wt_cd\"; }; git push" \
+    "cd \"$repo\"; if false; then (case x in a) echo ok;; esac); cd \"$wt_cd\"; fi; git push" \
     "$(printf 'cd "%s"; if false; then\ncd "%s"\nfi\ngit push' "$repo" "$wt_cd")" \
     "cd \"$repo\"; false && { echo x; cd \"$wt_cd\"; }; git push" \
     "cd \"$repo\"; echo x | cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; true |& cd \"$wt_cd\" && git push" \
+    "cd \"$wt_cd\"; time cd \"$repo\"; git push" \
+    "cd \"$repo\"; command -v cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; command -V cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; command -p cd \"$wt_cd\"; git push" \
+    "cd \"$repo/link_to_wt\" && cd .. && git push" \
+    "cd \"$repo\" && cd -PL \"$repo/link_to_wt/..\" && git push" \
     "cd \"$repo\"; cd -e \"$wt_cd\"; git push" \
     "cd \"$repo\"; env cd \"$wt_cd\"; git push" \
     "cd \"$repo\"; nohup cd \"$wt_cd\"; git push" \
@@ -459,11 +472,19 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     assert_json_field "$out_cond_cd" ".decision" "deny" "Conditional/invalid cd must not bypass main push gate: $cond_cd_cmd"
   done
 
-  local out_valid_cd_push
+  local out_valid_cd_push out_phys_lp_push out_phys_p_push
   out_valid_cd_push=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$wt_cd\" && git push origin feat/cd-bg" \
     '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
     | "$PRE_COMMAND_GUARD")
   assert_json_field "$out_valid_cd_push" ".decision" "allow" "Valid unconditional cd <wt> && git push feature-branch must stay allowed"
+  out_phys_lp_push=$(jq -nc --arg ws "$repo" --arg cmd "cd -LP \"$repo/link_to_wt/..\" && git push origin feat/cd-bg" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_phys_lp_push" ".decision" "allow" "cd -LP through symlink/.. resolves physically to feature worktree"
+  out_phys_p_push=$(jq -nc --arg ws "$repo" --arg cmd "cd \"$repo/link_to_wt\" && cd -P .. && git push origin feat/cd-bg" \
+    '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_phys_p_push" ".decision" "allow" "cd -P .. inside symlinked dir resolves physically to symlink target parent"
 
   CD_BASE="$wt_cd_root" PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
 import os
@@ -477,14 +498,14 @@ sub1.mkdir(parents=True, exist_ok=True)
 sub2.mkdir(parents=True, exist_ok=True)
 real_base = Path(os.path.realpath(str(base)))
 real_sub1 = Path(os.path.realpath(str(sub1)))
-real_sub2 = Path(os.path.realpath(str(sub2)))
+logical_sub2 = Path(os.path.normpath(str(sub2)))
 
 segs = harness_core.iter_command_segments_with_cwd(
     f"cd -P {sub1} && cd -- {sub2} && cd - && cd ~ && cd && pwd",
     base,
 )
 cwds = [cwd for _, cwd in segs]
-assert cwds == [real_base, real_sub1, real_sub2, real_sub1, Path.home(), Path.home()], cwds
+assert cwds == [real_base, real_sub1, logical_sub2, real_sub1, Path.home(), Path.home()], cwds
 PYEOF
 
   # 6. On feature branch, git push origin feature-x -> allow
@@ -1933,6 +1954,8 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "sort --out=README.md README.md" \
     "sort --compress-program=sh README.md" \
     "uniq README.md out.txt" \
+    "uniq - .harness/state/swarm/swarm-coordinator.json" \
+    "uniq -- README.md out.txt" \
     "rg --pre evil pat" \
     "rg --pre=evil pat" \
     "rg --pre-glob='*.md' pat" \
@@ -2037,7 +2060,7 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
   assert_json_field "$out_procsub_only" ".decision" "deny"
   assert_contains "$(printf '%s' "$out_procsub_only" | jq -r '.reason')" "process substitution"
 
-  local heredoc_cmd out_heredoc
+  local heredoc_cmd out_heredoc lc1_cmd out_lc1 lc2_cmd out_lc2 lc3_cmd out_lc3
   heredoc_cmd=$(printf "cat << true\necho '\$(rm -rf src)'\ntrue")
   out_heredoc=$(jq -nc --arg ws "$repo" --arg cmd "$heredoc_cmd" \
     '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
@@ -2045,9 +2068,25 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
   assert_json_field "$out_heredoc" ".decision" "deny" "Unquoted here-doc with single-quoted cmd substitution must be denied"
   assert_contains "$(printf '%s' "$out_heredoc" | jq -r '.reason')" "here-document"
 
+  lc1_cmd=$(printf 'echo "$\\\n(rm -rf src)"')
+  lc2_cmd=$(printf 'cat <\\\n<EOF\nhi\nEOF')
+  lc3_cmd=$(printf 'cat <\\\n(ls)')
+  for out_lc1 in "$lc1_cmd" "$lc2_cmd" "$lc3_cmd"; do
+    out_lc2=$(jq -nc --arg ws "$repo" --arg cmd "$out_lc1" \
+      '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+      | "$PRE_COMMAND_GUARD")
+    assert_json_field "$out_lc2" ".decision" "deny" "Line continuation bypass must be denied: $out_lc1"
+  done
+
+  out_lc3=$(jq -nc --arg ws "$repo" --arg cmd "uniq - && uniq -c README.md" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_lc3" ".decision" "allow" "Read-only uniq - and uniq -c README.md must stay allowed"
+
   spoof_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-spoof.XXXXXX")
   echo "$spoof_dir" >> "$_HARNESS_TEMP_TRACKER"
-  mkdir -p "$spoof_dir/sym" "$spoof_dir/scripts"
+  mkdir -p "$spoof_dir/sym" "$spoof_dir/scripts" "$repo/sub"
+  ln -s "$repo/sub" "$spoof_dir/sym_to_repo"
   printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/stamp-gate.sh"
   printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/harness-doctor.sh"
   printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/scripts/stamp-gate.sh"
@@ -2064,6 +2103,10 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "cd \"$spoof_dir\" && ./stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\" && ./harness-doctor.sh --json" \
     "cd \"$spoof_dir\" && ./scripts/stamp-gate.sh dispatch" \
+    "time cd \"$spoof_dir\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; command -v cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; echo x | cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir/sym_to_repo\"; cd ..; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/harness-doctor.sh --json" \
     "cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch" \

@@ -1596,7 +1596,7 @@ EOF
 
   cat << 'EOF' > "$mock_agy"
 #!/usr/bin/env bash
-echo "Internal error sk-secretkey999 ghp_secretTok123456789 AIzaSyDummyKey123456789 Bearer tok_abc1234567890" >&2
+echo "Internal error sk-secretkey999 ghp_secretTok123456789 AIzaSyDummyKey123456789 Bearer tok_abc1234567890 Bearer abc+/=12345678" >&2
 exit 1
 EOF
   chmod +x "$mock_agy"
@@ -1609,6 +1609,7 @@ EOF
   assert_not_contains "$redacted_err" "ghp_secretTok123456789" "ghp_ token in lastAttemptError must be redacted"
   assert_not_contains "$redacted_err" "AIzaSyDummyKey123456789" "AIza key in lastAttemptError must be redacted"
   assert_not_contains "$redacted_err" "tok_abc1234567890" "Bearer token in lastAttemptError must be redacted"
+  assert_not_contains "$redacted_err" "abc+/=12345678" "Base64 Bearer token in lastAttemptError must be redacted"
 
   # (e) Explicit reset in error + exponential backoff + env scrubbing + prose non-false-positive
   cat << EOF > "$mock_agy"

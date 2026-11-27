@@ -497,10 +497,92 @@ def compute_code_tree_sha(workspace: Path, ref: str = "HEAD") -> str:
     return hash_res.stdout.strip() if hash_res.returncode == 0 else "UNBORN"
 
 
+def _strip_shell_line_continuations(cmd_line: str) -> str:
+    """Strip POSIX ``\\<newline>`` line continuations outside single quotes and ``$'...'``."""
+    if "\\" not in cmd_line:
+        return cmd_line
+    out: list[str] = []
+    in_single = False
+    in_double = False
+    in_ansi_c = False
+    escape = False
+    at_token_start = True
+    i = 0
+    n = len(cmd_line)
+    while i < n:
+        c = cmd_line[i]
+        if escape:
+            out.append(c)
+            escape = False
+            at_token_start = False
+            i += 1
+            continue
+        if in_ansi_c:
+            out.append(c)
+            if c == "\\":
+                if i + 1 < n:
+                    out.append(cmd_line[i + 1])
+                    i += 2
+                    continue
+            elif c == "'":
+                in_ansi_c = False
+            i += 1
+            continue
+        if in_single:
+            out.append(c)
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if c == "\\":
+            if i + 1 < n and cmd_line[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 2 < n and cmd_line[i + 1] == "\r" and cmd_line[i + 2] == "\n":
+                i += 3
+                continue
+            escape = True
+            at_token_start = False
+            out.append(c)
+            i += 1
+            continue
+        if not in_double and c == "$" and i + 1 < n and cmd_line[i + 1] == "'":
+            in_ansi_c = True
+            at_token_start = False
+            out.append("$'")
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = True
+            at_token_start = False
+            out.append(c)
+            i += 1
+            continue
+        if c == '"':
+            in_double = not in_double
+            at_token_start = False
+            out.append(c)
+            i += 1
+            continue
+        if not in_double and c == "#" and at_token_start:
+            while i < n and cmd_line[i] != "\n":
+                out.append(cmd_line[i])
+                i += 1
+            continue
+        if not in_double and c in (" ", "\t", "\n", "\r", ";", "|", "&", "(", ")"):
+            at_token_start = True
+        else:
+            at_token_start = False
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
     """Split a shell command into ``(segment_text, delimiter)`` pairs respecting quotes and comments."""
     if not cmd_line:
         return []
+    cmd_line = _strip_shell_line_continuations(cmd_line)
 
     segments: list[tuple[str, str]] = []
     current: list[str] = []
@@ -558,9 +640,13 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
                 current.append(c)
                 i += 1
                 continue
-            if c in ("&", "|") and i + 1 < n and cmd_line[i + 1] == c:
+            if (
+                (c in ("&", "|", ";") and i + 1 < n and cmd_line[i + 1] == c)
+                or (c == "|" and i + 1 < n and cmd_line[i + 1] == "&")
+            ):
+                delim = cmd_line[i : i + 2]
                 seg = "".join(current).strip()
-                segments.append((seg, c + c))
+                segments.append((seg, delim))
                 current = []
                 at_token_start = True
                 i += 2
@@ -592,6 +678,20 @@ def _tokenize_raw_segments(cmd_line: str) -> list[tuple[str, str]]:
     return segments
 
 
+_TIME_SHORT_VAL = "of"
+_TIME_LONG_VAL = ("--output", "--format")
+
+
+def _short_flag_needs_next_arg(flag: str, val_chars: str) -> bool:
+    """Return True if short flag cluster ``flag`` ends with an option character consuming the next argv token."""
+    if not flag.startswith("-") or flag.startswith("--") or len(flag) < 2:
+        return False
+    for pos, ch in enumerate(flag[1:], start=1):
+        if ch in val_chars:
+            return pos == len(flag) - 1
+    return False
+
+
 def _strip_segment_wrappers(seg: str) -> list[str]:
     """Tokenize a single shell segment and strip env/sudo/builtin/time wrappers."""
     if not seg:
@@ -603,20 +703,10 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
     if not tokens:
         return []
 
-    def _short_flag_needs_next_arg(flag: str, val_chars: str) -> bool:
-        if not flag.startswith("-") or flag.startswith("--") or len(flag) < 2:
-            return False
-        for pos, ch in enumerate(flag[1:], start=1):
-            if ch in val_chars:
-                return pos == len(flag) - 1
-        return False
-
     SUDO_SHORT_VAL = "ughpDU"
     SUDO_LONG_VAL = ("--user", "--group", "--host", "--prompt", "--chdir", "--other-user")
     ENV_SHORT_VAL = "uCP"
     ENV_LONG_VAL = ("--unset", "--chdir")
-    TIME_SHORT_VAL = "of"
-    TIME_LONG_VAL = ("--output", "--format")
 
     splices = 0
     idx = 0
@@ -707,18 +797,26 @@ def _strip_segment_wrappers(seg: str) -> list[str]:
                 if tokens[idx] == "--":
                     idx += 1
                     break
-                if tokens[idx] in TIME_LONG_VAL or _short_flag_needs_next_arg(tokens[idx], TIME_SHORT_VAL):
+                if tokens[idx] in _TIME_LONG_VAL or _short_flag_needs_next_arg(tokens[idx], _TIME_SHORT_VAL):
                     idx += 2
                 else:
                     idx += 1
             continue
         if base == "command":
-            idx += 1
-            while idx < len(tokens) and tokens[idx].startswith("-"):
-                if tokens[idx] == "--":
-                    idx += 1
+            probe_idx = idx + 1
+            is_query = False
+            while probe_idx < len(tokens) and tokens[probe_idx].startswith("-"):
+                ctok = tokens[probe_idx]
+                if ctok == "--":
+                    probe_idx += 1
                     break
-                idx += 1
+                if not ctok.startswith("--") and ("v" in ctok[1:] or "V" in ctok[1:]):
+                    is_query = True
+                    break
+                probe_idx += 1
+            if is_query:
+                break
+            idx = probe_idx
             continue
         if base in ("nohup", "builtin"):
             idx += 1
@@ -741,19 +839,24 @@ def parse_command_segments(cmd_line: str) -> list[list[str]]:
 
 
 def _resolve_dir_arg(base: Path, raw_dir: str, physical: bool = False) -> Path:
-    """Resolve a path argument relative to ``base``, honoring physical symlink resolution when ``physical=True``."""
+    """Resolve a path argument relative to ``base``, honoring physical symlink resolution only when ``physical=True``."""
     expanded = os.path.expanduser(raw_dir)
+    if physical:
+        base_str = str(base)
+        if not os.path.isabs(expanded):
+            try:
+                base_str = os.path.realpath(base_str)
+            except OSError:
+                pass
+        joined = expanded if os.path.isabs(expanded) else os.path.join(base_str, expanded)
+        if os.path.exists(joined):
+            try:
+                return Path(os.path.realpath(joined))
+            except OSError:
+                pass
+        return Path(os.path.normpath(joined))
     joined = expanded if os.path.isabs(expanded) else os.path.join(str(base), expanded)
-    if physical and os.path.exists(joined):
-        try:
-            return Path(os.path.realpath(joined))
-        except OSError:
-            pass
-    norm = os.path.normpath(joined)
-    try:
-        return Path(os.path.realpath(norm)) if os.path.exists(norm) else Path(norm)
-    except OSError:
-        return Path(norm)
+    return Path(os.path.normpath(joined))
 
 
 def _apply_cd_segment_checked(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path, bool]:
@@ -798,7 +901,83 @@ def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> t
     return nxt, prev
 
 
-_CONTROL_KEYWORD_RE = re.compile(r"^\s*(?:if|then|else|elif|while|until|do|!|\{)\b")
+_CONTROL_KEYWORD_RE = re.compile(r"^\s*(?:(?:if|then|else|elif|while|until|do)\b|[!{](?:\s|$))")
+
+
+def _scan_leading_unquoted_words(raw_seg: str) -> list[tuple[str, bool]]:
+    """Return whitespace-separated ``(word, was_quoted)`` pairs from ``raw_seg``."""
+    words: list[tuple[str, bool]] = []
+    buf: list[str] = []
+    has_token = False
+    was_quoted = False
+    in_single = False
+    in_double = False
+    in_ansi_c = False
+    escape = False
+    i = 0
+    n = len(raw_seg)
+    while i < n:
+        c = raw_seg[i]
+        if escape:
+            buf.append(c)
+            escape = False
+            has_token = True
+            was_quoted = True
+            i += 1
+            continue
+        if in_ansi_c:
+            has_token = True
+            was_quoted = True
+            if c == "\\":
+                buf.append(c)
+                if i + 1 < n:
+                    buf.append(raw_seg[i + 1])
+                    i += 2
+                    continue
+            elif c == "'":
+                in_ansi_c = False
+            buf.append(c)
+            i += 1
+            continue
+        if c == "\\" and not in_single:
+            escape = True
+            has_token = True
+            was_quoted = True
+            i += 1
+            continue
+        if not in_single and not in_double and c == "$" and i + 1 < n and raw_seg[i + 1] == "'":
+            in_ansi_c = True
+            has_token = True
+            was_quoted = True
+            buf.append("$'")
+            i += 2
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+            has_token = True
+            was_quoted = True
+            i += 1
+            continue
+        if c == '"' and not in_single:
+            in_double = not in_double
+            has_token = True
+            was_quoted = True
+            i += 1
+            continue
+        if not in_single and not in_double and c in (" ", "\t", "\r", "\n"):
+            if has_token:
+                words.append(("".join(buf), was_quoted))
+                buf = []
+                has_token = False
+                was_quoted = False
+            i += 1
+            continue
+        buf.append(c)
+        has_token = True
+        i += 1
+    if has_token:
+        words.append(("".join(buf), was_quoted))
+    return words
 
 
 def _dedup_paths(paths: list[Path]) -> list[Path]:
@@ -826,7 +1005,7 @@ def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tup
         cleaned = _strip_segment_wrappers(raw_seg)
         if cleaned:
             out.append((cleaned, current_cwd))
-            if cleaned[0] == "cd" and delim not in ("|", "&"):
+            if cleaned[0] == "cd" and delim not in ("|", "|&", "&"):
                 current_cwd, prev_cwd = _apply_cd_segment(cleaned, current_cwd, prev_cwd)
 
         if delim == "(":
@@ -837,9 +1016,10 @@ def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tup
     return out
 
 
-def _is_shell_builtin_cd(raw_tokens: list[str]) -> bool:
-    """Return True only when ``raw_tokens`` invokes shell-builtin ``cd`` (never external ``env cd``/``nohup cd``)."""
+def _is_shell_builtin_cd(raw_tokens: list[str]) -> tuple[bool, bool]:
+    """Return ``(is_builtin_cd, portable_wrapper)`` for ``raw_tokens`` across bash/zsh."""
     idx = 0
+    portable_wrapper = True
     while idx < len(raw_tokens):
         tok = raw_tokens[idx]
         if "=" in tok and tok.split("=", 1)[0].isidentifier():
@@ -847,6 +1027,20 @@ def _is_shell_builtin_cd(raw_tokens: list[str]) -> bool:
             continue
         if tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
             idx += 1
+            continue
+        if tok == "time":
+            idx += 1
+            while idx < len(raw_tokens) and raw_tokens[idx].startswith("-"):
+                ttok = raw_tokens[idx]
+                if ttok == "--":
+                    idx += 1
+                    break
+                if ttok != "-p":
+                    portable_wrapper = False
+                if ttok in _TIME_LONG_VAL or _short_flag_needs_next_arg(ttok, _TIME_SHORT_VAL):
+                    idx += 2
+                else:
+                    idx += 1
             continue
         if tok == "builtin":
             idx += 1
@@ -856,13 +1050,17 @@ def _is_shell_builtin_cd(raw_tokens: list[str]) -> bool:
         if tok == "command":
             idx += 1
             while idx < len(raw_tokens) and raw_tokens[idx].startswith("-"):
-                if raw_tokens[idx] == "--":
+                ctok = raw_tokens[idx]
+                if ctok == "--":
                     idx += 1
                     break
+                if not ctok.startswith("--") and ("v" in ctok[1:] or "V" in ctok[1:]):
+                    return False, True
+                portable_wrapper = False
                 idx += 1
             continue
-        return tok == "cd"
-    return False
+        return tok == "cd", portable_wrapper
+    return False, portable_wrapper
 
 
 def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -> list[tuple[list[str], list[Path]]]:
@@ -875,7 +1073,8 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
     pipeline_entry: list[tuple[Path, Path]] = list(possible_states)
     pipeline_uncertain = False
     control_depth = 0
-    cwd_stack: list[tuple[list[tuple[Path, Path]], list[tuple[Path, Path]], bool, int]] = []
+    case_stack: list[bool] = []
+    cwd_stack: list[tuple[list[tuple[Path, Path]], list[tuple[Path, Path]], bool, int, list[bool]]] = []
     prev_delim = ""
     out: list[tuple[list[str], list[Path]]] = []
 
@@ -895,12 +1094,25 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
             raw_tokens = shlex.split(raw_seg)
         except Exception:
             raw_tokens = raw_seg.split()
-        for rt in raw_tokens:
-            if rt in ("if", "while", "until", "for", "select", "case", "{"):
+        for w, was_quoted in _scan_leading_unquoted_words(raw_seg):
+            if was_quoted:
+                break
+            if w in ("if", "while", "until", "for", "select", "{"):
                 control_depth += 1
-            elif rt in ("fi", "done", "esac", "}"):
+            elif w == "case":
+                control_depth += 1
+                case_stack.append(True)
+            elif w in ("fi", "done", "}"):
                 control_depth = max(0, control_depth - 1)
-        is_shell_cd = _is_shell_builtin_cd(raw_tokens)
+            elif w == "esac":
+                control_depth = max(0, control_depth - 1)
+                if case_stack:
+                    case_stack.pop()
+            elif w in ("then", "do", "else", "elif", "!"):
+                continue
+            else:
+                break
+        is_shell_cd, cd_wrapper_portable = _is_shell_builtin_cd(raw_tokens)
         cleaned = _strip_segment_wrappers(raw_seg)
         if prev_delim not in ("&&", "||"):
             pipeline_entry = list(possible_states)
@@ -908,19 +1120,19 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
 
         if cleaned:
             out.append((cleaned, _dedup_paths([cw for cw, _ in possible_states])))
-            if is_shell_cd and delim not in ("|", "&"):
+            if is_shell_cd and cleaned[0] == "cd" and delim not in ("|", "|&", "&"):
                 valid_next: list[tuple[Path, Path]] = []
-                all_guaranteed = True
+                all_guaranteed = cd_wrapper_portable
                 for cw, pw in possible_states:
                     nxt, new_prev, portable = _apply_cd_segment_checked(cleaned, cw, pw)
                     valid_next.append((nxt, new_prev))
                     if not portable or not nxt.is_dir():
                         all_guaranteed = False
-                if prev_delim == "|":
+                if prev_delim in ("|", "|&"):
                     pipeline_uncertain = True
                     possible_states = _dedup_states(possible_states + valid_next)
                 else:
-                    unconditional_exec = (control_depth == 0) and (prev_delim not in ("&&", "||", "|")) and (not is_cond)
+                    unconditional_exec = (control_depth == 0) and (prev_delim not in ("&&", "||", "|", "|&")) and (not is_cond)
                     if unconditional_exec and all_guaranteed and (delim == "&&" or not pipeline_uncertain):
                         possible_states = _dedup_states(valid_next)
                     else:
@@ -930,10 +1142,18 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
         if delim not in ("&&", "||") and pipeline_uncertain:
             possible_states = _dedup_states(possible_states + pipeline_entry)
 
-        if delim == "(":
-            cwd_stack.append((list(possible_states), list(pipeline_entry), pipeline_uncertain, control_depth))
-        elif delim == ")" and cwd_stack:
-            possible_states, pipeline_entry, pipeline_uncertain, control_depth = cwd_stack.pop()
+        if delim == ";;" and case_stack:
+            case_stack[-1] = True
+        elif delim == "(":
+            if not (case_stack and case_stack[-1]):
+                cwd_stack.append(
+                    (list(possible_states), list(pipeline_entry), pipeline_uncertain, control_depth, list(case_stack))
+                )
+        elif delim == ")":
+            if case_stack and case_stack[-1]:
+                case_stack[-1] = False
+            elif cwd_stack:
+                possible_states, pipeline_entry, pipeline_uncertain, control_depth, case_stack = cwd_stack.pop()
         prev_delim = delim
 
     return out
@@ -1926,22 +2146,22 @@ def _parse_git_invocation(seg: list[str], seg_cwd: Path) -> tuple[str, Path, int
         tok = seg[i]
         if tok == "-C":
             if i + 1 < n:
-                target = _resolve_dir_arg(target, seg[i + 1])
+                target = _resolve_dir_arg(target, seg[i + 1], physical=True)
                 i += 2
                 continue
             break
         if tok.startswith("-C") and len(tok) > 2:
-            target = _resolve_dir_arg(target, tok[2:])
+            target = _resolve_dir_arg(target, tok[2:], physical=True)
             i += 1
             continue
         if tok == "--work-tree":
             if i + 1 < n:
-                target = _resolve_dir_arg(target, seg[i + 1])
+                target = _resolve_dir_arg(target, seg[i + 1], physical=True)
                 i += 2
                 continue
             break
         if tok.startswith("--work-tree="):
-            target = _resolve_dir_arg(target, tok[len("--work-tree=") :])
+            target = _resolve_dir_arg(target, tok[len("--work-tree=") :], physical=True)
             i += 1
             continue
         if tok in ("-c", "--git-dir", "--namespace", "--super-prefix", "--config-env"):
@@ -1973,31 +2193,31 @@ def _extract_pkg_target_dir(seg: list[str], seg_cwd: Path) -> Path:
         tok = seg[i]
         if exe == "npm":
             if tok == "--prefix" and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True)
             if tok.startswith("--prefix="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--prefix=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--prefix=") :], physical=True)
         elif exe == "pnpm":
             if tok in ("--dir", "-C") and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True)
             if tok.startswith("--dir="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--dir=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--dir=") :], physical=True)
         elif exe == "yarn":
             if tok == "--cwd" and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True)
             if tok.startswith("--cwd="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--cwd=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--cwd=") :], physical=True)
         elif exe == "uv":
             if tok in ("--directory", "--project") and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1])
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True)
             if tok.startswith("--directory="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--directory=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--directory=") :], physical=True)
             if tok.startswith("--project="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--project=") :])
+                return _resolve_dir_arg(seg_cwd, tok[len("--project=") :], physical=True)
         elif exe == "cargo":
             if tok == "--manifest-path" and i + 1 < n:
-                return _resolve_dir_arg(seg_cwd, seg[i + 1]).parent
+                return _resolve_dir_arg(seg_cwd, seg[i + 1], physical=True).parent
             if tok.startswith("--manifest-path="):
-                return _resolve_dir_arg(seg_cwd, tok[len("--manifest-path=") :]).parent
+                return _resolve_dir_arg(seg_cwd, tok[len("--manifest-path=") :], physical=True).parent
         i += 1
     return seg_cwd
 
@@ -3488,6 +3708,7 @@ def is_active_swarm_coordinator(workspace: Path, hook_input: dict[str, Any]) -> 
 
 def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
     """Detect command substitutions, process substitutions, or file-writing redirections."""
+    cmd_line = _strip_shell_line_continuations(cmd_line)
     in_single = False
     in_double = False
     escape = False
@@ -3856,12 +4077,17 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
         elif exe == "uniq":
             pos_args: list[str] = []
             idx = 1
+            after_dd = False
             while idx < len(seg):
                 tok = seg[idx]
-                if tok in ("-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"):
+                if not after_dd and tok == "--":
+                    after_dd = True
+                    idx += 1
+                    continue
+                if not after_dd and tok in ("-f", "-s", "-w", "--skip-fields", "--skip-chars", "--check-chars"):
                     idx += 2
                     continue
-                if tok.startswith("-"):
+                if not after_dd and tok.startswith("-") and tok != "-":
                     idx += 1
                     continue
                 pos_args.append(tok)
@@ -4035,7 +4261,7 @@ def parse_quota_reset_epoch(
 
     # Prefer clause after resets/retry/wait/after if present
     clause_m = re.search(
-        r"(?:resets?|retry|try\s+again|available|wait)\s*(?:in|after)?\s*[: ]+([^\n.;]+)",
+        r"(?:resets?|retry|try\s+again|available|wait)(?:[ \t]+(?:in|after))?[ \t]*[: ][ \t]*([^\n.;]+)",
         text,
         re.IGNORECASE,
     )
@@ -4477,7 +4703,7 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
 
     initial_cwd = _resolve_initial_cwd(workspace, hook_input)
     raw_cwd = args.get("Cwd")
-    wf_cwd = _resolve_dir_arg(initial_cwd, raw_cwd.strip()) if isinstance(raw_cwd, str) and raw_cwd.strip() else initial_cwd
+    wf_cwd = _resolve_dir_arg(initial_cwd, raw_cwd.strip(), physical=True) if isinstance(raw_cwd, str) and raw_cwd.strip() else initial_cwd
     linked_wt = resolve_linked_worktree(workspace, wf_cwd)
     if linked_wt is not None and is_harness_ignored(linked_wt):
         return {"decision": "allow"}
@@ -4489,7 +4715,7 @@ def evaluate_pre_workflow(workspace: Path, hook_input: dict[str, Any]) -> dict[s
 
     script_path_raw = str(args.get("ScriptPath") or "").strip()
     if script_path_raw:
-        sp = _resolve_dir_arg(wf_cwd, script_path_raw)
+        sp = _resolve_dir_arg(wf_cwd, script_path_raw, physical=True)
         _, is_ext = _resolve_rel_path(workspace, str(sp))
         if is_ext:
             wt_root = resolve_linked_worktree(workspace, sp)
@@ -5325,7 +5551,7 @@ REVIEW_SCRUB_ENV_KEYS = frozenset(
     )
 )
 SECRET_REDACT_RE = re.compile(
-    r"(?:ts_live_[A-Za-z0-9_-]{8,}|(?:sk|rk)(?:_live)?-[A-Za-z0-9_-]{8,}|(?:sk|rk)_live_[A-Za-z0-9_-]{8,}|gh[pors]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{12,}|AIza[0-9A-Za-z_-]{16,}|Bearer\s+[A-Za-z0-9._-]{8,})",
+    r"(?:ts_live_[A-Za-z0-9_-]{8,}|(?:sk|rk)(?:_live)?-[A-Za-z0-9_-]{8,}|(?:sk|rk)_live_[A-Za-z0-9_-]{8,}|gh[pors]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{12,}|AIza[0-9A-Za-z_-]{16,}|Bearer\s+[A-Za-z0-9._+/=-]{8,})",
     re.IGNORECASE,
 )
 
