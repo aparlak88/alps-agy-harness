@@ -740,10 +740,15 @@ def parse_command_segments(cmd_line: str) -> list[list[str]]:
     return result
 
 
-def _resolve_dir_arg(base: Path, raw_dir: str) -> Path:
-    """Resolve a path argument relative to ``base`` normalizing ``..`` and symlinks."""
+def _resolve_dir_arg(base: Path, raw_dir: str, physical: bool = False) -> Path:
+    """Resolve a path argument relative to ``base``, honoring physical symlink resolution when ``physical=True``."""
     expanded = os.path.expanduser(raw_dir)
     joined = expanded if os.path.isabs(expanded) else os.path.join(str(base), expanded)
+    if physical and os.path.exists(joined):
+        try:
+            return Path(os.path.realpath(joined))
+        except OSError:
+            pass
     norm = os.path.normpath(joined)
     try:
         return Path(os.path.realpath(norm)) if os.path.exists(norm) else Path(norm)
@@ -752,9 +757,11 @@ def _resolve_dir_arg(base: Path, raw_dir: str) -> Path:
 
 
 def _apply_cd_segment_checked(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path, bool]:
-    """Compute ``(next_cwd, prev_cwd, valid)`` for a ``cd`` command segment."""
+    """Compute ``(next_cwd, prev_cwd, portable)`` for a ``cd`` segment conservatively across bash/zsh."""
     idx = 1
     saw_double_dash = False
+    physical = False
+    portable = True
     pos_args: list[str] = []
     while idx < len(tokens):
         tok = tokens[idx]
@@ -763,15 +770,17 @@ def _apply_cd_segment_checked(tokens: list[str], current_cwd: Path, prev_cwd: Pa
             idx += 1
             continue
         if not saw_double_dash and tok.startswith("-") and tok != "-":
-            if tok in ("-P", "-L", "-e"):
-                idx += 1
-                continue
-            return current_cwd, prev_cwd, False
+            if all(ch in "LP" for ch in tok[1:]):
+                physical = tok[-1] == "P"
+            else:
+                portable = False
+            idx += 1
+            continue
         pos_args.append(tok)
         idx += 1
 
     if len(pos_args) > 1:
-        return current_cwd, prev_cwd, False
+        portable = False
     target = pos_args[0] if pos_args else ""
 
     if not target or target == "~":
@@ -779,8 +788,8 @@ def _apply_cd_segment_checked(tokens: list[str], current_cwd: Path, prev_cwd: Pa
     elif target == "-":
         nxt = prev_cwd
     else:
-        nxt = _resolve_dir_arg(current_cwd, target)
-    return nxt, current_cwd, True
+        nxt = _resolve_dir_arg(current_cwd, target, physical=physical)
+    return nxt, current_cwd, portable
 
 
 def _apply_cd_segment(tokens: list[str], current_cwd: Path, prev_cwd: Path) -> tuple[Path, Path]:
@@ -828,6 +837,34 @@ def iter_command_segments_with_cwd(cmd_line: str, initial_cwd: Path) -> list[tup
     return out
 
 
+def _is_shell_builtin_cd(raw_tokens: list[str]) -> bool:
+    """Return True only when ``raw_tokens`` invokes shell-builtin ``cd`` (never external ``env cd``/``nohup cd``)."""
+    idx = 0
+    while idx < len(raw_tokens):
+        tok = raw_tokens[idx]
+        if "=" in tok and tok.split("=", 1)[0].isidentifier():
+            idx += 1
+            continue
+        if tok in ("{", "!", "then", "do", "else", "elif", "if", "while", "until"):
+            idx += 1
+            continue
+        if tok == "builtin":
+            idx += 1
+            if idx < len(raw_tokens) and raw_tokens[idx] == "--":
+                idx += 1
+            continue
+        if tok == "command":
+            idx += 1
+            while idx < len(raw_tokens) and raw_tokens[idx].startswith("-"):
+                if raw_tokens[idx] == "--":
+                    idx += 1
+                    break
+                idx += 1
+            continue
+        return tok == "cd"
+    return False
+
+
 def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -> list[tuple[list[str], list[Path]]]:
     """Parse command segments returning conservative possible CWD branches across conditional/failing ``cd``."""
     try:
@@ -837,7 +874,8 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
     possible_states: list[tuple[Path, Path]] = [(init_real, init_real)]
     pipeline_entry: list[tuple[Path, Path]] = list(possible_states)
     pipeline_uncertain = False
-    cwd_stack: list[tuple[list[tuple[Path, Path]], list[tuple[Path, Path]], bool]] = []
+    control_depth = 0
+    cwd_stack: list[tuple[list[tuple[Path, Path]], list[tuple[Path, Path]], bool, int]] = []
     prev_delim = ""
     out: list[tuple[list[str], list[Path]]] = []
 
@@ -853,6 +891,16 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
 
     for raw_seg, delim in _tokenize_raw_segments(cmd_line):
         is_cond = bool(_CONTROL_KEYWORD_RE.match(raw_seg))
+        try:
+            raw_tokens = shlex.split(raw_seg)
+        except Exception:
+            raw_tokens = raw_seg.split()
+        for rt in raw_tokens:
+            if rt in ("if", "while", "until", "for", "select", "case", "{"):
+                control_depth += 1
+            elif rt in ("fi", "done", "esac", "}"):
+                control_depth = max(0, control_depth - 1)
+        is_shell_cd = _is_shell_builtin_cd(raw_tokens)
         cleaned = _strip_segment_wrappers(raw_seg)
         if prev_delim not in ("&&", "||"):
             pipeline_entry = list(possible_states)
@@ -860,35 +908,32 @@ def iter_command_segments_with_possible_cwds(cmd_line: str, initial_cwd: Path) -
 
         if cleaned:
             out.append((cleaned, _dedup_paths([cw for cw, _ in possible_states])))
-            if cleaned[0] == "cd" and delim not in ("|", "&"):
+            if is_shell_cd and delim not in ("|", "&"):
                 valid_next: list[tuple[Path, Path]] = []
-                all_exist = True
+                all_guaranteed = True
                 for cw, pw in possible_states:
-                    nxt, new_prev, ok = _apply_cd_segment_checked(cleaned, cw, pw)
-                    if not ok:
-                        all_exist = False
-                    else:
-                        valid_next.append((nxt, new_prev))
-                        if not nxt.is_dir():
-                            all_exist = False
-                unconditional_exec = (prev_delim not in ("&&", "||")) and (not is_cond)
-                if not valid_next:
-                    pipeline_uncertain = True
-                elif delim == "&&" and unconditional_exec and all_exist:
-                    possible_states = _dedup_states(valid_next)
-                elif delim != "&&" and unconditional_exec and all_exist and not pipeline_uncertain:
-                    possible_states = _dedup_states(valid_next)
-                else:
+                    nxt, new_prev, portable = _apply_cd_segment_checked(cleaned, cw, pw)
+                    valid_next.append((nxt, new_prev))
+                    if not portable or not nxt.is_dir():
+                        all_guaranteed = False
+                if prev_delim == "|":
                     pipeline_uncertain = True
                     possible_states = _dedup_states(possible_states + valid_next)
+                else:
+                    unconditional_exec = (control_depth == 0) and (prev_delim not in ("&&", "||", "|")) and (not is_cond)
+                    if unconditional_exec and all_guaranteed and (delim == "&&" or not pipeline_uncertain):
+                        possible_states = _dedup_states(valid_next)
+                    else:
+                        pipeline_uncertain = True
+                        possible_states = _dedup_states(possible_states + valid_next)
 
         if delim not in ("&&", "||") and pipeline_uncertain:
             possible_states = _dedup_states(possible_states + pipeline_entry)
 
         if delim == "(":
-            cwd_stack.append((list(possible_states), list(pipeline_entry), pipeline_uncertain))
+            cwd_stack.append((list(possible_states), list(pipeline_entry), pipeline_uncertain, control_depth))
         elif delim == ")" and cwd_stack:
-            possible_states, pipeline_entry, pipeline_uncertain = cwd_stack.pop()
+            possible_states, pipeline_entry, pipeline_uncertain, control_depth = cwd_stack.pop()
         prev_delim = delim
 
     return out
@@ -2844,13 +2889,19 @@ COORDINATOR_DANGEROUS_ENV_VARS = frozenset(
         "GH_PAGER",
         "GH_BROWSER",
         "BROWSER",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "PROMPT_COMMAND",
+        "ZDOTDIR",
+        "GH_CONFIG_DIR",
     )
 )
 
 
 def _is_dangerous_coordinator_env_var(key: str) -> bool:
     """Return True if ``key`` can redirect execution, git/gh hooks, or trace output to disk."""
-    return key in COORDINATOR_DANGEROUS_ENV_VARS or key.startswith("GIT_TRACE")
+    return key in COORDINATOR_DANGEROUS_ENV_VARS or key.startswith(("GIT_TRACE", "HARNESS_", "PYTHON", "LD_", "DYLD_"))
 COORDINATOR_READ_ONLY_BINS = frozenset(
     (
         "cd",
@@ -3491,6 +3542,8 @@ def _has_unsafe_shell_syntax_for_coordinator(cmd_line: str) -> Optional[str]:
                 return "ANSI-C $'...' quoting"
             if c == "$" and i + 1 < n and cmd_line[i + 1] == '"':
                 return 'locale $"..." quoting'
+            if c == "<" and i + 1 < n and cmd_line[i + 1] == "<":
+                return "here-document or here-string redirection"
             if c in ("<", ">") and i + 1 < n and cmd_line[i + 1] == "(":
                 return "process substitution"
             if c == ">" or (c == "&" and i + 1 < n and cmd_line[i + 1] == ">"):
@@ -3988,8 +4041,10 @@ def parse_quota_reset_epoch(
     )
     dur_target = clause_m.group(1) if clause_m else text
     unit_pat = r"(?:days?|gün|hours?|hrs?|saat|minutes?|mins?|dakika|seconds?|secs?|saniye|d|h|m|s)"
+    term_pat = rf"\d+(?:\.\d+)?\s*{unit_pat}"
+    sep_pat = r"(?:\s*,\s*|\s+(?:and|ve)\s+|\s*)"
     dur_seq_re = re.compile(
-        rf"(?<![A-Za-z0-9-])((?:\d+(?:\.\d+)?\s*{unit_pat}(?:\s*,?\s*|\s+and\s+|\s+ve\s+)?)+)"
+        rf"(?<![A-Za-z0-9-])({term_pat}(?:{sep_pat}{term_pat})*)"
         r"(?![A-Za-z0-9-])(?!\s*[-–]?\s*(?:quota|limit|cap|window|kota))",
         re.IGNORECASE,
     )
@@ -5270,7 +5325,7 @@ REVIEW_SCRUB_ENV_KEYS = frozenset(
     )
 )
 SECRET_REDACT_RE = re.compile(
-    r"(?:ts_live_[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{12,}|AIza[0-9A-Za-z_-]{16,}|Bearer\s+[A-Za-z0-9._-]{8,})",
+    r"(?:ts_live_[A-Za-z0-9_-]{8,}|(?:sk|rk)(?:_live)?-[A-Za-z0-9_-]{8,}|(?:sk|rk)_live_[A-Za-z0-9_-]{8,}|gh[pors]_[A-Za-z0-9]{12,}|github_pat_[A-Za-z0-9_]{12,}|AIza[0-9A-Za-z_-]{16,}|Bearer\s+[A-Za-z0-9._-]{8,})",
     re.IGNORECASE,
 )
 

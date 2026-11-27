@@ -1801,6 +1801,13 @@ ep, ex = harness_core.parse_quota_reset_epoch("agy --conversation timed out afte
 assert not ex, (ep, ex)
 ep, ex = harness_core.parse_quota_reset_epoch("5h quota exceeded", now_epoch=now, buffer_sec=0)
 assert not ex, (ep, ex)
+import time as _redos_time
+t0_redos = _redos_time.monotonic()
+harness_core.parse_quota_reset_epoch("1h  " * 40 + "quota", now_epoch=now, buffer_sec=0)
+redos_elapsed = _redos_time.monotonic() - t0_redos
+assert redos_elapsed < 0.2, f"parse_quota_reset_epoch ReDoS regression: took {redos_elapsed:.3f}s"
+assert harness_core.SECRET_REDACT_RE.search("sk_live_abcdefgh123456") is not None
+assert harness_core.SECRET_REDACT_RE.search("github_pat_abcdef123456") is not None
 assert harness_core._stale_resuming_threshold_sec(120.0) == 150.0
 
 ep_z, ex_z = harness_core.parse_quota_reset_epoch("2030-11-27T04:00:00Z", now_epoch=now, buffer_sec=0)

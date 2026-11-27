@@ -441,7 +441,17 @@ test_pr_only_main_blocks_direct_push_and_local_merge_when_remote_exists() {
     "cd \"$repo\"; false && cd \"$wt_cd\"; git push" \
     "if false; then cd \"$wt_cd\"; fi; git push" \
     "cd \"$repo\"; cd \"$wt_cd\" bogus; git push" \
-    "cd \"$repo\"; cd -@ \"$wt_cd\"; git push"
+    "cd \"$repo\"; cd -@ \"$wt_cd\"; git push" \
+    "cd \"$repo\"; if false; then echo x; cd \"$wt_cd\"; fi; git push" \
+    "$(printf 'cd "%s"; if false; then\ncd "%s"\nfi\ngit push' "$repo" "$wt_cd")" \
+    "cd \"$repo\"; false && { echo x; cd \"$wt_cd\"; }; git push" \
+    "cd \"$repo\"; echo x | cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; cd -e \"$wt_cd\"; git push" \
+    "cd \"$repo\"; env cd \"$wt_cd\"; git push" \
+    "cd \"$repo\"; nohup cd \"$wt_cd\"; git push" \
+    "cd \"$wt_cd\"; cd -LP \"$repo\"; git push" \
+    "cd \"$wt_cd\"; cd -q \"$repo\"; git push" \
+    "cd \"$wt_cd\"; cd \"$repo\" bogus; git push"
   do
     out_cond_cd=$(jq -nc --arg ws "$repo" --arg cmd "$cond_cd_cmd" \
       '{workspacePaths: [$ws], toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
@@ -1831,6 +1841,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "GH_PAGER=evil gh pr list" \
     "GH_BROWSER=/tmp/evil.sh gh pr view 1" \
     "BROWSER=/tmp/evil.sh gh pr view 1" \
+    "GH_CONFIG_DIR=/tmp/evil gh pr list" \
+    "HARNESS_GH_BIN=/tmp/evil ./scripts/harness-doctor.sh --json" \
+    "PYTHONUSERBASE=/tmp/evil ./scripts/harness-doctor.sh --json" \
+    "SHELLOPTS=xtrace PS4='\$(id)' ./scripts/harness-doctor.sh --json" \
+    "cat <<< 'hello'" \
     "gh pr view 1 --web" \
     "gh pr view 1 -w" \
     "file -C README.md" \
@@ -2022,6 +2037,14 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
   assert_json_field "$out_procsub_only" ".decision" "deny"
   assert_contains "$(printf '%s' "$out_procsub_only" | jq -r '.reason')" "process substitution"
 
+  local heredoc_cmd out_heredoc
+  heredoc_cmd=$(printf "cat << true\necho '\$(rm -rf src)'\ntrue")
+  out_heredoc=$(jq -nc --arg ws "$repo" --arg cmd "$heredoc_cmd" \
+    '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "run_command", args: {CommandLine: $cmd}}}' \
+    | "$PRE_COMMAND_GUARD")
+  assert_json_field "$out_heredoc" ".decision" "deny" "Unquoted here-doc with single-quoted cmd substitution must be denied"
+  assert_contains "$(printf '%s' "$out_heredoc" | jq -r '.reason')" "here-document"
+
   spoof_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-spoof.XXXXXX")
   echo "$spoof_dir" >> "$_HARNESS_TEMP_TRACKER"
   mkdir -p "$spoof_dir/sym" "$spoof_dir/scripts"
@@ -2047,7 +2070,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "cd \"$spoof_dir\"; false && cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; true || cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
     "cd \"$spoof_dir\"; cd \"$repo\" bogus; bash ./scripts/stamp-gate.sh dispatch" \
-    "cd \"$spoof_dir\"; cd -@ \"$repo\"; bash ./scripts/stamp-gate.sh dispatch"
+    "cd \"$spoof_dir\"; cd -@ \"$repo\"; bash ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd -e \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; env cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; nohup cd \"$repo\"; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; if false; then echo x; cd \"$repo\"; fi; ./scripts/stamp-gate.sh dispatch"
   do
     local out_sp
     out_sp=$(jq -nc --arg ws "$repo" --arg cmd "$spoof_cmd" \
