@@ -1826,7 +1826,7 @@ EOF
   local agy_log
   agy_log=$(cat "$calls_log")
   assert_contains "$agy_log" "--conversation conv-dq"
-  assert_contains "$agy_log" "[SWARM_QUOTA_AUTO_RESUME]"
+  assert_contains "$agy_log" "--print=[SWARM_QUOTA_AUTO_RESUME]"
   assert_contains "$agy_log" "@worker-1"
   assert_not_contains "$agy_log" "ts_live_must_be_scrubbed" "Daemon must scrub TYPESAFE_API_KEY before invoking agy"
 

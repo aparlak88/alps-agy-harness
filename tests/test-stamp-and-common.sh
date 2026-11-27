@@ -1990,7 +1990,7 @@ assert final_state.get("resumedAt"), final_state
 lines = Path(os.environ["CONC_COUNT"]).read_text().splitlines()
 assert len(lines) == 1, f"Expected exactly 1 concurrent agy launch, got {len(lines)}: {lines}"
 cwd_line = Path(os.environ["CONC_CWD"]).read_text()
-assert str(ws.resolve()) in cwd_line and "gemini-4-neon-high" in cwd_line, cwd_line
+assert str(ws.resolve()) in cwd_line and "--conversation conv-conc" in cwd_line and "--print=[SWARM_QUOTA_AUTO_RESUME]" in cwd_line and "gemini-4-neon-high" in cwd_line, cwd_line
 
 # I7 / I3: Event-gated lock-exclusion test for register_swarm_coordinator with flock-entry barrier (plus 6-thread completion)
 c1_in = threading.Event()

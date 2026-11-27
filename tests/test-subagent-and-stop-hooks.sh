@@ -2137,6 +2137,25 @@ test_swarm_coordinator_blocks_subagent_workflow_and_enforces_integrator_and_pure
   }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
   assert_json_field "$auto_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-worker-title"] == null' "true"
 
+  # I3: Worker-prompt swarm(action="add") on a fresh repo with NO active coordinators must NOT register Coordinator
+  local worker_add_repo out_w_sub
+  worker_add_repo=$(make_temp_repo)
+  printf '%s' "$(jq -nc --arg ws "$worker_add_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-worker-add",
+    lastUserInput: "[SWARM_WORKER_CONTRACT] task",
+    toolCall: {name: "swarm", args: {action: "add", name: "helper-worker", workspace: "inherit", brief: "Sub-helper."}}
+  }')" | "$PRE_SUBAGENT_GUARD" >/dev/null
+  [ ! -f "$worker_add_repo/.harness/state/swarm/swarm-coordinator.json" ] \
+    || assert_json_field "$worker_add_repo/.harness/state/swarm/swarm-coordinator.json" '.coordinators["conv-worker-add"] == null' "true" "Worker swarm(add) must not register caller as Coordinator"
+  "$STAMP_GATE" dispatch --role "Worker Direct" --type "self" --tier "bounded_execution" --conversation-id "conv-worker-add" --workspace "$worker_add_repo"
+  out_w_sub=$(jq -nc --arg ws "$worker_add_repo" '{
+    workspacePaths: [$ws],
+    conversationId: "conv-worker-add",
+    toolCall: {name: "invoke_subagent", args: {TypeName: "self", Role: "Worker Direct", Prompt: "Execute bounded slice."}}
+  }' | "$PRE_SUBAGENT_GUARD")
+  assert_json_field "$out_w_sub" ".decision" "allow" "Worker after swarm(add) must not be blocked from invoke_subagent"
+
   # I1: Linked-worktree swarm(add) on a fresh repo with NO active coordinators must NOT register Coordinator
   local wt_only_repo auto_wt
   wt_only_repo=$(make_temp_repo)

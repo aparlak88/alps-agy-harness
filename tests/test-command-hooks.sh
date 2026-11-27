@@ -1677,6 +1677,9 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
   git -C "$repo" add README.md
   git -C "$repo" commit -m "chore: init" --quiet
   git -C "$repo" checkout -b "feat/coord-cmd" --quiet
+  mkdir -p "$repo/scripts"
+  ln -s "$STAMP_GATE" "$repo/scripts/stamp-gate.sh"
+  ln -s "$REPO_ROOT/scripts/harness-doctor.sh" "$repo/scripts/harness-doctor.sh"
 
   # Register conv-coord as active Coordinator via swarm(action="title")
   printf '%s' "$(jq -nc --arg ws "$repo" '{workspacePaths: [$ws], conversationId: "conv-coord", toolCall: {name: "swarm", args: {action: "title", title: "Cmd Guard"}}}')" \
@@ -1791,6 +1794,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "GIT_PAGER=evil git log" \
     "GIT_ASKPASS=/tmp/x git status" \
     "GIT_CONFIG_COUNT=1 git status" \
+    "GIT_TRACE=/tmp/trace.log git status" \
+    "GIT_TRACE2_EVENT=/tmp/trace.log git status" \
+    "env GIT_TRACE=/tmp/trace.log git status" \
+    "GH_PAGER=evil gh pr list" \
+    "file -C README.md" \
     "GIT_SEQUENCE_EDITOR=evil git status" \
     "GIT_CONFIG_SYSTEM=/tmp/x git status" \
     "GIT_TEMPLATE_DIR=/tmp/x git status" \
@@ -1969,10 +1977,12 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
 
   spoof_dir=$(mktemp -d "${TMPDIR:-/tmp}/swarm-spoof.XXXXXX")
   echo "$spoof_dir" >> "$_HARNESS_TEMP_TRACKER"
-  mkdir -p "$spoof_dir/sym"
+  mkdir -p "$spoof_dir/sym" "$spoof_dir/scripts"
   printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/stamp-gate.sh"
   printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/harness-doctor.sh"
-  chmod +x "$spoof_dir/stamp-gate.sh" "$spoof_dir/harness-doctor.sh"
+  printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/scripts/stamp-gate.sh"
+  printf '#!/usr/bin/env bash\necho pwned\n' > "$spoof_dir/scripts/harness-doctor.sh"
+  chmod +x "$spoof_dir/stamp-gate.sh" "$spoof_dir/harness-doctor.sh" "$spoof_dir/scripts/stamp-gate.sh" "$spoof_dir/scripts/harness-doctor.sh"
   ln -s "$spoof_dir/stamp-gate.sh" "$spoof_dir/sym/stamp-gate.sh"
   local spoof_cmd
   for spoof_cmd in \
@@ -1982,7 +1992,11 @@ test_swarm_coordinator_only_command_allowlist_and_bypass_guards() {
     "bash \"$spoof_dir/stamp-gate.sh\" dispatch" \
     "bash \"$spoof_dir/harness-doctor.sh\" --json" \
     "cd \"$spoof_dir\" && ./stamp-gate.sh dispatch" \
-    "cd \"$spoof_dir\" && ./harness-doctor.sh --json"
+    "cd \"$spoof_dir\" && ./harness-doctor.sh --json" \
+    "cd \"$spoof_dir\" && ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch" \
+    "cd \"$spoof_dir\"; cd /nonexistent-dir-coord-spoof; ./scripts/harness-doctor.sh --json" \
+    "cd /nonexistent-dir-coord-spoof; ./scripts/stamp-gate.sh dispatch"
   do
     local out_sp
     out_sp=$(jq -nc --arg ws "$repo" --arg cmd "$spoof_cmd" \

@@ -2747,8 +2747,14 @@ COORDINATOR_DANGEROUS_ENV_VARS = frozenset(
         "XDG_CONFIG_HOME",
         "GIT_DIR",
         "GIT_WORK_TREE",
+        "GH_PAGER",
     )
 )
+
+
+def _is_dangerous_coordinator_env_var(key: str) -> bool:
+    """Return True if ``key`` can redirect execution, git/gh hooks, or trace output to disk."""
+    return key in COORDINATOR_DANGEROUS_ENV_VARS or key.startswith("GIT_TRACE")
 COORDINATOR_READ_ONLY_BINS = frozenset(
     (
         "cd",
@@ -3455,7 +3461,7 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
             tok = tokens[idx]
             if "=" in tok and tok.split("=", 1)[0].isidentifier():
                 key = tok.split("=", 1)[0]
-                if key in COORDINATOR_DANGEROUS_ENV_VARS:
+                if _is_dangerous_coordinator_env_var(key):
                     return (
                         f"Swarm Coordinator-Only guard: setting execution env var '{key}' is blocked for the active Swarm Coordinator."
                     )
@@ -3493,7 +3499,7 @@ def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
                         return "Swarm Coordinator-Only guard: options on 'env' are blocked for the active Swarm Coordinator."
                     elif "=" in etok and etok.split("=", 1)[0].isidentifier():
                         key = etok.split("=", 1)[0]
-                        if key in COORDINATOR_DANGEROUS_ENV_VARS:
+                        if _is_dangerous_coordinator_env_var(key):
                             return (
                                 f"Swarm Coordinator-Only guard: setting execution env var '{key}' via env is blocked for the active Swarm Coordinator."
                             )
@@ -3543,7 +3549,7 @@ def _is_trusted_harness_script_path(raw_script: str, seg_cwd: Path, workspace: P
     except OSError:
         return False
     if not real_script.is_file():
-        return raw_script in (f"./scripts/{expected_name}", f"scripts/{expected_name}") and plugin_script.is_file()
+        return False
     allowed_targets = [plugin_script, workspace / "scripts" / expected_name]
     for cand in allowed_targets:
         try:
@@ -3716,6 +3722,12 @@ def _evaluate_coordinator_command_segment(seg: list[str], seg_cwd: Path, workspa
                     return _deny_seg()
         elif exe in ("printf", "test", "["):
             if any(tok == "-v" or (exe == "printf" and tok.startswith("-v")) for tok in seg[1:]):
+                return _deny_seg()
+        elif exe == "file":
+            if any(
+                tok == "-C" or tok == "--compile" or (tok.startswith("-") and not tok.startswith("--") and "C" in tok[1:])
+                for tok in seg[1:]
+            ):
                 return _deny_seg()
         return "allow", ""
 
