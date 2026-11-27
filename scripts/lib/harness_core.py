@@ -3842,14 +3842,21 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
     return out if (out == out and abs(out) != float("inf")) else default
 
 
-def _stale_resuming_threshold_sec(timeout_sec: float = DEFAULT_SWARM_RESUME_TIMEOUT_SEC) -> float:
-    """Return stale ``resuming`` takeover threshold in seconds (supports test override)."""
+def _resolve_swarm_resume_timeout_sec() -> float:
+    """Resolve ``agy --conversation`` resume subprocess timeout from env or default."""
+    raw_timeout = os.environ.get("HARNESS_SWARM_RESUME_TIMEOUT_SEC", str(DEFAULT_SWARM_RESUME_TIMEOUT_SEC)).strip()
+    return max(0.2, _safe_float(raw_timeout, DEFAULT_SWARM_RESUME_TIMEOUT_SEC))
+
+
+def _stale_resuming_threshold_sec(timeout_sec: Optional[float] = None) -> float:
+    """Return stale ``resuming`` takeover threshold in seconds (supports test and env overrides)."""
     raw = os.environ.get("HARNESS_SWARM_STALE_RESUMING_SEC", "").strip()
     if raw:
         parsed = _safe_float(raw, -1.0)
         if parsed > 0:
             return max(0.2, parsed)
-    return max(30.0, float(timeout_sec) + 30.0)
+    eff_timeout = _resolve_swarm_resume_timeout_sec() if timeout_sec is None else float(timeout_sec)
+    return max(30.0, eff_timeout + 30.0)
 
 
 def _check_coordinator_raw_segments(cmd_line: str) -> Optional[str]:
@@ -4479,8 +4486,7 @@ def attempt_swarm_quota_resume(workspace: Path, now_epoch: Optional[float] = Non
         return {"status": "idle", "reason": "no swarm state directory"}
     quota_path = swarm_dir / "swarm-quota-wait.json"
 
-    raw_timeout = os.environ.get("HARNESS_SWARM_RESUME_TIMEOUT_SEC", str(DEFAULT_SWARM_RESUME_TIMEOUT_SEC)).strip()
-    timeout_sec = max(0.2, _safe_float(raw_timeout, DEFAULT_SWARM_RESUME_TIMEOUT_SEC))
+    timeout_sec = _resolve_swarm_resume_timeout_sec()
     stale_threshold = _stale_resuming_threshold_sec(timeout_sec)
 
     with locked_state_file(swarm_dir, "swarm-quota-wait"):

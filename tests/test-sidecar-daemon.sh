@@ -1944,6 +1944,50 @@ EOF
   assert_eq "{}" "$stop_c_out"
   _wait_for_file_jq "$unreg_c/.harness/state/swarm/swarm-quota-wait.json" '.status == "resumed"' 40 \
     || { echo "/hook/stop-gate callback did not wake 30s-poll daemon to auto-resume within 4s: $(cat "$unreg_c/.harness/state/swarm/swarm-quota-wait.json" 2>/dev/null || true)" >&2; return 1; }
+
+  # 8. HARNESS_SWARM_RESUME_TIMEOUT_SEC threshold parity & non-stale resuming non-spin check
+  PYTHONPATH="$REPO_ROOT/scripts/lib" python3 - << 'PYEOF'
+import os
+import harness_core
+
+os.environ.pop("HARNESS_SWARM_STALE_RESUMING_SEC", None)
+os.environ["HARNESS_SWARM_RESUME_TIMEOUT_SEC"] = "300"
+assert harness_core._stale_resuming_threshold_sec() == 330.0, harness_core._stale_resuming_threshold_sec()
+os.environ["HARNESS_SWARM_RESUME_TIMEOUT_SEC"] = "10"
+assert harness_core._stale_resuming_threshold_sec() == 40.0, harness_core._stale_resuming_threshold_sec()
+PYEOF
+
+  local parity_sock_dir parity_data_dir parity_sock parity_dpid parity_repo parity_qfile started_200 c_before c_after cyc_delta
+  parity_sock_dir=$(mktemp -d "/tmp/hd-swq-par.XXXXXX")
+  parity_data_dir=$(mktemp -d "${TMPDIR:-/tmp}/hd-swq-pard.XXXXXX")
+  _TD_DIRS+=("$parity_sock_dir" "$parity_data_dir")
+  parity_sock="$parity_sock_dir/d.sock"
+
+  HARNESS_DAEMON_SOCK="$parity_sock" \
+  HARNESS_DAEMON_DATA_DIR="$parity_data_dir" \
+  HARNESS_SKIP_SHELL_PATH_SYNC="1" \
+  HARNESS_DAEMON_POLL_INTERVAL_SEC="30" \
+  HARNESS_SWARM_RESUME_TIMEOUT_SEC="300" \
+  HARNESS_AGY_BIN="$always_ok_agy" \
+  python3 -B "$DAEMON_PY" >/dev/null 2>&1 &
+  parity_dpid=$!
+  _TD_PIDS+=("$parity_dpid")
+  _wait_for_socket_health "$parity_sock" 50 || { echo "Parity daemon failed to start" >&2; return 1; }
+
+  parity_repo=$(make_temp_repo)
+  HARNESS_DISABLE_DAEMON=1 "$STAMP_GATE" swarm-quota pause --workspace "$parity_repo" --conversation-id "conv-par" --wait-seconds 0 --buffer-seconds 0 >/dev/null
+  parity_qfile="$parity_repo/.harness/state/swarm/swarm-quota-wait.json"
+  started_200=$(python3 -c 'import time; print(round(time.time() - 200, 3))')
+  jq --argjson ep "$started_200" '.status = "resuming" | .resumingStartedAtEpoch = $ep | .resumingToken = "in-flight-200s" | .attemptCount = 0' "$parity_qfile" > "$parity_qfile.tmp" && mv "$parity_qfile.tmp" "$parity_qfile"
+
+  c_before=$(curl -fsS --unix-socket "$parity_sock" "http://localhost/health" | jq -r '.watcherCycles // 0')
+  jq -nc --arg ws "$parity_repo" '{workspace: $ws}' | curl -fsS --unix-socket "$parity_sock" -H "Content-Type: application/json" -X POST --data-binary @- "http://localhost/event/swarm-quota-wait" >/dev/null
+  sleep 0.5
+  c_after=$(curl -fsS --unix-socket "$parity_sock" "http://localhost/health" | jq -r '.watcherCycles // 0')
+  cyc_delta=$((c_after - c_before))
+  [ "$cyc_delta" -lt 5 ] || { echo "Expected non-stale resuming under HARNESS_SWARM_RESUME_TIMEOUT_SEC=300 not to spin watcher_loop (cyc_delta=$cyc_delta)" >&2; return 1; }
+  assert_json_field "$parity_qfile" ".status" "resuming" "Non-stale resuming (200s < 330s) must not trigger premature takeover"
+  assert_json_field "$parity_qfile" ".attemptCount" "0" "Non-stale resuming (200s < 330s) must not increment attemptCount"
 }
 
 run_tests "$@"

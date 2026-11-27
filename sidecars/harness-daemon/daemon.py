@@ -317,11 +317,13 @@ class HarnessDaemonState:
     def _run_swarm_quota_resume(self, ws_key: str) -> None:
         """Invoke ``agy --conversation`` via ``harness_core.attempt_swarm_quota_resume`` in background."""
         resumed = False
+        should_wake = True
         try:
             ensure_startup_path_enriched()
             res = harness_core.attempt_swarm_quota_resume(Path(ws_key))
             status = str(res.get("status") or "unknown")
             resumed = status == "resumed"
+            should_wake = status != "resuming"
             self.logger.log("INFO", f"Swarm quota resume probe for {ws_key}: status={status} attempt={res.get('attemptCount', 0)}")
         except Exception as exc:
             self.logger.log("WARN", f"Swarm quota resume error for {ws_key}: {exc}")
@@ -331,7 +333,8 @@ class HarnessDaemonState:
                 if resumed and ws_key in self._workspaces:
                     self._workspaces[ws_key]["lastSeenAt"] = time.time()
                     self._persist_registry_locked()
-            self.wake_event.set()
+            if should_wake:
+                self.wake_event.set()
 
     def get_caches(self, ws_path: Path, allow_disk_hydration: bool = True) -> dict[str, Any]:
         """Return shallow copy of in-memory caches for ``ws_path``, optionally hydrating missing keys."""
@@ -748,6 +751,10 @@ class HarnessDaemonState:
                             if started_ep <= 0 or (now - started_ep) >= stale_threshold:
                                 self._quota_resume_inflight.add(ws_key)
                                 due_quota_resumes.append(ws_key)
+                            else:
+                                delta = max(0.05, stale_threshold - (now - started_ep))
+                                if soonest_probe_delta is None or delta < soonest_probe_delta:
+                                    soonest_probe_delta = delta
                     except Exception as exc:
                         self.logger.log("WARN", f"Malformed quota state for {ws_key}: {exc}")
 
